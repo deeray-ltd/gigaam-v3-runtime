@@ -291,7 +291,7 @@ dependencies = [
 
 [[package]]
 name = "gigaam-audio"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "gigaam-model-package",
  "gigaam-primitives",
@@ -301,7 +301,7 @@ dependencies = [
 
 [[package]]
 name = "gigaam-cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "gigaam-audio",
  "gigaam-model-package",
@@ -312,18 +312,18 @@ dependencies = [
 
 [[package]]
 name = "gigaam-model-package"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "gigaam-primitives",
 ]
 
 [[package]]
 name = "gigaam-primitives"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "gigaam-recognition"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "gigaam-audio",
  "gigaam-model-package",
@@ -334,7 +334,7 @@ dependencies = [
 
 [[package]]
 name = "gigaam-service"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "axum",
  "gigaam-audio",
@@ -348,7 +348,7 @@ dependencies = [
 
 [[package]]
 name = "gigaam-transcription"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "gigaam-audio",
  "gigaam-model-package",

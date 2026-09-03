@@ -2,6 +2,8 @@
 
 All notable changes are recorded here. Pre-1.0 releases do not promise a stable protocol.
 
+## Unreleased
+
 ## 0.1.0 - 2026-09-03
 
 First public release: source on GitHub and the CPU, CUDA, and TensorRT images on Docker Hub

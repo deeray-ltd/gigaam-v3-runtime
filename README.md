@@ -6,9 +6,9 @@ audio, and serves revisable streaming word and dialog events. Python and a deep-
 framework are absent from the serving path; ONNX Runtime is loaded dynamically through an
 explicit shared-library path.
 
-> Status: 0.1.0. The source is public and the three images are published on Docker Hub as
-> `deerayltd/asr:0.1.0-cpu`, `deerayltd/asr:0.1.0-cuda`, and `deerayltd/asr:0.1.0-tensorrt`
-> (digests below). Pre-1.0 interfaces may change.
+> Status: latest release 0.1.0 (tag v0.1.0), images `deerayltd/asr:0.1.0-cpu`,
+> `deerayltd/asr:0.1.0-cuda`, and `deerayltd/asr:0.1.0-tensorrt` (digests below). The main
+> branch is the 0.1.1 development line; pre-1.0 interfaces may change.
 
 ## What it provides
 
