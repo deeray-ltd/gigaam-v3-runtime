@@ -4,6 +4,11 @@ All notable changes are recorded here. Pre-1.0 releases do not promise a stable 
 
 ## Unreleased
 
+### Added
+
+- OCI image labels (title, description, source, url, documentation, vendor, licenses, version)
+  on the CPU, CUDA, and TensorRT image definitions.
+
 ## 0.1.0 - 2026-09-03
 
 First public release: source on GitHub and the CPU, CUDA, and TensorRT images on Docker Hub

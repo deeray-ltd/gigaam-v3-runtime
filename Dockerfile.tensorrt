@@ -96,6 +96,14 @@ ENV ASR_ENCODER_EP=tensorrt \
     LD_LIBRARY_PATH=/app/ort/lib:/app/tensorrt:/usr/local/cuda/lib64:/usr/local/nvidia/lib:/usr/local/nvidia/lib64 \
     ORT_DYLIB_PATH=/app/ort/lib/libonnxruntime.so.1.29.0
 
+LABEL org.opencontainers.image.title="GigaAM v3 Runtime (TensorRT)" \
+      org.opencontainers.image.description="GigaAM v3 speech-recognition service and CLI, ONNX Runtime TensorRT provider" \
+      org.opencontainers.image.source="https://github.com/deeray-ltd/gigaam-v3-runtime" \
+      org.opencontainers.image.url="https://github.com/deeray-ltd/gigaam-v3-runtime" \
+      org.opencontainers.image.documentation="https://github.com/deeray-ltd/gigaam-v3-runtime/blob/main/docs/OPERATIONS.md" \
+      org.opencontainers.image.vendor="Deeray Ltd." \
+      org.opencontainers.image.licenses="LGPL-3.0-or-later" \
+      org.opencontainers.image.version="0.1.1"
 EXPOSE 8080
 USER gigaam
 ENTRYPOINT ["/app/asr-serve", "--model", "/app/model", "--port", "8080"]
