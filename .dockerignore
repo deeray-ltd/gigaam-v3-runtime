@@ -1,0 +1,10 @@
+# The three Dockerfiles build from the repository root. Keep the context limited to
+# source and licenses required by their builder and final stages.
+*
+!Cargo.toml
+!Cargo.lock
+!crates/
+!crates/**
+!COPYING
+!COPYING.LESSER
+!THIRD_PARTY.md

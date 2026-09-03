@@ -1,0 +1,43 @@
+[package]
+name = "gigaam-transcription"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "GigaAM v3 Runtime batch and streaming transcription workflows."
+publish = false
+
+[dependencies]
+gigaam-audio = { path = "../audio" }
+gigaam-primitives = { path = "../primitives" }
+gigaam-recognition = { path = "../recognition", default-features = false }
+
+[dev-dependencies]
+gigaam-audio = { path = "../audio", features = ["decoders"] }
+gigaam-model-package = { path = "../model-package" }
+
+[features]
+# Opt-in semantic integration tests require an externally supplied model pack and binary fixtures.
+golden-tests = []
+
+[[test]]
+name = "decoders"
+required-features = ["golden-tests"]
+
+[[test]]
+name = "e2e"
+required-features = ["golden-tests"]
+
+[[test]]
+name = "resample_e2e"
+required-features = ["golden-tests"]
+
+[[test]]
+name = "rnnt"
+required-features = ["golden-tests"]
+
+[[test]]
+name = "stream"
+required-features = ["golden-tests"]

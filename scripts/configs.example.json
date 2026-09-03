@@ -1,0 +1,10 @@
+[
+  {"label": "ctc-fp16-cuda", "flags": "--fp16", "env": {"ASR_CUDA_ASSIGNMENT_POLICY": "allow-unverified"},
+     "_note": "All CUDA-default rows collect initial evidence only; model-specific verified CTC/RNN-T fingerprints are required to accept CUDA results."},
+  {"label": "ctc-fp32-cuda", "flags": "", "env": {"ASR_CUDA_ASSIGNMENT_POLICY": "allow-unverified"}},
+  {"label": "rnnt-cuda", "flags": "--rnnt", "env": {"ASR_CUDA_ASSIGNMENT_POLICY": "allow-unverified"}},
+  {"label": "ctc-fp16-batched", "flags": "--fp16", "env": {"ASR_FRONTEND": "batched", "ASR_CUDA_ASSIGNMENT_POLICY": "allow-unverified"}},
+  {"label": "ctc-fp16-trt",  "flags": "--fp16 --ep tensorrt",
+     "env": {"ASR_ENCODER_EP": "tensorrt", "ASR_TRT_CACHE": "trt-cache"},
+     "_note": "Before running, set ORT_DYLIB_PATH and LD_LIBRARY_PATH for a compatible TensorRT-enabled ONNX Runtime installation, then build asr with --features tensorrt."}
+]

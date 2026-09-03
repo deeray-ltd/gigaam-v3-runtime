@@ -1,0 +1,10 @@
+[package]
+name = "gigaam-primitives"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "GigaAM v3 Runtime checked numeric conversion primitives."
+publish = false

@@ -1,0 +1,13 @@
+[package]
+name = "gigaam-model-package"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "GigaAM v3 Runtime model-package schema and selected asset validation."
+publish = false
+
+[dependencies]
+gigaam-primitives = { path = "../primitives" }

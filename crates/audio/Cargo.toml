@@ -1,0 +1,28 @@
+[package]
+name = "gigaam-audio"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "GigaAM v3 Runtime audio preparation and frontend boundary."
+publish = false
+
+[dependencies]
+gigaam-model-package = { path = "../model-package" }
+gigaam-primitives = { path = "../primitives" }
+opus-decoder = { version = "0.1.1", optional = true }
+symphonia = { version = "0.5", default-features = false, features = ["mp3", "flac", "vorbis", "aac", "isomp4", "ogg", "wav", "pcm", "mkv"], optional = true }
+
+[features]
+decoders = ["dep:opus-decoder", "dep:symphonia"]
+golden-tests = []
+
+[[test]]
+name = "wav_golden"
+required-features = ["golden-tests"]
+
+[[test]]
+name = "frontend_golden"
+required-features = ["golden-tests"]

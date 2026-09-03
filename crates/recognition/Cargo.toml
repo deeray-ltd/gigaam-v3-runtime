@@ -1,0 +1,27 @@
+[package]
+name = "gigaam-recognition"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "GigaAM v3 Runtime recognition contracts, decoding algorithms, and ONNX Runtime execution assembly."
+publish = false
+
+[dependencies]
+gigaam-audio = { path = "../audio" }
+gigaam-model-package = { path = "../model-package" }
+gigaam-primitives = { path = "../primitives" }
+ort = { version = "2.0.0-rc.13", default-features = false, features = ["std", "load-dynamic", "api-24"] }
+sha2 = "0.11.0"
+
+[features]
+default = []
+cuda = ["ort/cuda"]
+tensorrt = ["cuda", "ort/tensorrt"]
+golden-tests = []
+
+[[test]]
+name = "ctc_golden"
+required-features = ["golden-tests"]

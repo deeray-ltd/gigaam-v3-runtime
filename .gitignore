@@ -1,0 +1,14 @@
+# --- model packs and fixtures (fetched/produced separately) ---
+model/*
+!model/config.kv
+fixtures/*
+
+# --- build output and runtime caches ---
+target/
+trt-libs/
+trt-cache/
+__pycache__/
+
+# --- scratch output ---
+/*.log
+/*.txt

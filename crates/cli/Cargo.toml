@@ -1,0 +1,27 @@
+[package]
+name = "gigaam-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "GigaAM v3 Runtime offline command-line interface boundary."
+publish = false
+
+[[bin]]
+name = "asr"
+path = "src/main.rs"
+
+[dependencies]
+gigaam-primitives = { path = "../primitives" }
+gigaam-model-package = { path = "../model-package" }
+gigaam-audio = { path = "../audio" }
+gigaam-recognition = { path = "../recognition", default-features = false }
+gigaam-transcription = { path = "../transcription" }
+
+[features]
+default = ["cuda"]
+cuda = ["gigaam-recognition/cuda"]
+decoders = ["gigaam-audio/decoders"]
+tensorrt = ["cuda", "gigaam-recognition/tensorrt"]
