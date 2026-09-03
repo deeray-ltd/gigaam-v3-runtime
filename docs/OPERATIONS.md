@@ -171,9 +171,9 @@ performs its own test suite: CI owns Rust checks, external-golden target compila
 Docker build-context allowlist, and Dockerfile construction policy; the images themselves are
 built and accepted outside CI. Those checks do not prove real model or accelerator inference.
 
-The intended public release names are deeray/asr:0.1.0-cpu,
-deeray/asr:0.1.0-cuda, and deeray/asr:0.1.0-tensorrt. They are release targets, not a
-statement that any tag is currently published.
+The published release images are deerayltd/asr:0.1.0-cpu, deerayltd/asr:0.1.0-cuda, and
+deerayltd/asr:0.1.0-tensorrt on Docker Hub; their digests are listed in the README. Pull by
+digest when an exact artifact matters.
 
 ## Metrics
 

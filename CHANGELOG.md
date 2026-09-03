@@ -1,9 +1,11 @@
 # Changelog
 
-All notable changes are recorded here. Until a public release is accepted, this file
-describes source state rather than a stable protocol or published artifact.
+All notable changes are recorded here. Pre-1.0 releases do not promise a stable protocol.
 
-## Unreleased
+## 0.1.0 - 2026-09-03
+
+First public release: source on GitHub and the CPU, CUDA, and TensorRT images on Docker Hub
+(`deerayltd/asr:0.1.0-cpu`, `-cuda`, `-tensorrt`).
 
 ### Added
 

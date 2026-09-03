@@ -166,8 +166,8 @@ and release material describe the same behavior in more detail and do not contra
 ### REL-001 · Three truthful release artifacts
 
 - Requirement: The public release has distinct CPU, CUDA, and TensorRT artifacts with truthful
-  tags `deeray/asr:0.1.0-cpu`, `deeray/asr:0.1.0-cuda`, and
-  `deeray/asr:0.1.0-tensorrt`.
+  tags `deerayltd/asr:0.1.0-cpu`, `deerayltd/asr:0.1.0-cuda`, and
+  `deerayltd/asr:0.1.0-tensorrt`.
 - Scope: Image definitions, tags, runtime contents, and publication records.
 
 ### REL-002 · Hermetic pinned provenance

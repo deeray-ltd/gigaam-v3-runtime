@@ -6,9 +6,9 @@ audio, and serves revisable streaming word and dialog events. Python and a deep-
 framework are absent from the serving path; ONNX Runtime is loaded dynamically through an
 explicit shared-library path.
 
-> Status: 0.1.0-dev. Source architecture and image definitions are under release
-> acceptance. No repository release or Docker Hub tag is asserted as published, and
-> pre-1.0 interfaces may change.
+> Status: 0.1.0. The source is public and the three images are published on Docker Hub as
+> `deerayltd/asr:0.1.0-cpu`, `deerayltd/asr:0.1.0-cuda`, and `deerayltd/asr:0.1.0-tensorrt`
+> (digests below). Pre-1.0 interfaces may change.
 
 ## What it provides
 
@@ -78,7 +78,23 @@ window can be slower than real time for one stream, depending on the host and
 ASR_ORT_THREADS; measure on the target host before relying on it, and prefer a CUDA or
 TensorRT provider for streaming.
 
-## Docker source images
+## Docker images
+
+Published images are on Docker Hub at [deerayltd/asr](https://hub.docker.com/r/deerayltd/asr).
+They contain no model; mount a version-1 model package read-only at /app/model:
+
+~~~sh
+docker pull deerayltd/asr:0.1.0-cpu
+
+docker run --rm -p 8080:8080 \
+  --mount type=bind,src="$PWD/model",dst=/app/model,readonly \
+  deerayltd/asr:0.1.0-cpu
+~~~
+
+The CUDA and TensorRT images additionally need `--gpus all`; the CUDA image also needs the
+verified placement fingerprints described in [docs/OPERATIONS.md](docs/OPERATIONS.md).
+
+### Building from source
 
 Dockerfile.cpu, Dockerfile.cuda, and Dockerfile.tensorrt define standalone source builds
 for CPU, CUDA, and TensorRT. Each builds gigaam-service from the repository root, carries
@@ -94,11 +110,18 @@ docker run --rm -p 8080:8080 \
   gigaam-v3-runtime:cpu
 ~~~
 
-The intended public names are deeray/asr:0.1.0-cpu, deeray/asr:0.1.0-cuda, and
-deeray/asr:0.1.0-tensorrt. They are release targets, not published-image claims. Building an
-image from source is not the same as validating it: CPU and accelerator images still require
-running each image against a real GigaAM v3 model and, for CUDA/TensorRT, a real GPU, before
-either is described as accepted or published.
+The published images on Docker Hub, built from this source and run against a real GigaAM v3
+model package (and, for CUDA and TensorRT, a real GPU) before publication:
+
+| Tag | Digest |
+| --- | --- |
+| `deerayltd/asr:0.1.0-cpu` | `sha256:ec2d258e614940ccf2b5de03b43f8212af830053173824d95c8b632f724c58ab` |
+| `deerayltd/asr:0.1.0-cuda` | `sha256:90d8b13279f587455e11095791e3363016ab6977676719eae8c00d8cc6f58263` |
+| `deerayltd/asr:0.1.0-tensorrt` | `sha256:936cd20fa9ce2b4f459987af9ea22629aceb33d20cd89e53c74fe4a471213bdc` |
+
+Building an image from source is not the same as validating it: an image built locally must
+still be run against a real model package, and a real GPU for the accelerator variants, before
+it is described as accepted.
 
 ## Validation
 
