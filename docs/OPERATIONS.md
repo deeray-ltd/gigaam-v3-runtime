@@ -167,9 +167,9 @@ docker run --rm -p 8080:8080 \
 
 CUDA and TensorRT additionally need the host NVIDIA runtime and a supported GPU platform.
 TensorRT creates a writable /app/trt-cache owned by the non-root image user. No Dockerfile
-performs its own test suite: CI owns Rust checks, external-golden target compilation, image
-construction, and observable image-contract checks. Those checks do not prove real model or
-accelerator inference.
+performs its own test suite: CI owns Rust checks, external-golden target compilation, the
+Docker build-context allowlist, and Dockerfile construction policy; the images themselves are
+built and accepted outside CI. Those checks do not prove real model or accelerator inference.
 
 The intended public release names are deeray/asr:0.1.0-cpu,
 deeray/asr:0.1.0-cuda, and deeray/asr:0.1.0-tensorrt. They are release targets, not a
