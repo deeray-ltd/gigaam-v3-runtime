@@ -203,6 +203,7 @@ help or version command grammar.
 asr transcribe FILE [--model DIR] [--ep cpu|cuda|tensorrt] [--ort-dylib PATH]
                     [--fp16] [--rnnt] [--window S] [--overlap S] [--pad]
                     [--words] [--split-channels] [--turns] [--turn-gap S]
+                    [--evidence PATH]
 
 asr bench [--audio FILE] [--model DIR] [--ep cpu|cuda|tensorrt] [--ort-dylib PATH]
           [--fp16] [--window S] [--iters N] [--gap-ms N] [--alt-window S]
@@ -222,7 +223,7 @@ asr dialog FILE [--model DIR] [--ep cpu|cuda|tensorrt] [--ort-dylib PATH]
 
 | Command | Defaults and constraints |
 | --- | --- |
-| transcribe | model is model; CTC is selected unless --rnnt; --window is 30 seconds; --overlap is 6 seconds and must be shorter than window; --turn-gap is 1 second; --words conflicts with --turns; --pad selects fixed-window padding. |
+| transcribe | model is model; CTC is selected unless --rnnt; --window is 30 seconds; --overlap is 6 seconds and must be shorter than window; --turn-gap is 1 second; --words conflicts with --turns; --pad selects fixed-window padding; --evidence is optional and requires CTC. |
 | bench | audio defaults to fixtures/long_example.wav, a path not bundled by the repository; window is 30 seconds; iters is 20 and positive; gap-ms is 0 and nonnegative; alt-window is optional and positive. |
 | stream | chunk-ms is 100 and positive; step-ms is 500 and positive; horizon is 4 seconds and positive; window/overlap default to 30/6 seconds with overlap shorter than window; endpoint defaults to blank; silence-ms is optional and nonnegative; --lock selects committed-stable locking; --events prints event projections. |
 | vad | threshold is 0.5; neg-threshold is 0.35; both are finite in 0 through 1 and neg-threshold cannot exceed threshold; min-speech-ms and min-silence-ms default to 250 and 100 and are positive; speech-pad-ms defaults to 30 and is nonnegative. |
@@ -233,6 +234,14 @@ asr dialog FILE [--model DIR] [--ep cpu|cuda|tensorrt] [--ort-dylib PATH]
 model-rate buffer length, and the decoded WAV input is resampled to the same rate before
 warmup or measurement. The default therefore remains a 30-second duration for every valid
 package rate rather than a fixed sample count.
+
+`transcribe --evidence PATH` writes one per-window decode-evidence file alongside the ordinary
+transcript: a plain ASCII text file with a header line, one `model` line and one `audio` line
+naming the package and input, and one block per decoded window carrying that window's geometry,
+raw per-frame CTC labels, non-emission mask, and collapsed tokens. PATH is validated once, before
+any window is decoded: its parent directory must already exist, and PATH itself must not already
+be a directory. The transcript is unaffected by --evidence; only CTC transcription supports it,
+so it conflicts with --rnnt.
 
 For applicable commands, --model defaults to model. --ort-dylib or ORT_DYLIB_PATH is
 required; when both are present, they must be identical. Provider selection and runtime

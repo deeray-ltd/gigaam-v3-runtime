@@ -9,13 +9,20 @@ use crate::configuration;
 use crate::grammar::{
     ChannelOutput, DecoderChoice, TranscribeInvocation, TranscribeOutput, TurnOutput,
 };
-use crate::projection::{self, TranscribeSummary};
+use crate::projection::{
+    self, EvidenceAudioHeader, EvidenceModelHeader, EvidenceWriter, TranscribeSummary,
+    evidence_token,
+};
 use gigaam_audio::load;
-use gigaam_recognition::{ExecutionControl, RequiredEncoderRoles};
+use gigaam_model_package::ModelPackage;
+use gigaam_primitives::f64_to_f32;
+use gigaam_recognition::{ExecutionControl, FrameRate, RequiredEncoderRoles};
 use gigaam_transcription::{
     BatchChannelPolicy, BatchConfig, BatchSetup, MultiChannelBatchOptions, MultiChannelBatchSetup,
-    MultiChannelBatchTranscriber, TurnGap,
+    MultiChannelBatchTranscriber, TurnGap, WindowEvidenceObserver, subsampling_factor,
 };
+use std::path::Path;
+use std::sync::Arc;
 use std::time::Instant;
 
 /// Executes a complete direct batch transcription without a service scheduler.
@@ -24,6 +31,10 @@ pub(crate) fn run(invocation: TranscribeInvocation) -> Result<(), String> {
         DecoderChoice::Ctc => RequiredEncoderRoles::ctc(),
         DecoderChoice::Rnnt => RequiredEncoderRoles::rnnt(),
     };
+    let evidence_path = configuration::evidence_path(invocation.evidence.clone())?;
+    if evidence_path.is_some() && invocation.decoder == DecoderChoice::Rnnt {
+        return Err("--evidence requires CTC; it does not support --rnnt".into());
+    }
     let runtime = configuration::runtime(&invocation.runtime, required_roles)
         .map_err(|error| format!("runtime configuration: {error}"))?;
     let options = MultiChannelBatchOptions::new(
@@ -34,7 +45,7 @@ pub(crate) fn run(invocation: TranscribeInvocation) -> Result<(), String> {
     let started = Instant::now();
     let frontend_mode =
         configuration::frontend_mode().map_err(|error| format!("frontend: {error}"))?;
-    let observations = projection::observations(trace_mode);
+    let mut observations = projection::observations(trace_mode);
 
     let package = composition::open_package(&invocation.model)?;
     let sample_rate = composition::package_sample_rate(&package)?;
@@ -70,6 +81,20 @@ pub(crate) fn run(invocation: TranscribeInvocation) -> Result<(), String> {
             decoder
         }
     };
+
+    let evidence: Option<Arc<EvidenceWriter>> = match &evidence_path {
+        Some(path) => Some(Arc::new(open_evidence_writer(
+            path,
+            &invocation.model,
+            &package,
+        )?)),
+        None => None,
+    };
+    if let Some(evidence) = &evidence {
+        observations =
+            observations.with_evidence(Arc::clone(evidence) as Arc<dyn WindowEvidenceObserver>);
+    }
+
     let mut transcriber = MultiChannelBatchTranscriber::new(MultiChannelBatchSetup::new(
         BatchSetup {
             frontend,
@@ -89,11 +114,23 @@ pub(crate) fn run(invocation: TranscribeInvocation) -> Result<(), String> {
     let source_rate = loaded.sample_rate().hertz();
     let audio = composition::resample_to(loaded, config.sample_rate())
         .map_err(|error| format!("resample: {error}"))?;
+    if let Some(evidence) = &evidence {
+        let audio_name = evidence_token(&invocation.input, "audio")?;
+        evidence.write_audio_header(EvidenceAudioHeader {
+            audio_name: &audio_name,
+            sample_rate: audio.sample_rate().hertz(),
+            samples: audio.frames(),
+            total_seconds: audio.duration_seconds(),
+        })?;
+    }
     let inference_started = Instant::now();
     let result = transcriber
         .transcribe(&audio)
         .map_err(|error| error.to_string())?;
     let inference_elapsed = inference_started.elapsed();
+    if let Some(evidence) = &evidence {
+        evidence.finish()?;
+    }
     projection::transcribe(TranscribeSummary {
         result: &result,
         audio: &audio,
@@ -107,6 +144,40 @@ pub(crate) fn run(invocation: TranscribeInvocation) -> Result<(), String> {
         inference_elapsed,
     });
     Ok(())
+}
+
+/// Opens the evidence file and writes its `evidence v1` and `model` header lines from the
+/// package's own typed frontend and CTC definitions. The subsampling factor is derived, never a
+/// hard-coded constant, through the exact function the batch window loop uses internally.
+fn open_evidence_writer(
+    path: &Path,
+    model_path: &Path,
+    package: &ModelPackage,
+) -> Result<EvidenceWriter, String> {
+    let model_id = evidence_token(model_path, "model")?;
+    let frame_rate = FrameRate::new(f64_to_f32(package.frontend().frames_per_second()))
+        .map_err(|error| format!("model: {error}"))?;
+    let subsampling = subsampling_factor(
+        package.frontend().sample_rate(),
+        package.frontend().hop_length(),
+        frame_rate,
+    )
+    .map_err(|error| format!("model: {error}"))?;
+    let vocabulary = package
+        .ctc_vocabulary()
+        .map_err(|error| format!("model: {error}"))?;
+    let space = vocabulary.iter().position(|piece| piece == "\u{2581}");
+    EvidenceWriter::create(
+        path,
+        EvidenceModelHeader {
+            model_id: &model_id,
+            frames_per_sec: frame_rate.get(),
+            blank: package.ctc().blank_id(),
+            vocab_size: vocabulary.len(),
+            space,
+            subsampling,
+        },
+    )
 }
 
 /// Maps every independent CLI output choice to the shared batch channel-selection policy.

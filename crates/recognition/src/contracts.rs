@@ -36,7 +36,7 @@ pub struct Token {
 }
 
 impl Token {
-    pub(crate) const fn new(id: usize, frame: usize) -> Self {
+    pub const fn new(id: usize, frame: usize) -> Self {
         Self { id, frame }
     }
 
@@ -112,6 +112,8 @@ pub struct Decoded {
     silence: Vec<bool>,
     output_frames: usize,
     encoder_seconds: f64,
+    labels: Option<Vec<usize>>,
+    tokens: Option<Vec<Token>>,
 }
 
 impl Decoded {
@@ -120,6 +122,39 @@ impl Decoded {
         silence: Vec<bool>,
         output_frames: usize,
         encoder_seconds: f64,
+    ) -> Result<Self, String> {
+        Self::assemble(words, silence, output_frames, encoder_seconds, None, None)
+    }
+
+    /// Constructs one decoded window that also carries a CTC decoder's raw per-frame argmax
+    /// labels (blank included, one entry per output frame) and its collapsed pre-word-merge
+    /// tokens, both in this window's local frame coordinates. `words` and `silence` describe the
+    /// same decoded window as `new`.
+    pub fn new_with_labels(
+        words: Vec<Word>,
+        silence: Vec<bool>,
+        output_frames: usize,
+        encoder_seconds: f64,
+        labels: Vec<usize>,
+        tokens: Vec<Token>,
+    ) -> Result<Self, String> {
+        Self::assemble(
+            words,
+            silence,
+            output_frames,
+            encoder_seconds,
+            Some(labels),
+            Some(tokens),
+        )
+    }
+
+    fn assemble(
+        words: Vec<Word>,
+        silence: Vec<bool>,
+        output_frames: usize,
+        encoder_seconds: f64,
+        labels: Option<Vec<usize>>,
+        tokens: Option<Vec<Token>>,
     ) -> Result<Self, String> {
         if silence.len() != output_frames {
             return Err(format!(
@@ -130,11 +165,31 @@ impl Decoded {
         if !encoder_seconds.is_finite() || encoder_seconds < 0.0 {
             return Err("recognition encoder duration must be finite and nonnegative".into());
         }
+        if let Some(labels) = &labels
+            && labels.len() != output_frames
+        {
+            return Err(format!(
+                "recognition label sequence has {} frames, expected {output_frames}",
+                labels.len()
+            ));
+        }
+        if let Some(tokens) = &tokens {
+            for token in tokens {
+                if token.frame() >= output_frames {
+                    return Err(format!(
+                        "recognition token frame {} is outside the decoded window of {output_frames} frames",
+                        token.frame()
+                    ));
+                }
+            }
+        }
         Ok(Self {
             words,
             silence,
             output_frames,
             encoder_seconds,
+            labels,
+            tokens,
         })
     }
 
@@ -158,6 +213,18 @@ impl Decoded {
 
     pub fn silence(&self) -> &[bool] {
         &self.silence
+    }
+
+    /// Returns the raw per-frame argmax labels behind this window's tokens and words, one per
+    /// output frame including blank, or `None` for a decoder that exposes no per-frame labels.
+    pub fn labels(&self) -> Option<&[usize]> {
+        self.labels.as_deref()
+    }
+
+    /// Returns the collapsed pre-word-merge tokens behind this window's words, or `None` for a
+    /// decoder that exposes no per-frame labels.
+    pub fn tokens(&self) -> Option<&[Token]> {
+        self.tokens.as_deref()
     }
 
     pub const fn output_frames(&self) -> usize {
@@ -201,4 +268,66 @@ impl WindowDecoder for Box<dyn WindowDecoder> {
 /// Injected speech-probability execution port over Audio's validated sample value.
 pub trait SpeechProbabilityDetector {
     fn probabilities(&mut self, audio: ChannelAudioView<'_>) -> Result<Vec<f32>, String>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Decoded, Token, Word};
+
+    fn word() -> Word {
+        Word::new("word".into(), 0.0, 0.1).expect("test word timestamps are valid")
+    }
+
+    #[test]
+    fn plain_construction_leaves_labels_and_tokens_absent() {
+        let decoded = Decoded::new(vec![word()], vec![false, true], 2, 0.0)
+            .expect("valid plain decoded construction must succeed");
+        assert_eq!(decoded.labels(), None);
+        assert_eq!(decoded.tokens(), None);
+    }
+
+    #[test]
+    fn labeled_construction_preserves_labels_and_tokens() {
+        let decoded = Decoded::new_with_labels(
+            vec![word()],
+            vec![false, false],
+            2,
+            0.0,
+            vec![1, 1],
+            vec![Token::new(1, 0)],
+        )
+        .expect("valid labeled decoded construction must succeed");
+        assert_eq!(decoded.labels(), Some(&[1, 1][..]));
+        assert_eq!(decoded.tokens(), Some(&[Token::new(1, 0)][..]));
+    }
+
+    #[test]
+    fn labeled_construction_refuses_a_wrong_labels_length() {
+        assert!(
+            Decoded::new_with_labels(
+                vec![word()],
+                vec![false, false],
+                2,
+                0.0,
+                vec![1],
+                Vec::new(),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn labeled_construction_refuses_a_token_frame_outside_the_window() {
+        assert!(
+            Decoded::new_with_labels(
+                vec![word()],
+                vec![false, false],
+                2,
+                0.0,
+                vec![1, 1],
+                vec![Token::new(1, 2)],
+            )
+            .is_err()
+        );
+    }
 }

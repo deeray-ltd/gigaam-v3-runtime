@@ -65,22 +65,29 @@ pub fn greedy(
     vocabulary: usize,
     blank: usize,
 ) -> Result<Vec<Token>, String> {
-    let (tokens, _) = greedy_masked(log_probabilities, frames, vocabulary, blank, None)?;
+    let (tokens, _, _) = greedy_masked(log_probabilities, frames, vocabulary, blank, None)?;
     Ok(tokens)
 }
 
-/// The greedy output plus a per-frame silence mask. A frame is silent when its argmax is blank or
-/// the bare SentencePiece space token emitted during pauses between words.
+/// Greedy CTC output: the collapsed non-blank tokens, the per-frame silence mask, and the raw
+/// per-frame argmax label (one entry per frame, blank included).
+pub type GreedyMaskedOutput = (Vec<Token>, Vec<bool>, Vec<usize>);
+
+/// The greedy output plus a per-frame silence mask and the raw per-frame argmax label. A frame is
+/// silent when its argmax is blank or the bare SentencePiece space token emitted during pauses
+/// between words. `labels` has one entry per output frame, blank included, so a caller can
+/// reproduce the collapse behind `tokens` without re-running the encoder.
 pub fn greedy_masked(
     log_probabilities: &[f32],
     frames: usize,
     vocabulary: usize,
     blank: usize,
     space: Option<usize>,
-) -> Result<(Vec<Token>, Vec<bool>), String> {
+) -> Result<GreedyMaskedOutput, String> {
     validate_greedy_input(log_probabilities, frames, vocabulary, blank, space)?;
     let mut out = Vec::new();
     let mut silence = Vec::with_capacity(frames);
+    let mut labels = Vec::with_capacity(frames);
     let mut previous = usize::MAX;
     for frame in 0..frames {
         let row = &log_probabilities[frame * vocabulary..(frame + 1) * vocabulary];
@@ -94,9 +101,10 @@ pub fn greedy_masked(
         if best != blank && best != previous {
             out.push(Token::new(best, frame));
         }
+        labels.push(best);
         previous = best;
     }
-    Ok((out, silence))
+    Ok((out, silence, labels))
 }
 
 fn validate_greedy_input(
@@ -261,7 +269,7 @@ impl<E: Encoder> WindowDecoder for CtcDecoder<E> {
         let started = Instant::now();
         let (log_probabilities, output_frames) = self.encoder.forward(features)?;
         let encoder_seconds = started.elapsed().as_secs_f64();
-        let (tokens, silence) = greedy_masked(
+        let (tokens, silence, labels) = greedy_masked(
             &log_probabilities,
             output_frames,
             self.encoder.out_dim(),
@@ -269,7 +277,14 @@ impl<E: Encoder> WindowDecoder for CtcDecoder<E> {
             self.silence_policy.space_token(),
         )?;
         let words = tokens_to_words(&tokens, &self.vocabulary, self.frame_rate)?;
-        Decoded::new(words, silence, output_frames, encoder_seconds)
+        Decoded::new_with_labels(
+            words,
+            silence,
+            output_frames,
+            encoder_seconds,
+            labels,
+            tokens,
+        )
     }
 }
 
@@ -339,13 +354,49 @@ mod tests {
         let log_probabilities = [
             0.0, -1.0, -1.0, -1.0, 0.0, -1.0, -1.0, -1.0, 0.0, -1.0, 0.0, -1.0,
         ];
-        let (tokens, silence) = greedy_masked(&log_probabilities, 4, 3, 0, Some(2))
+        let (tokens, silence, labels) = greedy_masked(&log_probabilities, 4, 3, 0, Some(2))
             .expect("finite CTC logits satisfy the declared matrix contract");
         assert_eq!(silence, vec![true, false, true, false]);
+        assert_eq!(labels, vec![0, 1, 2, 1]);
         assert_eq!(
             tokens,
             vec![Token::new(1, 1), Token::new(2, 2), Token::new(1, 3)]
         );
+    }
+
+    #[test]
+    fn greedy_masked_labels_have_one_entry_per_frame_and_agree_with_emitted_tokens() {
+        // Frames 0-1 repeat label 1 (one token), frame 2 is blank, frames 3-4 repeat label 2
+        // (one token), frame 5 returns to label 1 (a new token because the intervening blank
+        // reset the previous-label state).
+        let log_probabilities = [
+            0.0, 5.0, 0.0, // frame 0: label 1
+            0.0, 5.0, 0.0, // frame 1: label 1 (repeat)
+            5.0, 0.0, 0.0, // frame 2: blank
+            0.0, 0.0, 5.0, // frame 3: label 2
+            0.0, 0.0, 5.0, // frame 4: label 2 (repeat)
+            0.0, 5.0, 0.0, // frame 5: label 1
+        ];
+        let (tokens, _silence, labels) = greedy_masked(&log_probabilities, 6, 3, 0, None)
+            .expect("finite CTC logits satisfy the declared matrix contract");
+        assert_eq!(labels.len(), 6);
+        assert_eq!(labels, vec![1, 1, 0, 2, 2, 1]);
+        assert_eq!(
+            tokens,
+            vec![Token::new(1, 0), Token::new(2, 3), Token::new(1, 5)]
+        );
+        for token in &tokens {
+            let frame = token.frame();
+            assert_eq!(
+                labels[frame],
+                token.id(),
+                "an emitted token must name the label actually decoded at its frame"
+            );
+            assert!(
+                frame == 0 || labels[frame - 1] != token.id(),
+                "an emitted token must start a new run, not continue the previous frame's label"
+            );
+        }
     }
 
     #[test]
