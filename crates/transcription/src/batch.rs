@@ -12,13 +12,61 @@
 use crate::contracts::{
     BatchConfig, PadPolicy, StageTimings, Transcript, TranscriptWord, checkpoint,
 };
-use crate::observations::{ObservationMode, WindowTiming};
+use crate::observations::{
+    ObservationMode, WindowEvidence, WindowEvidenceInput, WindowKind, WindowTiming,
+};
 use crate::padding::pad_noise;
 use crate::stitch::{WindowWords, stitch_aligned, windows};
 use gigaam_audio::{ChannelAudio, FeatureMatrix, FrontendProcessor};
 use gigaam_primitives::{trunc_f32_to_usize, usize_to_f32, usize_to_u64_checked};
 use gigaam_recognition::{ExecutionControl, FrameRate, WindowDecoder};
 use std::sync::Arc;
+
+/// Per-window geometry computed once by the window loop and threaded into per-window decoding,
+/// so the same values back both the transcript word cut and, when enabled, the window-evidence
+/// record. `subsampling_factor` is `None` unless a window-evidence observer is installed, so its
+/// derivation (and any refusal it could produce) never runs on the plain transcription path.
+struct WindowGeometry {
+    index: usize,
+    kind: WindowKind,
+    start_sec: f32,
+    end_sec: f32,
+    first_sample: usize,
+    first_frame: usize,
+    last_frame: usize,
+    offset: f32,
+    keep_until_sec: f32,
+    subsampling_factor: Option<usize>,
+}
+
+/// Derives the encoder's frame-subsampling factor from a frontend's sample rate and hop length
+/// and a decoder's output frame rate, instead of assuming a fixed value. `sample_rate /
+/// hop_length` is the frontend's own feature-frame rate; dividing it by the encoder's output
+/// frame rate must yield a whole number of frontend frames per encoder output frame. The batch
+/// window loop and the CLI evidence-header writer both call this so the two stay consistent.
+pub fn subsampling_factor(
+    sample_rate: usize,
+    hop_length: usize,
+    frame_rate: FrameRate,
+) -> Result<usize, String> {
+    if hop_length == 0 {
+        return Err("batch frontend hop length must be positive".into());
+    }
+    let feature_rate = usize_to_f32(sample_rate) / usize_to_f32(hop_length);
+    let ratio = feature_rate / frame_rate.get();
+    if !ratio.is_finite() || ratio < 1.0 {
+        return Err(format!(
+            "batch subsampling factor {ratio} must be finite and at least one"
+        ));
+    }
+    let rounded = ratio.round();
+    if (ratio - rounded).abs() > 1e-3 {
+        return Err(format!(
+            "batch subsampling factor {ratio} is not a whole number of encoder output frames"
+        ));
+    }
+    trunc_f32_to_usize(rounded).map_err(|error| format!("batch subsampling factor: {error}"))
+}
 
 /// A mutable single-channel batch transcriber with one supplied recognition decoder.
 pub struct BatchTranscriber<D: WindowDecoder> {
@@ -115,14 +163,11 @@ impl<D: WindowDecoder> BatchTranscriber<D> {
     fn decode_frames(
         &mut self,
         all_features: &FeatureMatrix,
-        first_frame: usize,
-        last_frame: usize,
-        offset: f32,
-        end_sec: f32,
+        geometry: WindowGeometry,
     ) -> Result<Vec<TranscriptWord>, String> {
         checkpoint(&self.control)?;
-        let features = all_features.frame_range(first_frame, last_frame)?;
-        let frames = features.frames();
+        let features = all_features.frame_range(geometry.first_frame, geometry.last_frame)?;
+        let feature_frames = features.frames();
         checkpoint(&self.control)?;
         let started = std::time::Instant::now();
         let decoded = self.decoder.decode(features.view())?;
@@ -137,21 +182,47 @@ impl<D: WindowDecoder> BatchTranscriber<D> {
         {
             return Err("recognition decoder reported an invalid stage duration".into());
         }
+        if let (Some(labels), Some(tokens), Some(subsampling_factor)) = (
+            decoded.labels(),
+            decoded.tokens(),
+            geometry.subsampling_factor,
+        ) {
+            let evidence = WindowEvidence::new(WindowEvidenceInput {
+                index: geometry.index,
+                kind: geometry.kind,
+                start_sec: geometry.start_sec,
+                end_sec: geometry.end_sec,
+                first_sample: geometry.first_sample,
+                first_feature_frame: geometry.first_frame,
+                feature_frames,
+                residue: geometry.first_frame % subsampling_factor,
+                origin: geometry.first_frame / subsampling_factor,
+                output_frames: decoded.output_frames(),
+                keep_until_sec: geometry.keep_until_sec,
+                labels: labels.to_vec(),
+                mask: decoded.silence().to_vec(),
+                tokens: tokens.to_vec(),
+            })?;
+            self.observations.emit_evidence(evidence);
+        }
         let words = decoded
             .into_words()
             .into_iter()
             .map(TranscriptWord::from_recognition)
             .collect::<Result<Vec<_>, _>>()?
             .into_iter()
-            .map(|word| word.shifted(offset))
+            .map(|word| word.shifted(geometry.offset))
             .collect::<Result<Vec<_>, _>>()?
             .into_iter()
-            .filter(|word| word.start() < end_sec)
+            .filter(|word| word.start() < geometry.keep_until_sec)
             .collect();
         self.timings.add_encoder(encoder_seconds);
         self.timings.add_decode(decode_seconds);
-        self.observations
-            .emit(WindowTiming::new(offset, frames, encoder_seconds)?);
+        self.observations.emit(WindowTiming::new(
+            geometry.offset,
+            feature_frames,
+            encoder_seconds,
+        )?);
         Ok(words)
     }
 
@@ -191,8 +262,17 @@ impl<D: WindowDecoder> BatchTranscriber<D> {
             self.config.window_sec(),
             self.config.overlap_sec(),
         )?;
+        let subsampling_factor = if self.observations.evidence_enabled() {
+            Some(subsampling_factor(
+                self.sample_rate,
+                self.frontend.hop_length(),
+                self.frame_rate,
+            )?)
+        } else {
+            None
+        };
         let mut window_words = Vec::with_capacity(windows.len());
-        for window in &windows {
+        for (window_index, window) in windows.iter().enumerate() {
             checkpoint(&self.control)?;
             let start = window.start();
             let end = window.end();
@@ -218,12 +298,25 @@ impl<D: WindowDecoder> BatchTranscriber<D> {
                 continue;
             }
             let offset = usize_to_f32(first_frame) * usize_to_f32(hop) / sample_rate_f32;
+            let kind = if window_index + 1 == windows.len() {
+                WindowKind::Tail
+            } else {
+                WindowKind::Body
+            };
             let words = self.decode_frames(
                 &features,
-                first_frame,
-                last_frame,
-                offset,
-                end.min(keep_until),
+                WindowGeometry {
+                    index: window_index,
+                    kind,
+                    start_sec: start,
+                    end_sec: end,
+                    first_sample,
+                    first_frame,
+                    last_frame,
+                    offset,
+                    keep_until_sec: end.min(keep_until),
+                    subsampling_factor,
+                },
             )?;
             window_words.push(WindowWords::new(*window, words));
         }
@@ -240,13 +333,16 @@ impl<D: WindowDecoder> BatchTranscriber<D> {
 
 #[cfg(test)]
 mod tests {
-    use super::{BatchSetup, BatchTranscriber};
+    use super::{BatchSetup, BatchTranscriber, subsampling_factor};
     use crate::contracts::{BatchConfig, PadPolicy};
-    use crate::observations::{ObservationMode, WindowTiming, WindowTimingObserver};
+    use crate::observations::{
+        ObservationMode, WindowEvidence, WindowEvidenceObserver, WindowKind, WindowTiming,
+        WindowTimingObserver,
+    };
     use crate::test_support;
     use gigaam_audio::{ChannelAudio, SampleRate};
     use gigaam_recognition::{
-        Decoded, ExecutionControl, ExecutionState, FrameRate, WindowDecoder, Word,
+        Decoded, ExecutionControl, ExecutionState, FrameRate, Token, WindowDecoder, Word,
     };
     use std::sync::Arc;
     use std::sync::Mutex;
@@ -337,6 +433,58 @@ mod tests {
         }
     }
 
+    /// A decoder that always exposes CTC-style labels and tokens, so evidence-observer tests do
+    /// not depend on a real encoder.
+    struct EvidenceDecoder {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl WindowDecoder for EvidenceDecoder {
+        fn frame_rate(&self) -> FrameRate {
+            FrameRate::new(8.0).expect("test decoder frame rate is positive")
+        }
+
+        fn decode(
+            &mut self,
+            features: gigaam_audio::FeatureMatrixView<'_>,
+        ) -> Result<Decoded, String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let frames = features.frames();
+            let word = Word::new("word".into(), 0.0, 0.1)
+                .expect("test decoder word timestamps are coherent");
+            Decoded::new_with_labels(
+                vec![word],
+                vec![false; frames],
+                frames,
+                0.0,
+                vec![1; frames],
+                vec![Token::new(1, 0)],
+            )
+        }
+    }
+
+    struct EvidenceRecordingObserver {
+        observations: Mutex<Vec<WindowEvidence>>,
+    }
+
+    impl EvidenceRecordingObserver {
+        fn observations(&self) -> Vec<WindowEvidence> {
+            self.observations
+                .lock()
+                .expect("test observer lock must not be poisoned")
+                .clone()
+        }
+    }
+
+    impl WindowEvidenceObserver for EvidenceRecordingObserver {
+        fn observe(&self, observation: WindowEvidence) {
+            self.observations
+                .lock()
+                .expect("test observer lock must not be poisoned")
+                .push(observation);
+        }
+    }
+
     fn config() -> BatchConfig {
         BatchConfig::new(
             SampleRate::new(16).expect("test sample rate is positive"),
@@ -349,6 +497,44 @@ mod tests {
 
     fn input() -> ChannelAudio {
         ChannelAudio::new(vec![0.25; 48]).expect("test samples must be finite")
+    }
+
+    #[test]
+    fn subsampling_factor_derives_whole_ratios_and_refuses_fractional_or_zero_input() {
+        assert_eq!(
+            subsampling_factor(
+                16_000,
+                160,
+                FrameRate::new(25.0).expect("test frame rate is positive")
+            ),
+            Ok(4)
+        );
+        assert_eq!(
+            subsampling_factor(
+                16,
+                2,
+                FrameRate::new(8.0).expect("test frame rate is positive")
+            ),
+            Ok(1)
+        );
+        assert!(
+            subsampling_factor(
+                16_000,
+                160,
+                FrameRate::new(7.0).expect("test frame rate is positive")
+            )
+            .is_err(),
+            "a non-whole-number ratio must refuse"
+        );
+        assert!(
+            subsampling_factor(
+                16_000,
+                0,
+                FrameRate::new(25.0).expect("test frame rate is positive")
+            )
+            .is_err(),
+            "a zero hop length must refuse"
+        );
     }
 
     #[test]
@@ -430,6 +616,116 @@ mod tests {
             enabled_calls.load(Ordering::SeqCst)
         );
         assert_eq!(disabled_transcript, enabled_transcript);
+    }
+
+    #[test]
+    fn evidence_observer_emits_one_record_per_window_and_leaves_the_transcript_unchanged() {
+        let enabled_calls = Arc::new(AtomicUsize::new(0));
+        let observer = Arc::new(EvidenceRecordingObserver {
+            observations: Mutex::new(Vec::new()),
+        });
+        let mut enabled = BatchTranscriber::new(BatchSetup {
+            frontend: test_support::frontend(),
+            decoder: EvidenceDecoder {
+                calls: enabled_calls.clone(),
+            },
+            config: config(),
+            control: ExecutionControl::without_deadline(),
+            observations: ObservationMode::disabled().with_evidence(observer.clone()),
+        })
+        .expect("test batch setup must be valid");
+        let enabled_transcript = enabled
+            .transcribe_channel(&input())
+            .expect("evidence decoder must transcribe every window");
+        let records = observer.observations();
+        assert_eq!(records.len(), enabled_calls.load(Ordering::SeqCst));
+        assert_eq!(records.len(), enabled_transcript.windows());
+        for (index, record) in records.iter().enumerate() {
+            assert_eq!(record.index(), index);
+            let expected_kind = if index + 1 == records.len() {
+                WindowKind::Tail
+            } else {
+                WindowKind::Body
+            };
+            assert_eq!(record.kind(), expected_kind);
+            assert_eq!(record.output_frames(), record.labels().len());
+            assert_eq!(record.output_frames(), record.mask().len());
+            assert_eq!(record.tokens(), &[Token::new(1, 0)]);
+        }
+
+        let disabled_calls = Arc::new(AtomicUsize::new(0));
+        let mut disabled = BatchTranscriber::new(BatchSetup {
+            frontend: test_support::frontend(),
+            decoder: EvidenceDecoder {
+                calls: disabled_calls.clone(),
+            },
+            config: config(),
+            control: ExecutionControl::without_deadline(),
+            observations: ObservationMode::disabled(),
+        })
+        .expect("test batch setup must be valid");
+        let disabled_transcript = disabled
+            .transcribe_channel(&input())
+            .expect("evidence decoder must transcribe with the evidence channel disabled");
+        assert_eq!(
+            disabled_calls.load(Ordering::SeqCst),
+            enabled_calls.load(Ordering::SeqCst)
+        );
+        assert_eq!(disabled_transcript, enabled_transcript);
+    }
+
+    #[test]
+    fn evidence_geometry_matches_window_arithmetic_including_an_off_grid_tail_window() {
+        // Frontend feature rate is sample_rate / hop_length = 64 / 2 = 32 Hz; the decoder's frame
+        // rate is 8 Hz, so this fixture's subsampling factor is 32 / 8 = 4. A 100-sample (1.5625 s)
+        // input with a 1.0 s window and 0.25 s overlap produces a body window starting on the
+        // subsampling grid and a tail window widened backward to an off-grid start.
+        let sample_rate = SampleRate::new(64).expect("test sample rate is positive");
+        let observer = Arc::new(EvidenceRecordingObserver {
+            observations: Mutex::new(Vec::new()),
+        });
+        let mut transcriber = BatchTranscriber::new(BatchSetup {
+            frontend: test_support::frontend_at_sample_rate(64),
+            decoder: EvidenceDecoder {
+                calls: Arc::new(AtomicUsize::new(0)),
+            },
+            config: BatchConfig::new(sample_rate, 1.0, 0.25, PadPolicy::Exact)
+                .expect("test batch configuration must be valid"),
+            control: ExecutionControl::without_deadline(),
+            observations: ObservationMode::disabled().with_evidence(observer.clone()),
+        })
+        .expect("test batch setup must be valid");
+        let audio = ChannelAudio::new(vec![0.25; 100]).expect("test samples must be finite");
+        transcriber
+            .transcribe_channel(&audio)
+            .expect("evidence decoder must transcribe every window");
+        let records = observer.observations();
+        assert_eq!(
+            records.len(),
+            2,
+            "this fixture must produce exactly a body and a tail window"
+        );
+        for record in &records {
+            assert_eq!(
+                record.origin() * 4 + record.residue(),
+                record.first_feature_frame(),
+                "origin * subsampling_factor + residue must reconstruct the first feature frame"
+            );
+            assert!(
+                record.residue() < 4,
+                "residue must stay within one subsampling period"
+            );
+        }
+        assert_eq!(
+            (records[0].kind(), records[0].residue()),
+            (WindowKind::Body, 0)
+        );
+        assert_eq!(
+            (records[1].kind(), records[1].residue()),
+            (WindowKind::Tail, 2)
+        );
+        assert_eq!(records[1].first_feature_frame(), 18);
+        assert_eq!(records[1].origin(), 4);
     }
 
     #[test]

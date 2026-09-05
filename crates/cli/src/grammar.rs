@@ -78,6 +78,7 @@ pub(crate) struct TranscribeInvocation {
     pub(crate) padding: PadPolicy,
     pub(crate) output: TranscribeOutput,
     pub(crate) turn_gap_seconds: f32,
+    pub(crate) evidence: Option<PathBuf>,
 }
 
 /// The exact decoder family selected for offline batch transcription.
@@ -180,7 +181,13 @@ impl Command {
         match self {
             Self::Transcribe => matches!(
                 option,
-                "--model" | "--ep" | "--ort-dylib" | "--window" | "--overlap" | "--turn-gap"
+                "--model"
+                    | "--ep"
+                    | "--ort-dylib"
+                    | "--window"
+                    | "--overlap"
+                    | "--turn-gap"
+                    | "--evidence"
             ),
             Self::Bench => matches!(
                 option,
@@ -401,6 +408,7 @@ fn transcribe(parsed: ParsedArguments) -> Result<Invocation, String> {
         true => DecoderChoice::Rnnt,
         false => DecoderChoice::Ctc,
     };
+    let evidence = parsed.value("--evidence").map(PathBuf::from);
     Ok(Invocation::Transcribe(TranscribeInvocation {
         input: parsed.required_input("transcribe")?,
         model: parsed.model(),
@@ -416,6 +424,7 @@ fn transcribe(parsed: ParsedArguments) -> Result<Invocation, String> {
             turns,
         },
         turn_gap_seconds,
+        evidence,
     }))
 }
 
@@ -627,6 +636,7 @@ mod tests {
     fn command_grammar_accepts_one_complete_form_per_command() {
         for values in [
             vec!["transcribe", "audio.wav"],
+            vec!["transcribe", "audio.wav", "--evidence", "out.evidence.txt"],
             vec!["bench", "--iters", "1"],
             vec![
                 "stream",
@@ -664,6 +674,15 @@ mod tests {
             vec!["dialog", "audio.wav", "--endpoint", "gpu"],
             vec!["vad", "audio.wav", "--threshold", "1.1"],
             vec!["transcribe", "audio.wav", "--words", "--turns"],
+            vec!["transcribe", "audio.wav", "--evidence"],
+            vec![
+                "transcribe",
+                "audio.wav",
+                "--evidence",
+                "out.evidence.txt",
+                "--evidence",
+                "again.evidence.txt",
+            ],
         ] {
             assert!(
                 parse_text(&arguments(&values)).is_err(),
@@ -700,6 +719,30 @@ mod tests {
                         channels: ChannelOutput::Split,
                         turns: TurnOutput::Included,
                     }
+                );
+            }
+            Ok(_) => panic!("transcribe grammar must produce a transcribe invocation"),
+            Err(error) => panic!("valid transcribe grammar must succeed: {error}"),
+        }
+    }
+
+    #[test]
+    fn evidence_option_is_absent_by_default_and_carries_its_value_when_given() {
+        match parse_text(&arguments(&["transcribe", "audio.wav"])) {
+            Ok(Invocation::Transcribe(invocation)) => assert_eq!(invocation.evidence, None),
+            Ok(_) => panic!("transcribe grammar must produce a transcribe invocation"),
+            Err(error) => panic!("valid transcribe grammar must succeed: {error}"),
+        }
+        match parse_text(&arguments(&[
+            "transcribe",
+            "audio.wav",
+            "--evidence",
+            "out.evidence.txt",
+        ])) {
+            Ok(Invocation::Transcribe(invocation)) => {
+                assert_eq!(
+                    invocation.evidence,
+                    Some(std::path::PathBuf::from("out.evidence.txt"))
                 );
             }
             Ok(_) => panic!("transcribe grammar must produce a transcribe invocation"),
