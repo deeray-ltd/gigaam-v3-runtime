@@ -238,10 +238,12 @@ package rate rather than a fixed sample count.
 `transcribe --evidence PATH` writes one per-window decode-evidence file alongside the ordinary
 transcript: a plain ASCII text file with a header line, one `model` line and one `audio` line
 naming the package and input, and one block per decoded window carrying that window's geometry,
-raw per-frame CTC labels, non-emission mask, and collapsed tokens. PATH is validated once, before
-any window is decoded: its parent directory must already exist, and PATH itself must not already
-be a directory. The transcript is unaffected by --evidence; only CTC transcription supports it,
-so it conflicts with --rnnt.
+raw per-frame CTC labels, non-emission mask, collapsed tokens, and the token-index span behind
+each decoded word, so an external reader can check its own word grouping against the decoder's
+own word rule without re-implementing it. PATH is validated once, before any window is decoded:
+its parent directory must already exist, and PATH itself must not already be a directory. The
+transcript is unaffected by --evidence; only CTC transcription supports it, so it conflicts with
+--rnnt.
 
 For applicable commands, --model defaults to model. --ort-dylib or ORT_DYLIB_PATH is
 required; when both are present, they must be identical. Provider selection and runtime

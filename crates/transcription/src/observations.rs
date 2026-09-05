@@ -85,12 +85,14 @@ pub(crate) struct WindowEvidenceInput {
     pub(crate) labels: Vec<usize>,
     pub(crate) mask: Vec<bool>,
     pub(crate) tokens: Vec<Token>,
+    pub(crate) word_spans: Vec<(usize, usize)>,
 }
 
 /// Immutable per-window collapse-and-geometry evidence, emitted after a successful decode when a
 /// window-evidence observer is installed. It carries the CTC decoder's own raw per-frame argmax
-/// labels and its collapsed pre-word-merge tokens, both in this window's local frame coordinates,
-/// so an external tool can reproduce word segmentation without re-running recognition.
+/// labels, its collapsed pre-word-merge tokens, and the token-index span behind each decoded
+/// word, all in this window's local frame/token coordinates, so an external tool can reproduce
+/// word segmentation without re-running recognition or re-implementing the decoder's word rule.
 #[derive(Clone, Debug, PartialEq)]
 pub struct WindowEvidence {
     index: usize,
@@ -107,6 +109,7 @@ pub struct WindowEvidence {
     labels: Vec<usize>,
     mask: Vec<bool>,
     tokens: Vec<Token>,
+    word_spans: Vec<(usize, usize)>,
 }
 
 impl WindowEvidence {
@@ -143,6 +146,14 @@ impl WindowEvidence {
                 ));
             }
         }
+        for &(first, last) in &input.word_spans {
+            if first > last || last >= input.tokens.len() {
+                return Err(format!(
+                    "window evidence word span ({first}, {last}) is outside the {}-token decoded window",
+                    input.tokens.len()
+                ));
+            }
+        }
         Ok(Self {
             index: input.index,
             kind: input.kind,
@@ -158,6 +169,7 @@ impl WindowEvidence {
             labels: input.labels,
             mask: input.mask,
             tokens: input.tokens,
+            word_spans: input.word_spans,
         })
     }
 
@@ -215,6 +227,12 @@ impl WindowEvidence {
 
     pub fn tokens(&self) -> &[Token] {
         &self.tokens
+    }
+
+    /// Returns the token-index span behind each decoded word, in word order. Each span's
+    /// indices refer to this record's own `tokens()` list.
+    pub fn word_spans(&self) -> &[(usize, usize)] {
+        &self.word_spans
     }
 }
 
@@ -308,6 +326,7 @@ mod tests {
             labels: vec![0, 1],
             mask: vec![true, false],
             tokens: vec![Token::new(1, 1)],
+            word_spans: vec![(0, 0)],
         }
     }
 
@@ -325,6 +344,20 @@ mod tests {
         assert_eq!(evidence.labels(), &[0, 1]);
         assert_eq!(evidence.mask(), &[true, false]);
         assert_eq!(evidence.tokens(), &[Token::new(1, 1)]);
+        assert_eq!(evidence.word_spans(), &[(0, 0)]);
+    }
+
+    #[test]
+    fn word_spans_index_within_the_carried_tokens_list() {
+        let mut input = valid_input();
+        input.tokens = vec![Token::new(1, 0), Token::new(2, 1)];
+        input.word_spans = vec![(0, 1)];
+        let evidence =
+            WindowEvidence::new(input).expect("a span within the token list must succeed");
+        for &(first, last) in evidence.word_spans() {
+            assert!(first <= last);
+            assert!(last < evidence.tokens().len());
+        }
     }
 
     #[test]
@@ -349,5 +382,20 @@ mod tests {
         let mut negative_keep_until = valid_input();
         negative_keep_until.keep_until_sec = -1.0;
         assert!(WindowEvidence::new(negative_keep_until).is_err());
+
+        let mut out_of_range_word_span = valid_input();
+        out_of_range_word_span.word_spans = vec![(0, 1)];
+        assert!(
+            WindowEvidence::new(out_of_range_word_span).is_err(),
+            "a word span whose end exceeds the token list must refuse"
+        );
+
+        let mut inverted_word_span = valid_input();
+        inverted_word_span.tokens = vec![Token::new(1, 1), Token::new(1, 1)];
+        inverted_word_span.word_spans = vec![(0, 0), (1, 0)]; // the second span ends before it starts
+        assert!(
+            WindowEvidence::new(inverted_word_span).is_err(),
+            "a word span whose end precedes its start must refuse"
+        );
     }
 }
