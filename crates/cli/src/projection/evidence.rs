@@ -6,10 +6,13 @@
 //!
 //! Plain UTF-8 text, ASCII content only, one line per record, fields separated by single
 //! spaces: an `evidence v1` line, a `model` line, an `audio` line, then one
-//! `window`/`labels`/`mask`/`tokens`/`end` block per successfully decoded window. Token ids are
-//! written as bare integers; SentencePiece vocabulary text never crosses this boundary.
-//! Transcription never writes files or reads the environment; this module is the CLI's own
-//! process-boundary adapter around the crate's typed `WindowEvidenceObserver` port.
+//! `window`/`labels`/`mask`/`tokens`/`words`/`end` block per successfully decoded window. Token
+//! ids are written as bare integers; SentencePiece vocabulary text never crosses this boundary.
+//! The `words` line carries the same token-index spans the decoder's own word rule produced, one
+//! `first-last` pair per word in word order, both ends inclusive indices into that window's
+//! `tokens` line; a window with no words writes `words` with no pairs after it. Transcription
+//! never writes files or reads the environment; this module is the CLI's own process-boundary
+//! adapter around the crate's typed `WindowEvidenceObserver` port.
 
 use gigaam_recognition::Token;
 use gigaam_transcription::{WindowEvidence, WindowEvidenceObserver, WindowKind};
@@ -74,6 +77,7 @@ struct WindowRecord<'a> {
     labels: &'a [usize],
     mask: &'a [bool],
     tokens: &'a [Token],
+    word_spans: &'a [(usize, usize)],
 }
 
 /// A file-writing observer that formats each successfully decoded window as one `evidence v1` block.
@@ -154,6 +158,7 @@ impl WindowEvidenceObserver for EvidenceWriter {
             labels: observation.labels(),
             mask: observation.mask(),
             tokens: observation.tokens(),
+            word_spans: observation.word_spans(),
         };
         let mut writer = self
             .writer
@@ -222,6 +227,11 @@ fn write_window(writer: &mut dyn Write, record: &WindowRecord<'_>) -> io::Result
         write!(writer, " {}@{}", token.id(), token.frame())?;
     }
     writeln!(writer)?;
+    write!(writer, "words")?;
+    for (first, last) in record.word_spans {
+        write!(writer, " {first}-{last}")?;
+    }
+    writeln!(writer)?;
     writeln!(writer, "end")
 }
 
@@ -279,6 +289,7 @@ mod tests {
         labels: Vec<usize>,
         mask: Vec<bool>,
         tokens: Vec<(usize, usize)>,
+        words: Vec<(usize, usize)>,
     }
 
     fn field<'a>(pairs: &[&'a str], key: &str) -> &'a str {
@@ -369,6 +380,18 @@ mod tests {
             })
             .collect();
 
+        let words_line = lines.next().expect("evidence must have a words line");
+        let mut words_fields = words_line.split_whitespace();
+        assert_eq!(words_fields.next(), Some("words"));
+        let words: Vec<(usize, usize)> = words_fields
+            .map(|entry| {
+                let (first, last) = entry
+                    .split_once('-')
+                    .unwrap_or_else(|| panic!("evidence word span {entry:?} must contain '-'"));
+                (parse_usize(first), parse_usize(last))
+            })
+            .collect();
+
         assert_eq!(lines.next(), Some("end"));
         assert_eq!(
             lines.next(),
@@ -391,6 +414,7 @@ mod tests {
             labels,
             mask,
             tokens,
+            words,
         };
         ParsedEvidence {
             model_id,
@@ -441,6 +465,7 @@ mod tests {
             labels: &[256, 1, 1, 0, 2],
             mask: &[true, false, false, true, false],
             tokens: &[Token::new(1, 1), Token::new(2, 4)],
+            word_spans: &[(0, 0), (1, 1)],
         };
         write_window(&mut buffer, &record)
             .expect("writing one window record to an in-memory buffer must succeed");
@@ -483,6 +508,36 @@ mod tests {
         assert_eq!(window.labels, vec![256, 1, 1, 0, 2]);
         assert_eq!(window.mask, vec![true, false, false, true, false]);
         assert_eq!(window.tokens, vec![(1, 1), (2, 4)]);
+        assert_eq!(window.words, vec![(0, 0), (1, 1)]);
+    }
+
+    #[test]
+    fn writer_output_for_a_window_with_no_words_writes_an_empty_words_line() {
+        let mut buffer = Vec::new();
+        let record = WindowRecord {
+            index: 0,
+            kind: WindowKind::Body,
+            start_sec: 0.0,
+            end_sec: 1.0,
+            first_sample: 0,
+            first_feature_frame: 0,
+            feature_frames: 4,
+            residue: 0,
+            origin: 0,
+            output_frames: 2,
+            keep_until_sec: 1.0,
+            labels: &[0, 0],
+            mask: &[true, true],
+            tokens: &[],
+            word_spans: &[],
+        };
+        write_window(&mut buffer, &record)
+            .expect("writing a wordless window record to an in-memory buffer must succeed");
+        let text = String::from_utf8(buffer).expect("evidence output must be UTF-8");
+        assert!(
+            text.lines().any(|line| line == "words"),
+            "a window with no words must write a bare words line"
+        );
     }
 
     #[test]
@@ -502,7 +557,7 @@ mod tests {
         .expect("writing the model header to an in-memory buffer must succeed");
         let text = String::from_utf8(buffer).expect("evidence output must be UTF-8");
         let parsed = parse_evidence(&format!(
-            "{text}audio a sample_rate 1 samples 1 total_seconds 1\nwindow 0 kind body start_sec 0 end_sec 1 first_sample 0 first_feature_frame 0 feature_frames 1 residue 0 origin 0 output_frames 0 keep_until_sec 1\nlabels\nmask\ntokens\nend\n"
+            "{text}audio a sample_rate 1 samples 1 total_seconds 1\nwindow 0 kind body start_sec 0 end_sec 1 first_sample 0 first_feature_frame 0 feature_frames 1 residue 0 origin 0 output_frames 0 keep_until_sec 1\nlabels\nmask\ntokens\nwords\nend\n"
         ));
         assert_eq!(
             parsed

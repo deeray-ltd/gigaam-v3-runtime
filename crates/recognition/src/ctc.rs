@@ -158,6 +158,37 @@ pub fn tokens_to_text(tokens: &[Token], vocabulary: &[String]) -> String {
     text.replace('\u{2581}', " ").trim_start().to_owned()
 }
 
+/// Returns the token-index span `(first, last)` behind each word `tokens_to_words` would emit,
+/// in word order and inclusive on both ends, using this token slice's own 0-based indices.
+/// `tokens_to_words` is built on this function, so the two can never disagree about which tokens
+/// form a word: an external reader can reproduce the decoder's own word grouping from the same
+/// tokens without re-implementing the merge rule. A bare SentencePiece word-boundary token
+/// (piece text `▁` with no trailing text) contributes no text and is excluded from every span; a
+/// run of only such tokens yields no span.
+pub fn word_token_spans(tokens: &[Token], vocabulary: &[String]) -> Vec<(usize, usize)> {
+    let mut spans = Vec::new();
+    let mut current = String::new();
+    let (mut first, mut last) = (0_usize, 0_usize);
+    for (index, token) in tokens.iter().enumerate() {
+        let piece = &vocabulary[token.id()];
+        if piece.starts_with('\u{2581}') && !current.is_empty() {
+            let text = std::mem::take(&mut current);
+            if !text.trim().is_empty() {
+                spans.push((first, last));
+            }
+        }
+        if current.is_empty() {
+            first = index;
+        }
+        last = index;
+        current.push_str(piece.trim_start_matches('\u{2581}'));
+    }
+    if !current.is_empty() && !current.trim().is_empty() {
+        spans.push((first, last));
+    }
+    spans
+}
+
 /// Build words using their first and last token times. A piece beginning with `▁` starts a word.
 pub fn tokens_to_words(
     tokens: &[Token],
@@ -165,24 +196,19 @@ pub fn tokens_to_words(
     frame_rate: FrameRate,
 ) -> Result<Vec<Word>, String> {
     let mut words = Vec::new();
-    let mut current = String::new();
-    let (mut first, mut last) = (0_usize, 0_usize);
-    for token in tokens {
-        let piece = &vocabulary[token.id()];
-        if piece.starts_with('\u{2581}') && !current.is_empty() {
-            let text = std::mem::take(&mut current);
-            if !text.trim().is_empty() {
-                words.push(word_from_token_range(text, first, last, frame_rate)?);
-            }
+    for (first_index, last_index) in word_token_spans(tokens, vocabulary) {
+        let mut text = String::new();
+        for token in &tokens[first_index..=last_index] {
+            text.push_str(vocabulary[token.id()].trim_start_matches('\u{2581}'));
         }
-        if current.is_empty() {
-            first = token.frame();
-        }
-        last = token.frame();
-        current.push_str(piece.trim_start_matches('\u{2581}'));
-    }
-    if !current.is_empty() && !current.trim().is_empty() {
-        words.push(word_from_token_range(current, first, last, frame_rate)?);
+        let first_frame = tokens[first_index].frame();
+        let last_frame = tokens[last_index].frame();
+        words.push(word_from_token_range(
+            text,
+            first_frame,
+            last_frame,
+            frame_rate,
+        )?);
     }
     Ok(words)
 }
@@ -276,6 +302,7 @@ impl<E: Encoder> WindowDecoder for CtcDecoder<E> {
             self.blank,
             self.silence_policy.space_token(),
         )?;
+        let word_spans = word_token_spans(&tokens, &self.vocabulary);
         let words = tokens_to_words(&tokens, &self.vocabulary, self.frame_rate)?;
         Decoded::new_with_labels(
             words,
@@ -284,6 +311,7 @@ impl<E: Encoder> WindowDecoder for CtcDecoder<E> {
             encoder_seconds,
             labels,
             tokens,
+            word_spans,
         )
     }
 }
@@ -347,6 +375,56 @@ mod tests {
             (words[1].text(), words[1].start(), words[1].end()),
             ("world", 0.36, 0.4)
         );
+    }
+
+    #[test]
+    fn word_token_spans_reproduce_the_words_tokens_to_words_builds_and_exclude_the_bare_marker() {
+        let vocabulary: Vec<String> = ["<blk>", "▁hel", "lo", "▁", "▁world"]
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        let tokens = vec![
+            Token::new(1, 2),
+            Token::new(2, 4),
+            Token::new(3, 7), // a bare word-marker token between the two words
+            Token::new(4, 9),
+        ];
+        let spans = word_token_spans(&tokens, &vocabulary);
+        assert_eq!(spans, vec![(0, 1), (3, 3)]);
+        assert!(
+            spans
+                .iter()
+                .all(|&(first, last)| !(first..=last).contains(&2)),
+            "the bare word-marker token at index 2 must belong to no span"
+        );
+
+        let words = tokens_to_words(&tokens, &vocabulary, frame_rate())
+            .expect("test CTC token ranges are valid");
+        assert_eq!(words.len(), spans.len());
+        for (&(first, last), word) in spans.iter().zip(&words) {
+            let mut text = String::new();
+            for token in &tokens[first..=last] {
+                text.push_str(vocabulary[token.id()].trim_start_matches('\u{2581}'));
+            }
+            assert_eq!(
+                word.text(),
+                text,
+                "the span's own tokens must reproduce the decoded word text"
+            );
+        }
+    }
+
+    #[test]
+    fn word_token_spans_of_only_marker_tokens_yields_no_span_or_word() {
+        let vocabulary: Vec<String> = ["<blk>", "\u{2581}"]
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        let tokens = vec![Token::new(1, 0), Token::new(1, 1), Token::new(1, 2)];
+        assert_eq!(word_token_spans(&tokens, &vocabulary), Vec::new());
+        let words = tokens_to_words(&tokens, &vocabulary, frame_rate())
+            .expect("bare-marker-only tokens are still a valid decode");
+        assert!(words.is_empty());
     }
 
     #[test]

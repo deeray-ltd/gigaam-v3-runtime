@@ -182,9 +182,10 @@ impl<D: WindowDecoder> BatchTranscriber<D> {
         {
             return Err("recognition decoder reported an invalid stage duration".into());
         }
-        if let (Some(labels), Some(tokens), Some(subsampling_factor)) = (
+        if let (Some(labels), Some(tokens), Some(word_spans), Some(subsampling_factor)) = (
             decoded.labels(),
             decoded.tokens(),
+            decoded.word_spans(),
             geometry.subsampling_factor,
         ) {
             let evidence = WindowEvidence::new(WindowEvidenceInput {
@@ -202,6 +203,7 @@ impl<D: WindowDecoder> BatchTranscriber<D> {
                 labels: labels.to_vec(),
                 mask: decoded.silence().to_vec(),
                 tokens: tokens.to_vec(),
+                word_spans: word_spans.to_vec(),
             })?;
             self.observations.emit_evidence(evidence);
         }
@@ -459,6 +461,7 @@ mod tests {
                 0.0,
                 vec![1; frames],
                 vec![Token::new(1, 0)],
+                vec![(0, 0)],
             )
         }
     }
@@ -651,6 +654,14 @@ mod tests {
             assert_eq!(record.output_frames(), record.labels().len());
             assert_eq!(record.output_frames(), record.mask().len());
             assert_eq!(record.tokens(), &[Token::new(1, 0)]);
+            assert_eq!(record.word_spans(), &[(0, 0)]);
+            for &(first, last) in record.word_spans() {
+                assert!(first <= last);
+                assert!(
+                    last < record.tokens().len(),
+                    "a word span must index within this record's own tokens list"
+                );
+            }
         }
 
         let disabled_calls = Arc::new(AtomicUsize::new(0));
