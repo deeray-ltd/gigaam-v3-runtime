@@ -223,6 +223,7 @@ pub struct Metrics {
     lat_frontend: Hist,
     lat_encoder: Hist,
     lat_decode: Hist,
+    lat_vad: Hist,
     max_http: usize,
     max_ws: usize,
 }
@@ -249,6 +250,7 @@ impl Metrics {
             lat_frontend: Hist::default(),
             lat_encoder: Hist::default(),
             lat_decode: Hist::default(),
+            lat_vad: Hist::default(),
             max_http,
             max_ws,
         }
@@ -312,6 +314,11 @@ impl Metrics {
     }
     pub fn observe_decode(&self, secs: f64) {
         self.lat_decode.observe(secs);
+    }
+
+    /// Completed HTTP batch detector and segmentation time, excluding session construction.
+    pub(crate) fn observe_vad(&self, secs: f64) {
+        self.lat_vad.observe(secs);
     }
 
     /// Prometheus text. `avail_http`/`avail_ws` are available semaphore permits used to derive active counts.
@@ -390,6 +397,7 @@ impl Metrics {
         self.lat_frontend.render(&mut s, "asr_frontend_seconds");
         self.lat_encoder.render(&mut s, "asr_encoder_seconds");
         self.lat_decode.render(&mut s, "asr_decode_seconds");
+        self.lat_vad.render(&mut s, "asr_vad_seconds");
         s
     }
 }

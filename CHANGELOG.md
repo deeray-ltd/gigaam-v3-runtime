@@ -6,6 +6,13 @@ All notable changes are recorded here. Pre-1.0 releases do not promise a stable 
 
 ### Added
 
+- Opt-in HTTP batch VAD through explicit response version 2, with the same validated
+  threshold, duration, and padding controls as the CLI, original-clock speech spans, and
+  an applied-policy response. Version 1 bodies and VAD-off asset independence are preserved.
+  Version 2 provides typed post-binding refusal codes; malformed queries retain legacy
+  errors. Request-owned VAD construction/detection phases and completed VAD timing expose
+  work while cancellation retains admission until native work and session cleanup finish.
+
 - Opt-in `transcribe --vad` for CTC and RNN-T batch speech segmentation, with explicit
   threshold, minimum speech/silence, and padding controls. It requires a 16 kHz model,
   preserves batch channel selection and source times, and reports applied policy and VAD
@@ -25,7 +32,7 @@ All notable changes are recorded here. Pre-1.0 releases do not promise a stable 
   caller-owned detector at the 16 kHz model rate. Accepted speech spans preserve source
   time, crop origins in window evidence, and independent repeated words; silent channels
   remain present without frontend or decoder work. VAD duration is reported separately
-  from frontend time. HTTP batch activation and its native detector lifecycle remain pending.
+  from frontend time. HTTP and CLI adapters opt into this library path explicitly.
 - OCI image labels (title, description, source, url, documentation, vendor, licenses, version)
   on the CPU, CUDA, and TensorRT image definitions.
 - `transcribe --evidence PATH`, an opt-in per-window decode-evidence file (raw CTC labels,

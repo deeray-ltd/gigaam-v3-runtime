@@ -334,6 +334,21 @@ pub(crate) mod tests {
         pub(crate) frontend: Arc<FrontendProcessor>,
     }
 
+    impl AssemblyFixture {
+        /// A regular placeholder is selected by package validation, never passed to native ORT.
+        pub(crate) fn write_injected_vad_asset(&self) -> Result<(), String> {
+            let name = include_str!("../../../model/config.kv")
+                .lines()
+                .find_map(|line| line.strip_prefix("vad.model="))
+                .expect("the canonical fixture package declares a VAD model asset");
+            fs::write(
+                self._package.path().join(name),
+                b"injected detector fixture",
+            )
+            .map_err(|error| format!("write injected VAD asset: {error}"))
+        }
+    }
+
     fn test_weight_values(length: usize, asset: &str) -> Result<Vec<f32>, String> {
         let mut values = Vec::new();
         values
@@ -344,7 +359,24 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn assembly_fixture() -> Result<AssemblyFixture, String> {
+        assembly_fixture_at_rate(16000)
+    }
+
+    pub(crate) fn assembly_fixture_at_rate(rate: u32) -> Result<AssemblyFixture, String> {
         let package = AssemblyPackage::new()?;
+        let config = include_str!("../../../model/config.kv")
+            .lines()
+            .map(|line| {
+                if line.starts_with("sample_rate=") {
+                    format!("sample_rate={rate}")
+                } else {
+                    line.to_owned()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(package.path().join("config.kv"), config)
+            .map_err(|error| format!("write fixture model rate: {error}"))?;
         let pack = Arc::new(
             ModelPackage::open(package.path())
                 .map_err(|error| format!("open service assembly package: {error}"))?,
