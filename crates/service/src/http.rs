@@ -13,6 +13,7 @@ use crate::admission::{
     AdmissionRefusal, AdmissionState, HttpAdmission, RequestBodyLimit, RequestWorkOwner,
 };
 use crate::context::ApplicationContext;
+use crate::log::{BatchProgress, BatchStage, BatchStageOutcome, TranscribeProgress};
 use crate::metrics::Metrics;
 use crate::protocol::{QueryParameters, query_bool, query_finite_f32};
 use crate::response::{Options, ResponseInput, json_err, json_ok, transcribe_response};
@@ -283,39 +284,133 @@ enum AdmittedWorkResult<T> {
     TimedOut,
 }
 
-/// The production execution seam retains the admission owner inside blocking work until it
-/// terminalizes, even after the HTTP deadline has returned a timeout response.
-async fn execute_admitted_work<T, F>(
+/// Request-local observations use the existing bounded producer; they own no execution state.
+#[derive(Clone)]
+struct RequestProgress {
+    telemetry: TelemetryProducer,
+    request_id: String,
+    started: Instant,
+}
+
+impl RequestProgress {
+    fn observe(&self, progress: BatchProgress) {
+        self.telemetry.offer_access(crate::log::render(
+            crate::log::AccessEvent::TranscribeProgress(TranscribeProgress {
+                request_id: self.request_id.clone(),
+                elapsed_milliseconds: self.started.elapsed().as_millis(),
+                progress,
+            }),
+        ));
+    }
+
+    fn stage<T>(
+        &self,
+        stage: BatchStage,
+        operation: impl FnOnce() -> Result<T, TranscribeError>,
+    ) -> Result<T, TranscribeError> {
+        let started = Instant::now();
+        self.observe(BatchProgress::StageStarted(stage));
+        let mut observation = StageObservation {
+            progress: self,
+            stage,
+            started,
+            outcome: BatchStageOutcome::Interrupted,
+        };
+        let result = operation();
+        observation.outcome = if result.is_ok() {
+            BatchStageOutcome::Completed
+        } else {
+            BatchStageOutcome::Failed
+        };
+        result
+    }
+}
+
+/// An unwind finishes only the current observed stage; it does not change request ownership.
+struct StageObservation<'a> {
+    progress: &'a RequestProgress,
+    stage: BatchStage,
+    started: Instant,
+    outcome: BatchStageOutcome,
+}
+
+impl Drop for StageObservation<'_> {
+    fn drop(&mut self) {
+        self.progress.observe(BatchProgress::StageFinished {
+            stage: self.stage,
+            outcome: self.outcome,
+            milliseconds: self.started.elapsed().as_millis(),
+        });
+    }
+}
+
+/// Drops outside the request owner's scope, after completion, failure, or unwind acknowledgement.
+struct WorkObservation {
+    progress: RequestProgress,
+    control: ExecutionControl,
+}
+
+impl Drop for WorkObservation {
+    fn drop(&mut self) {
+        self.progress
+            .observe(BatchProgress::WorkFinished(self.control.state()));
+    }
+}
+
+struct AdmittedExecution {
     owner: RequestWorkOwner,
     control: ExecutionControl,
     timeout: Duration,
-    work: F,
-) -> AdmittedWorkResult<T>
+    progress: RequestProgress,
+}
+
+/// The production execution seam retains the admission owner inside blocking work until it
+/// terminalizes, even after the HTTP deadline has returned a timeout response.
+async fn execute_admitted_work<T, F>(execution: AdmittedExecution, work: F) -> AdmittedWorkResult<T>
 where
     T: Send + 'static,
     F: FnOnce(&ExecutionControl) -> Result<T, TranscribeError> + Send + 'static,
 {
+    let AdmittedExecution {
+        owner,
+        control,
+        timeout,
+        progress,
+    } = execution;
     let work_control = control.clone();
-    let job = tokio::task::spawn_blocking(move || match work(&work_control) {
-        Ok(value) => match owner.complete() {
-            ExecutionState::Completed => Ok(value),
-            ExecutionState::Cancelled => {
-                Err(TranscribeError::Unavailable("processing cancelled".into()))
+    let work_progress = progress.clone();
+    let job = tokio::task::spawn_blocking(move || {
+        let _observation = WorkObservation {
+            progress: work_progress.clone(),
+            control: work_control.clone(),
+        };
+        {
+            // This inner owner scope ends before the terminal observation, including on unwind.
+            let owner = owner;
+            work_progress.observe(BatchProgress::WorkStarted);
+            match work(&work_control) {
+                Ok(value) => match owner.complete() {
+                    ExecutionState::Completed => Ok(value),
+                    ExecutionState::Cancelled => {
+                        Err(TranscribeError::Unavailable("processing cancelled".into()))
+                    }
+                    state => Err(TranscribeError::Unavailable(format!(
+                        "processing ended in unexpected state {state:?}"
+                    ))),
+                },
+                Err(error) => {
+                    owner.fail();
+                    Err(error)
+                }
             }
-            state => Err(TranscribeError::Unavailable(format!(
-                "processing ended in unexpected state {state:?}"
-            ))),
-        },
-        Err(error) => {
-            owner.fail();
-            Err(error)
         }
     });
     match tokio::time::timeout(timeout, job).await {
         Ok(Ok(result)) => AdmittedWorkResult::Completed(result),
         Ok(Err(_)) => AdmittedWorkResult::WorkerFailure,
         Err(_) => {
-            control.request_cancellation();
+            let state = control.request_cancellation();
+            progress.observe(BatchProgress::DeadlineElapsed(state));
             AdmittedWorkResult::TimedOut
         }
     }
@@ -410,19 +505,33 @@ pub(crate) async fn transcribe(
     };
     let control = ExecutionControl::for_request();
     let owner = RequestWorkOwner::new(admission, control.clone());
+    let progress = RequestProgress {
+        telemetry: state.telemetry.clone(),
+        request_id: request_id.text.clone(),
+        started,
+    };
+    progress.observe(BatchProgress::Admitted);
     let timeout = state.request_timeout;
     let work_context = Arc::clone(&state.context);
     let work_metrics = Arc::clone(&metrics);
+    let work_progress = progress.clone();
     let work = move |work_control: &ExecutionControl| {
-        do_transcribe(
-            &work_context,
-            &work_metrics,
-            &query,
-            body.to_vec(),
-            work_control,
-        )
+        do_transcribe(BatchWork {
+            context: &work_context,
+            metrics: &work_metrics,
+            query: &query,
+            bytes: body.to_vec(),
+            control: work_control,
+            progress: &work_progress,
+        })
     };
-    let response = match execute_admitted_work(owner, control.clone(), timeout, work).await {
+    let execution = AdmittedExecution {
+        owner,
+        control,
+        timeout,
+        progress,
+    };
+    let response = match execute_admitted_work(execution, work).await {
         AdmittedWorkResult::Completed(Ok(json)) => json_ok(json),
         AdmittedWorkResult::Completed(Err(error)) => {
             metrics.transcribe_error();
@@ -455,13 +564,24 @@ pub(crate) async fn transcribe(
 }
 
 /// Synchronous request path: decode -> channels -> scheduled recognition windows -> JSON.
-fn do_transcribe(
-    context: &ApplicationContext,
-    metrics: &Metrics,
-    query: &TranscribeQuery,
+struct BatchWork<'a> {
+    context: &'a ApplicationContext,
+    metrics: &'a Metrics,
+    query: &'a TranscribeQuery,
     bytes: Vec<u8>,
-    control: &ExecutionControl,
-) -> Result<String, TranscribeError> {
+    control: &'a ExecutionControl,
+    progress: &'a RequestProgress,
+}
+
+fn do_transcribe(work: BatchWork<'_>) -> Result<String, TranscribeError> {
+    let BatchWork {
+        context,
+        metrics,
+        query,
+        bytes,
+        control,
+        progress,
+    } = work;
     let scheduler = match query.model {
         BatchModel::Ctc => &context.capabilities.ctc,
         BatchModel::Rnnt => context
@@ -470,10 +590,11 @@ fn do_transcribe(
             .as_ref()
             .ok_or_else(|| TranscribeError::BadRequest("rnnt model is not loaded".into()))?,
     };
-    let encoded =
-        EncodedAudio::new(bytes, query.extension.clone()).map_err(TranscribeError::BadRequest)?;
-    let loaded =
-        load_bytes(encoded).map_err(|error| TranscribeError::BadRequest(error.to_string()))?;
+    let loaded = progress.stage(BatchStage::AudioDecode, || {
+        let encoded = EncodedAudio::new(bytes, query.extension.clone())
+            .map_err(TranscribeError::BadRequest)?;
+        load_bytes(encoded).map_err(|error| TranscribeError::BadRequest(error.to_string()))
+    })?;
     let source_rate = loaded.sample_rate().hertz();
     if !(4000..=192000).contains(&source_rate) {
         return Err(TranscribeError::BadRequest(format!(
@@ -485,8 +606,10 @@ fn do_transcribe(
             "input has no audio channels".into(),
         ));
     }
-    let audio = resample_audio(loaded, context.capabilities.frontend.sample_rate())
-        .map_err(TranscribeError::BadRequest)?;
+    let audio = progress.stage(BatchStage::Resample, || {
+        resample_audio(loaded, context.capabilities.frontend.sample_rate())
+            .map_err(TranscribeError::BadRequest)
+    })?;
     let options = query.options;
     let channel_policy = http_batch_channel_policy(options);
     let turn_gap = TurnGap::new(options.turn_gap).map_err(TranscribeError::BadRequest)?;
@@ -503,22 +626,26 @@ fn do_transcribe(
     ))
     .map_err(TranscribeError::Unavailable)?;
     let started = Instant::now();
-    let result = complete_multi_channel_batch(metrics, || transcriber.transcribe(&audio))?;
+    let result = progress.stage(BatchStage::BatchTranscription, || {
+        complete_multi_channel_batch(metrics, || transcriber.transcribe(&audio))
+    })?;
     let duration = audio.duration_seconds();
     let rtf = started.elapsed().as_secs_f32() / duration.max(1e-6);
-    let response = transcribe_response(ResponseInput {
-        channels: result.channels(),
-        segments: result.segments(),
-        turns: result.turns(),
-        options,
-        duration_sec: duration,
-        sample_rate_in: source_rate,
-        source_channels: result.source_channels(),
-        duplicate: result.duplicate(),
-        model: query.model.as_str(),
-        rtf,
-    });
-    Ok(response.to_string())
+    progress.stage(BatchStage::ResponseProjection, || {
+        let response = transcribe_response(ResponseInput {
+            channels: result.channels(),
+            segments: result.segments(),
+            turns: result.turns(),
+            options,
+            duration_sec: duration,
+            sample_rate_in: source_rate,
+            source_channels: result.source_channels(),
+            duplicate: result.duplicate(),
+            model: query.model.as_str(),
+            rtf,
+        });
+        Ok(response.to_string())
+    })
 }
 
 #[cfg(test)]
@@ -631,6 +758,210 @@ mod tests {
             request_id,
             body,
         }
+    }
+
+    fn assert_phase(line: &str, phase: &str, state: &str) {
+        assert!(line.contains("\"event\":\"transcribe_phase\""), "{line}");
+        assert!(line.contains(&format!("\"phase\":\"{phase}\"")), "{line}");
+        assert!(line.contains(&format!("\"state\":\"{state}\"")), "{line}");
+    }
+
+    #[tokio::test]
+    async fn batch_phases_follow_actual_work_and_preserve_the_terminal_access_record()
+    -> Result<(), String> {
+        let fixture = crate::tests::assembly_fixture()?;
+        let telemetry = test_support::prepare(16, 1)?;
+        let settings = ServiceAdmission::new(1, 1, Duration::from_secs(5))?;
+        let admission = Arc::new(AdmissionState::new(&settings)?);
+        let mut state = state_with_telemetry(
+            &fixture,
+            Arc::clone(&admission),
+            telemetry.metrics_arc(),
+            telemetry.producer(),
+        )?;
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+        Arc::get_mut(&mut state.context)
+            .expect("the test has not shared its application context yet")
+            .capabilities
+            .ctc = Arc::new(ExecutionScheduler::spawn(ControlledDecoder {
+            started: Some(started_tx),
+            release: release_rx,
+        }));
+        state.request_timeout = Duration::from_secs(5);
+        let audio = crate::tests::pcm16_wav_silence(fixture.frontend.sample_rate().hertz(), 640)?;
+        let mut headers = HeaderMap::new();
+        headers.insert("x-request-id", HeaderValue::from_static("phase-history"));
+        let response = tokio::spawn(transcribe(
+            State(state),
+            headers,
+            RawQuery(Some("ext=wav".to_owned())),
+            Bytes::from(audio),
+        ));
+        tokio::time::timeout(Duration::from_secs(5), started_rx)
+            .await
+            .expect("the real batch path must reach the controlled decoder")
+            .expect("the decoder must report that native-like work started");
+        let mut lines = telemetry.drain_lines();
+        assert_eq!(lines.len(), 7);
+        assert_phase(&lines[6], "batch_transcription", "started");
+        assert!(!response.is_finished());
+        assert_eq!(admission.available_http(), 0);
+
+        release_tx
+            .send(())
+            .expect("the running decoder waits for release");
+        let response = project(response.await.expect("the batch handler must finish")).await;
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(
+            response.request_id,
+            Some(HeaderValue::from_static("phase-history"))
+        );
+        let body =
+            std::str::from_utf8(&response.body).expect("the public batch response is UTF-8 JSON");
+        assert!(body.contains("\"model\":\"ctc\""));
+        assert!(!body.contains("transcribe_phase"));
+        lines.extend(telemetry.drain_lines());
+        let expected = [
+            ("admission", "admitted"),
+            ("work", "started"),
+            ("audio_decode", "started"),
+            ("audio_decode", "completed"),
+            ("resample", "started"),
+            ("resample", "completed"),
+            ("batch_transcription", "started"),
+            ("batch_transcription", "completed"),
+            ("response_projection", "started"),
+            ("response_projection", "completed"),
+            ("work", "terminal"),
+        ];
+        assert_eq!(lines.len(), expected.len() + 1);
+        for (line, (phase, outcome)) in lines.iter().zip(expected) {
+            assert_phase(line, phase, outcome);
+            assert!(line.contains("\"req_id\":\"phase-history\""));
+            assert!(line.contains("\"elapsed_ms\":"));
+            if outcome == "completed" {
+                assert!(line.contains("\"phase_ms\":"));
+            }
+        }
+        assert!(lines[10].contains("\"execution_state\":\"completed\""));
+        assert!(lines[11].contains("\"event\":\"transcribe\""));
+        assert!(lines[11].contains("\"status\":200"));
+        assert_eq!(admission.available_http(), 1);
+        assert_eq!(telemetry.snapshot().queue_full, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn failed_audio_reports_only_executed_phases_and_telemetry_cannot_change_its_response()
+    -> Result<(), String> {
+        let fixture = crate::tests::assembly_fixture()?;
+        let baseline = test_support::prepare(16, 1)?;
+        let saturated = test_support::prepare(1, 1)?;
+        let disconnected = test_support::prepare(1, 1)?.into_receiver_dropped();
+        for number in 0..4 {
+            saturated.producer().offer_access(crate::log::render(
+                crate::log::AccessEvent::WsError(crate::log::WsErrorAccess {
+                    phase: "fill",
+                    message: number.to_string(),
+                }),
+            ));
+        }
+        let mut responses = Vec::new();
+        for producer in [
+            baseline.producer(),
+            saturated.producer(),
+            disconnected.producer(),
+        ] {
+            let settings = ServiceAdmission::new(1, 1, Duration::from_secs(1))?;
+            let admission = Arc::new(AdmissionState::new(&settings)?);
+            let state = state_with_telemetry(
+                &fixture,
+                Arc::clone(&admission),
+                Arc::new(Metrics::new(1, 1)),
+                producer,
+            )?;
+            let mut headers = HeaderMap::new();
+            headers.insert("x-request-id", HeaderValue::from_static("invalid-audio"));
+            responses.push(
+                project(
+                    transcribe(
+                        State(state),
+                        headers,
+                        RawQuery(Some("ext=wav".to_owned())),
+                        Bytes::from_static(b"not-a-wave-file"),
+                    )
+                    .await,
+                )
+                .await,
+            );
+            assert_eq!(admission.available_http(), 1);
+        }
+        assert_eq!(responses[0].status, StatusCode::BAD_REQUEST);
+        assert_eq!(responses[0], responses[1]);
+        assert_eq!(responses[0], responses[2]);
+        let lines = baseline.drain_lines();
+        assert_eq!(lines.len(), 6);
+        assert_phase(&lines[0], "admission", "admitted");
+        assert_phase(&lines[1], "work", "started");
+        assert_phase(&lines[2], "audio_decode", "started");
+        assert_phase(&lines[3], "audio_decode", "failed");
+        assert_phase(&lines[4], "work", "terminal");
+        assert!(lines[4].contains("\"execution_state\":\"failed\""));
+        assert!(lines[5].contains("\"event\":\"transcribe\""));
+        assert!(lines[5].contains("\"status\":400"));
+        assert!(lines.iter().all(|line| !line.contains("not-a-wave-file")));
+        assert_eq!(saturated.snapshot().queue_full, 6);
+        assert_eq!(disconnected.snapshot().sink_closed, 6);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn panicking_work_reports_interruption_after_releasing_its_owner() -> Result<(), String> {
+        let telemetry = test_support::prepare(16, 1)?;
+        let settings = ServiceAdmission::new(1, 1, Duration::from_secs(5))?;
+        let admission = AdmissionState::new(&settings)?;
+        let control = ExecutionControl::for_request();
+        let progress = RequestProgress {
+            telemetry: telemetry.producer(),
+            request_id: "panic-history".to_owned(),
+            started: Instant::now(),
+        };
+        let work_progress = progress.clone();
+        let execution = AdmittedExecution {
+            owner: RequestWorkOwner::new(
+                admission
+                    .admit_http()
+                    .map_err(|_| "test admission refused")?,
+                control.clone(),
+            ),
+            control: control.clone(),
+            timeout: Duration::from_secs(5),
+            progress,
+        };
+        let result = execute_admitted_work(execution, move |_| {
+            work_progress.stage(
+                BatchStage::BatchTranscription,
+                || -> Result<(), TranscribeError> { panic!("controlled work unwind") },
+            )
+        })
+        .await;
+        assert!(matches!(result, AdmittedWorkResult::WorkerFailure));
+        assert_eq!(control.state(), ExecutionState::Failed);
+        assert_eq!(admission.available_http(), 1);
+        let lines = telemetry.drain_lines();
+        assert_eq!(lines.len(), 4);
+        assert_phase(&lines[0], "work", "started");
+        assert_phase(&lines[1], "batch_transcription", "started");
+        assert_phase(&lines[2], "batch_transcription", "interrupted");
+        assert_phase(&lines[3], "work", "terminal");
+        assert!(lines[3].contains("\"execution_state\":\"failed\""));
+        assert!(
+            lines
+                .iter()
+                .all(|line| !line.contains("controlled work unwind"))
+        );
+        Ok(())
     }
 
     async fn admitted_terminal_histories(producer: &TelemetryProducer) -> Vec<ResponseProjection> {
@@ -922,20 +1253,27 @@ mod tests {
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
         let observed_admission = Arc::clone(&admission);
-        let task = tokio::spawn(execute_admitted_work(
+        let telemetry =
+            test_support::prepare(16, 1).expect("the bounded test telemetry settings are valid");
+        let execution = AdmittedExecution {
             owner,
-            control.clone(),
-            Duration::from_millis(1),
-            move |_| {
-                started_tx.send(()).map_err(|_| {
-                    TranscribeError::Unavailable("test start observer dropped".into())
-                })?;
-                release_rx.recv().map_err(|_| {
-                    TranscribeError::Unavailable("test release channel closed".into())
-                })?;
-                Ok::<_, TranscribeError>(())
+            control: control.clone(),
+            timeout: Duration::from_millis(1),
+            progress: RequestProgress {
+                telemetry: telemetry.producer(),
+                request_id: "deadline-history".to_owned(),
+                started: Instant::now(),
             },
-        ));
+        };
+        let task = tokio::spawn(execute_admitted_work(execution, move |_| {
+            started_tx
+                .send(())
+                .map_err(|_| TranscribeError::Unavailable("test start observer dropped".into()))?;
+            release_rx
+                .recv()
+                .map_err(|_| TranscribeError::Unavailable("test release channel closed".into()))?;
+            Ok::<_, TranscribeError>(())
+        }));
         started_rx
             .await
             .expect("the production work seam must start its blocking closure");
@@ -949,6 +1287,17 @@ mod tests {
             0,
             "the timeout result must return while the blocking owner retains admission"
         );
+        let lines = telemetry.drain_lines();
+        assert_eq!(lines.len(), 2);
+        assert!(lines.iter().any(|line| {
+            line.contains("\"phase\":\"deadline\"")
+                && line.contains("\"execution_state\":\"cancel_requested\"")
+        }));
+        assert!(
+            lines
+                .iter()
+                .all(|line| !line.contains("\"state\":\"terminal\""))
+        );
         release_tx
             .send(())
             .expect("the controlled blocking closure must receive its release");
@@ -960,6 +1309,20 @@ mod tests {
         .await
         .expect("the late blocking terminalization must release admission");
         assert_eq!(control.state(), ExecutionState::Cancelled);
+        let lines = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let lines = telemetry.drain_lines();
+                if !lines.is_empty() {
+                    break lines;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the actual terminal observation follows owner release");
+        assert_eq!(lines.len(), 1);
+        assert_phase(&lines[0], "work", "terminal");
+        assert!(lines[0].contains("\"execution_state\":\"cancelled\""));
     }
 
     fn metric_counter(metrics: &Metrics, name: &str) -> u64 {

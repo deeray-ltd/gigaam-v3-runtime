@@ -6,6 +6,10 @@ All notable changes are recorded here. Pre-1.0 releases do not promise a stable 
 
 ### Added
 
+- Correlated batch HTTP phase records for actual audio decoding, resampling, aggregate
+  transcription, response projection and work termination through the existing bounded
+  telemetry writer. HTTP deadline notification remains distinct from actual cancellation
+  completion; transcript responses and terminal access records are unchanged.
 - OCI image labels (title, description, source, url, documentation, vendor, licenses, version)
   on the CPU, CUDA, and TensorRT image definitions.
 - `transcribe --evidence PATH`, an opt-in per-window decode-evidence file (raw CTC labels,
