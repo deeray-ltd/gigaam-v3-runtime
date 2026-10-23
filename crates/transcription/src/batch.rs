@@ -9,6 +9,7 @@
 
 //! Single-channel batch transcription state and window orchestration.
 
+use crate::channel_selection::OriginalChannel;
 use crate::contracts::{
     BatchConfig, PadPolicy, StageTimings, Transcript, TranscriptWord, checkpoint,
 };
@@ -30,6 +31,7 @@ use std::sync::Arc;
 /// record. `subsampling_factor` is `None` unless a window-evidence observer is installed, so its
 /// derivation (and any refusal it could produce) never runs on the plain transcription path.
 struct WindowGeometry {
+    channel: Option<OriginalChannel>,
     index: usize,
     kind: WindowKind,
     start_sec: f32,
@@ -47,6 +49,7 @@ struct WindowGeometry {
 /// Feature and decoder coordinates remain local to this crop, even off the source hop grid.
 #[derive(Clone, Copy, Default)]
 struct SpanOrigin {
+    channel: Option<OriginalChannel>,
     sample: usize,
     window_index: usize,
 }
@@ -203,6 +206,7 @@ impl<D: WindowDecoder> BatchTranscriber<D> {
             let source_offset =
                 usize_to_f32(geometry.frontend_origin_sample) / usize_to_f32(self.sample_rate);
             let evidence = WindowEvidence::new(WindowEvidenceInput {
+                channel: geometry.channel,
                 index: geometry.index,
                 kind: geometry.kind,
                 start_sec: source_offset + geometry.start_sec,
@@ -249,7 +253,21 @@ impl<D: WindowDecoder> BatchTranscriber<D> {
 
     /// Transcribes one complete, validated Audio-owned channel.
     pub fn transcribe_channel(&mut self, input: &ChannelAudio) -> Result<Transcript, String> {
-        self.transcribe_span(input.samples(), SpanOrigin::default())
+        self.transcribe_channel_in_context(input, None)
+    }
+
+    pub(crate) fn transcribe_channel_in_context(
+        &mut self,
+        input: &ChannelAudio,
+        channel: Option<OriginalChannel>,
+    ) -> Result<Transcript, String> {
+        self.transcribe_span(
+            input.samples(),
+            SpanOrigin {
+                channel,
+                ..SpanOrigin::default()
+            },
+        )
     }
 
     /// Segments one complete channel at 16 kHz before recognition, borrowing an independently
@@ -264,6 +282,16 @@ impl<D: WindowDecoder> BatchTranscriber<D> {
         input: &ChannelAudio,
         detector: &mut V,
         policy: VadPolicyConfig,
+    ) -> Result<Transcript, String> {
+        self.transcribe_channel_with_vad_in_context(input, detector, policy, None)
+    }
+
+    pub(crate) fn transcribe_channel_with_vad_in_context<V: SpeechProbabilityDetector>(
+        &mut self,
+        input: &ChannelAudio,
+        detector: &mut V,
+        policy: VadPolicyConfig,
+        channel: Option<OriginalChannel>,
     ) -> Result<Transcript, String> {
         checkpoint(&self.control)?;
         self.validate_vad_sample_rate()?;
@@ -283,6 +311,7 @@ impl<D: WindowDecoder> BatchTranscriber<D> {
             let transcript = self.transcribe_span(
                 samples,
                 SpanOrigin {
+                    channel,
                     sample: segment.start_sample(),
                     window_index: planned_windows,
                 },
@@ -391,6 +420,7 @@ impl<D: WindowDecoder> BatchTranscriber<D> {
             let words = self.decode_frames(
                 &features,
                 WindowGeometry {
+                    channel: origin.channel,
                     index: origin
                         .window_index
                         .checked_add(window_index)
@@ -817,6 +847,11 @@ mod tests {
         assert_eq!(result.windows(), 6);
         assert_eq!(records.len(), 6);
         for (index, record) in records.iter().enumerate() {
+            assert_eq!(
+                record.channel(),
+                None,
+                "direct single-channel calls have no enclosing physical selection"
+            );
             assert_eq!(record.index(), index);
             assert_eq!(
                 record.frontend_origin_sample(),

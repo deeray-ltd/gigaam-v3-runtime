@@ -346,7 +346,7 @@ fn batch_vad_refuses_rate_and_ambiguous_evidence_before_native_or_file_creation(
     ambiguous.arg("--vad").arg("--evidence").arg(&evidence);
     assert_exact_failure(
         run(ambiguous),
-        "--vad cannot use evidence v1: segmented evidence requires a channel-aware format",
+        "--vad requires --evidence-version 2 when --evidence is enabled",
         "batch VAD evidence v1 refusal",
     );
     assert!(

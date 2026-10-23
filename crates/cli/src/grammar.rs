@@ -82,6 +82,7 @@ pub(crate) struct TranscribeInvocation {
     pub(crate) output: TranscribeOutput,
     pub(crate) turn_gap_seconds: f32,
     pub(crate) evidence: Option<PathBuf>,
+    pub(crate) evidence_version: EvidenceVersion,
     pub(crate) vad: Option<VadPolicyArguments>,
 }
 
@@ -90,6 +91,13 @@ pub(crate) struct TranscribeInvocation {
 pub(crate) enum DecoderChoice {
     Ctc,
     Rnnt,
+}
+
+/// Explicit evidence-file schema; v1 remains the default for existing callers.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum EvidenceVersion {
+    V1,
+    V2,
 }
 
 /// Validated encoder benchmark input and command choices.
@@ -253,6 +261,7 @@ impl Command {
                     | "--overlap"
                     | "--turn-gap"
                     | "--evidence"
+                    | "--evidence-version"
                     | "--vad-threshold"
                     | "--vad-neg-threshold"
                     | "--vad-min-speech-ms"
@@ -486,6 +495,15 @@ fn transcribe(parsed: ParsedArguments) -> Result<Invocation, String> {
         false => DecoderChoice::Ctc,
     };
     let evidence = parsed.value("--evidence").map(PathBuf::from);
+    let evidence_version = match parsed.value("--evidence-version") {
+        None => EvidenceVersion::V1,
+        Some(_) if evidence.is_none() => {
+            return Err("--evidence-version requires --evidence".into());
+        }
+        Some("1") => EvidenceVersion::V1,
+        Some("2") => EvidenceVersion::V2,
+        Some(_) => return Err("--evidence-version must be 1 or 2".into()),
+    };
     let vad = if parsed.has_flag("--vad") {
         Some(vad_policy(&parsed, VadOptionNames::BATCH)?)
     } else {
@@ -512,6 +530,7 @@ fn transcribe(parsed: ParsedArguments) -> Result<Invocation, String> {
         },
         turn_gap_seconds,
         evidence,
+        evidence_version,
         vad,
     }))
 }
@@ -1008,6 +1027,35 @@ mod tests {
             }
             Ok(_) => panic!("transcribe grammar must produce a transcribe invocation"),
             Err(error) => panic!("valid transcribe grammar must succeed: {error}"),
+        }
+    }
+
+    #[test]
+    fn evidence_version_is_explicit_strict_and_requires_a_destination() {
+        for (suffix, expected) in [
+            (vec![], super::EvidenceVersion::V1),
+            (vec!["--evidence-version", "1"], super::EvidenceVersion::V1),
+            (vec!["--evidence-version", "2"], super::EvidenceVersion::V2),
+        ] {
+            let mut values = vec!["transcribe", "audio.wav", "--evidence", "out.txt"];
+            values.extend(suffix);
+            match parse_text(&arguments(&values)) {
+                Ok(Invocation::Transcribe(value)) => assert_eq!(value.evidence_version, expected),
+                other => panic!("supported evidence schema must parse: {other:?}"),
+            }
+        }
+        for values in [
+            vec!["transcribe", "audio.wav", "--evidence-version", "2"],
+            vec![
+                "transcribe",
+                "audio.wav",
+                "--evidence",
+                "out.txt",
+                "--evidence-version",
+                "3",
+            ],
+        ] {
+            assert!(parse_text(&arguments(&values)).is_err());
         }
     }
 

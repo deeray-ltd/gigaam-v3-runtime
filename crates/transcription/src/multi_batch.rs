@@ -11,7 +11,8 @@
 
 use crate::batch::{BatchSetup, BatchTranscriber};
 use crate::channel_selection::{
-    BatchChannelPolicy, DuplicateClassification, SourceChannelCount, select_batch_channels,
+    BatchChannelPolicy, DuplicateClassification, OriginalChannel, SourceChannelCount,
+    select_batch_channels,
 };
 use crate::contracts::{StageTimings, Transcript, Turn, checkpoint};
 use crate::turns::{ChannelTranscript, TurnGap, channel_segments, turns};
@@ -186,7 +187,9 @@ impl<D: WindowDecoder> MultiChannelBatchTranscriber<D> {
         self,
         input: &DecodedAudio,
     ) -> Result<MultiChannelBatchResult, MultiChannelBatchError> {
-        self.transcribe_using(input, |batch, channel| batch.transcribe_channel(channel))
+        self.transcribe_using(input, |batch, channel, original| {
+            batch.transcribe_channel_in_context(channel, Some(original))
+        })
     }
 
     /// Applies batch VAD independently to every selected physical channel using one borrowed
@@ -202,8 +205,8 @@ impl<D: WindowDecoder> MultiChannelBatchTranscriber<D> {
         self.batch
             .validate_vad_sample_rate()
             .map_err(MultiChannelBatchError::Input)?;
-        self.transcribe_using(input, |batch, channel| {
-            batch.transcribe_channel_with_vad(channel, detector, policy)
+        self.transcribe_using(input, |batch, channel, original| {
+            batch.transcribe_channel_with_vad_in_context(channel, detector, policy, Some(original))
         })
     }
 
@@ -213,6 +216,7 @@ impl<D: WindowDecoder> MultiChannelBatchTranscriber<D> {
         mut transcribe: impl FnMut(
             &mut BatchTranscriber<D>,
             &ChannelAudio,
+            OriginalChannel,
         ) -> Result<Transcript, String>,
     ) -> Result<MultiChannelBatchResult, MultiChannelBatchError> {
         checkpoint(&self.control).map_err(MultiChannelBatchError::Transcription)?;
@@ -247,7 +251,7 @@ impl<D: WindowDecoder> MultiChannelBatchTranscriber<D> {
                 .channels()
                 .get(selected.index())
                 .expect("validated channel selection must reference its source audio");
-            let transcript = transcribe(&mut self.batch, channel)
+            let transcript = transcribe(&mut self.batch, channel, *selected)
                 .map_err(MultiChannelBatchError::Transcription)?;
             checkpoint(&self.control).map_err(MultiChannelBatchError::Transcription)?;
             timing_aggregate
@@ -396,16 +400,174 @@ mod tests {
     use crate::channel_selection::{BatchChannelPolicy, DuplicateClassification};
     use crate::contracts::VadProbability;
     use crate::contracts::{BatchConfig, PadPolicy, StageTimings};
-    use crate::observations::ObservationMode;
+    use crate::observations::{ObservationMode, WindowEvidence, WindowEvidenceObserver};
     use crate::turns::TurnGap;
     use crate::vad_policy::{VadDurations, VadPadding, VadPolicyConfig, VadThresholds};
     use gigaam_audio::{
         ChannelAudio, ChannelAudioView, DecodedAudio, FeatureMatrixView, SampleRate,
     };
     use gigaam_recognition::{
-        Decoded, ExecutionControl, FrameRate, SpeechProbabilityDetector, WindowDecoder, Word,
+        Decoded, ExecutionControl, FrameRate, SpeechProbabilityDetector, Token, WindowDecoder, Word,
     };
     use std::sync::{Arc, Mutex};
+
+    struct ChannelEvidence(Mutex<Vec<WindowEvidence>>);
+
+    impl WindowEvidenceObserver for ChannelEvidence {
+        fn observe(&self, evidence: WindowEvidence) {
+            self.0
+                .lock()
+                .expect("evidence test lock must not be poisoned")
+                .push(evidence);
+        }
+    }
+
+    struct EvidenceDecoder;
+
+    impl WindowDecoder for EvidenceDecoder {
+        fn frame_rate(&self) -> FrameRate {
+            FrameRate::new(8.0).expect("test frame rate is positive")
+        }
+        fn decode(&mut self, features: FeatureMatrixView<'_>) -> Result<Decoded, String> {
+            let frames = features.frames();
+            Decoded::new_with_labels(
+                vec![Word::new("speech".into(), 0.0, 0.01)?],
+                vec![false; frames],
+                frames,
+                0.0,
+                vec![1; frames],
+                vec![Token::new(1, 0)],
+                vec![(0, 0)],
+            )
+        }
+    }
+
+    struct UnequalVad;
+
+    impl SpeechProbabilityDetector for UnequalVad {
+        fn probabilities(&mut self, audio: ChannelAudioView<'_>) -> Result<Vec<f32>, String> {
+            let marker = audio.samples()[0];
+            Ok(if marker == 0.0 {
+                vec![0.0; 6]
+            } else if marker == 0.25 {
+                vec![0.0, 1.0, 0.0, 0.0, 1.0, 0.0]
+            } else {
+                vec![0.0, 1.0, 1.0, 1.0, 0.0, 0.0]
+            })
+        }
+    }
+
+    fn evidence_batch(
+        policy: BatchChannelPolicy,
+        observed: Arc<ChannelEvidence>,
+    ) -> MultiChannelBatchTranscriber<EvidenceDecoder> {
+        MultiChannelBatchTranscriber::new(MultiChannelBatchSetup::new(
+            BatchSetup {
+                frontend: crate::test_support::frontend_at_sample_rate(16_000),
+                decoder: EvidenceDecoder,
+                config: BatchConfig::new(
+                    SampleRate::new(16_000).expect("test rate is positive"),
+                    0.128,
+                    0.032,
+                    PadPolicy::Exact,
+                )
+                .expect("test window policy is valid"),
+                control: ExecutionControl::without_deadline(),
+                observations: ObservationMode::disabled().with_evidence(observed),
+            },
+            MultiChannelBatchOptions::new(policy, TurnGap::new(0.1).expect("test gap is positive")),
+        ))
+        .expect("test frontend and configuration rates agree")
+    }
+
+    #[test]
+    fn segmented_evidence_carries_physical_channel_and_crop_with_unequal_and_silent_channels() {
+        let observed = Arc::new(ChannelEvidence(Mutex::new(Vec::new())));
+        let transcriber = evidence_batch(BatchChannelPolicy::separate_channels(), observed.clone());
+        let input = audio_at_sample_rate(
+            16_000,
+            vec![
+                channel(vec![0.0; 3072]),
+                channel(vec![0.25; 3072]),
+                channel(vec![0.5; 3072]),
+            ],
+        );
+        let policy = VadPolicyConfig::new(
+            vad_policy().thresholds(),
+            vad_policy().durations(),
+            VadPadding::new(0.0625).expect("one sample padding is representable"),
+        );
+        let result = transcriber
+            .transcribe_with_vad(&input, &mut UnequalVad, policy)
+            .expect("all physical channels finish");
+        assert_eq!(channel_ids(&result), vec![0, 1, 2]);
+        assert!(result.channels()[0].words().is_empty());
+        let records = observed
+            .0
+            .lock()
+            .expect("evidence test lock must not be poisoned");
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| (
+                    record
+                        .channel()
+                        .expect("multi-channel owner supplies identity")
+                        .index(),
+                    record.index(),
+                    record.frontend_origin_sample()
+                ))
+                .collect::<Vec<_>>(),
+            vec![(1, 0, 511), (1, 1, 2047), (2, 0, 511)]
+        );
+        for record in records.iter() {
+            assert_eq!(record.first_feature_frame(), 0);
+            assert_eq!(record.tokens()[0].frame(), 0);
+            assert_eq!(record.first_sample(), record.frontend_origin_sample());
+        }
+        assert_eq!(
+            result.channels()[1].words().len(),
+            2,
+            "independent repeated words survive segmentation"
+        );
+    }
+
+    #[test]
+    fn evidence_reports_only_selected_physical_channels_after_batch_deduplication() {
+        let samples = (0..3072)
+            .map(|index| if index % 2 == 0 { 0.25 } else { -0.25 })
+            .collect::<Vec<_>>();
+        let duplicated =
+            audio_at_sample_rate(16_000, vec![channel(samples.clone()), channel(samples)]);
+        for policy in [
+            BatchChannelPolicy::single_output(),
+            BatchChannelPolicy::separate_channels(),
+        ] {
+            let observed = Arc::new(ChannelEvidence(Mutex::new(Vec::new())));
+            let result = evidence_batch(policy, observed.clone())
+                .transcribe(&duplicated)
+                .expect("selected duplicate channel completes");
+            assert_eq!(result.duplicate(), DuplicateClassification::DualMono);
+            assert_eq!(channel_ids(&result), vec![0]);
+            let records = observed
+                .0
+                .lock()
+                .expect("test observer lock must not be poisoned");
+            assert!(!records.is_empty());
+            assert!(records.iter().all(|record| {
+                record
+                    .channel()
+                    .expect("selected physical channel is known")
+                    .index()
+                    == 0
+            }));
+            assert!(
+                records
+                    .iter()
+                    .all(|record| record.frontend_origin_sample() == 0)
+            );
+        }
+    }
 
     #[derive(Clone, Copy)]
     struct WordPlan {

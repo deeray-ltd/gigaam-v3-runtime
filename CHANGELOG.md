@@ -9,10 +9,14 @@ All notable changes are recorded here. Pre-1.0 releases do not promise a stable 
 - Opt-in `transcribe --vad` for CTC and RNN-T batch speech segmentation, with explicit
   threshold, minimum speech/silence, and padding controls. It requires a 16 kHz model,
   preserves batch channel selection and source times, and reports applied policy and VAD
-  duration separately. Existing `evidence v1` is refused with VAD until it can represent
-  segmented channel origins.
+  duration separately. Segmented evidence requires explicit version 2.
 - Standalone `vad --channels all|0,2` selects physical channels without deduplication,
   including labelled silent channels. Omitting selection preserves channel-0 output.
+- Explicit `transcribe --evidence-version 2` adds physical channel identity, integer feature
+  crop origin, applied VAD policy and successful selected-channel coverage, including channels
+  with zero emitted windows. The existing observer port is preserved; direct single-channel
+  library evidence has no physical-channel identity. Default version-1 evidence bytes remain
+  unchanged, and RNN-T evidence remains unsupported.
 - Correlated batch HTTP phase records for actual audio decoding, resampling, aggregate
   transcription, response projection and work termination through the existing bounded
   telemetry writer. HTTP deadline notification remains distinct from actual cancellation
