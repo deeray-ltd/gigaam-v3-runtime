@@ -13,8 +13,8 @@ use crate::projection::stream::{StreamProjection, StreamSummary};
 use gigaam_audio::{ChannelAudio, load};
 use gigaam_recognition::{ExecutionControl, RequiredEncoderRoles};
 use gigaam_transcription::{
-    BatchConfig, BatchSetup, BatchTranscriber, EndpointDetector, EndpointRules, PadPolicy,
-    StreamConfig, StreamSession, StreamSetup,
+    BatchConfig, BatchSetup, BatchTranscriber, EndpointDetector, PadPolicy, StreamSession,
+    StreamSetup,
 };
 use std::time::Instant;
 
@@ -35,31 +35,10 @@ pub(crate) fn run(invocation: StreamInvocation) -> Result<(), String> {
 
     let package = composition::open_package(&invocation.model)?;
     let sample_rate = composition::package_sample_rate(&package)?;
-    let timing_changes = StreamConfig::timing_changes()
-        .with_step_sec(invocation.step_seconds)
-        .and_then(|changes| changes.with_horizon_sec(invocation.horizon_seconds))
-        .and_then(|changes| changes.with_window_sec(invocation.window_seconds))
-        .and_then(|changes| changes.with_overlap_sec(invocation.overlap_seconds))
+    let config = invocation
+        .stream_policy
+        .bind(sample_rate)
         .map_err(|error| format!("stream configuration: {error}"))?;
-    let base_config = StreamConfig::checked_default(sample_rate)
-        .map_err(|error| format!("stream configuration: {error}"))?;
-    let mut config = timing_changes
-        .apply(base_config)
-        .map_err(|error| format!("stream configuration: {error}"))?
-        .with_lock_policy(invocation.lock_policy)
-        .map_err(|error| format!("stream configuration: {error}"))?
-        .with_endpoint_source(invocation.endpoint)
-        .map_err(|error| format!("stream configuration: {error}"))?;
-    if let Some(milliseconds) = invocation.silence_milliseconds {
-        let rules = EndpointRules::new(
-            milliseconds / 1_000.0,
-            config.rules().without_speech_seconds(),
-        )
-        .map_err(|error| format!("--silence-ms: {error}"))?;
-        config = config
-            .with_rules(rules)
-            .map_err(|error| format!("stream configuration: {error}"))?;
-    }
     let batch_config = BatchConfig::new(
         config.sample_rate(),
         config.window_sec(),
@@ -163,7 +142,9 @@ pub(crate) fn run(invocation: StreamInvocation) -> Result<(), String> {
         audio_seconds: duration,
         wall_seconds,
         reference: reference.as_deref(),
-    })
+    })?;
+    projection::applied_stream_config(invocation.applied_config, &config);
+    Ok(())
 }
 
 fn first_channel(audio: &gigaam_audio::DecodedAudio) -> Result<&ChannelAudio, String> {

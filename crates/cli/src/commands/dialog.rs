@@ -11,8 +11,8 @@ use crate::projection;
 use gigaam_audio::load;
 use gigaam_recognition::RequiredEncoderRoles;
 use gigaam_transcription::{
-    BackchannelDuration, BackchannelPolicy, OfflineDialogSetup, OfflineDialogSetupInput,
-    StreamConfig, TurnGap, transcribe_offline_dialog,
+    BackchannelDuration, BackchannelPolicy, OfflineDialogSetup, OfflineDialogSetupInput, TurnGap,
+    transcribe_offline_dialog,
 };
 
 /// Executes offline dialogue reconstruction using direct channel-local recognition composition.
@@ -27,13 +27,13 @@ pub(crate) fn run(invocation: DialogInvocation) -> Result<(), String> {
 
     let package = composition::open_package(&invocation.model)?;
     let sample_rate = composition::package_sample_rate(&package)?;
-    let stream_config = StreamConfig::checked_default(sample_rate)
-        .map_err(|error| format!("dialog stream configuration: {error}"))?
-        .with_endpoint_source(invocation.endpoint)
+    let stream_config = invocation
+        .stream_policy
+        .bind(sample_rate)
         .map_err(|error| format!("dialog stream configuration: {error}"))?;
     let setup = OfflineDialogSetup::new(OfflineDialogSetupInput {
         channel_policy: invocation.channel_policy,
-        stream_config,
+        stream_config: stream_config.clone(),
         turn_gap,
         backchannel_policy,
     })
@@ -49,6 +49,7 @@ pub(crate) fn run(invocation: DialogInvocation) -> Result<(), String> {
     let result = transcribe_offline_dialog(setup, &mut factory, audio.channels())
         .map_err(|failure| projection::dialog_failure_message(&failure))?;
     projection::dialog(&result, channels);
+    projection::applied_stream_config(invocation.applied_config, &stream_config);
     Ok(())
 }
 

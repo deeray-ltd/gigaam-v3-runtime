@@ -5,15 +5,62 @@
 //! Client patch application, event display, and stream-simulator statistics projection.
 
 use super::precision_label;
-use crate::grammar::StreamEventOutput;
+use crate::grammar::{AppliedConfigOutput, StreamEventOutput};
 use crate::numeric::{
     count_to_f32, count_to_f64, duration_to_f32, percentile, rounded_f32_to_usize,
 };
 use gigaam_model_package::EncoderPrecision;
 use gigaam_transcription::{
-    FinalReason, StreamConfig, StreamEvent, StreamLockPolicy, StreamWord, WordStability,
-    normalize_word, word_count, word_edits,
+    EndpointSource, FinalReason, StreamConfig, StreamEvent, StreamLockPolicy, StreamWord,
+    WordStability, normalize_word, word_count, word_edits,
 };
+
+/// Projects only the policy bound to the completed command, never the original flag text.
+pub(super) fn applied_config_record(
+    output: AppliedConfigOutput,
+    config: &StreamConfig,
+) -> Option<String> {
+    if output == AppliedConfigOutput::Hidden {
+        return None;
+    }
+    let (endpoint, vad) = match config.endpoint_source() {
+        EndpointSource::Blank => ("blank", "{\"enabled\":false}".to_owned()),
+        EndpointSource::Vad => (
+            "vad",
+            format!(
+                "{{\"enabled\":true,\"threshold\":{}}}",
+                f64::from(config.vad_threshold().get())
+            ),
+        ),
+    };
+    let lock = match config.lock_policy() {
+        StreamLockPolicy::Advisory => "advisory",
+        StreamLockPolicy::CommitStable => "commit_stable",
+    };
+    Some(format!(
+        concat!(
+            "{{\"type\":\"applied_stream_config\",\"schema_version\":1,",
+            "\"model_sample_rate\":{rate},\"endpoint\":\"{endpoint}\",",
+            "\"window_sec\":{window},\"overlap_sec\":{overlap},",
+            "\"step_sec\":{step},\"horizon_sec\":{horizon},\"lock\":\"{lock}\",",
+            "\"seam_after_sec\":{seam},\"keep_silence_sec\":{keep},",
+            "\"endpoint_rules\":{{\"after_speech_sec\":{after},",
+            "\"without_speech_sec\":{without}}},\"vad\":{vad}}}"
+        ),
+        endpoint = endpoint,
+        lock = lock,
+        vad = vad,
+        rate = config.sample_rate().hertz(),
+        window = f64::from(config.window_sec()),
+        overlap = f64::from(config.overlap_sec()),
+        step = f64::from(config.step_sec()),
+        horizon = f64::from(config.horizon_sec()),
+        seam = f64::from(config.seam_after_sec()),
+        keep = f64::from(config.keep_silence_sec()),
+        after = f64::from(config.rules().after_speech_seconds()),
+        without = f64::from(config.rules().without_speech_seconds()),
+    ))
+}
 
 /// Stateful client-visible projection for one stream simulator invocation.
 pub(crate) struct StreamProjection {
@@ -400,10 +447,58 @@ fn client_text<'a>(words: impl Iterator<Item = &'a str>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{StreamPatchWord, StreamProjection, StreamStatistics, client_text};
-    use crate::grammar::StreamEventOutput;
+    use super::{
+        StreamPatchWord, StreamProjection, StreamStatistics, applied_config_record, client_text,
+    };
+    use crate::grammar::{AppliedConfigOutput, StreamEventOutput};
+    use gigaam_audio::SampleRate;
     use gigaam_model_package::EncoderPrecision;
-    use gigaam_transcription::{FinalReason, StreamLockPolicy, WordStability};
+    use gigaam_transcription::{
+        EndpointRules, EndpointSource, FinalReason, StreamConfig, StreamLockPolicy, VadProbability,
+        WordStability,
+    };
+
+    #[test]
+    fn applied_policy_is_opt_in_and_projects_bound_values_without_timestamp_rounding()
+    -> Result<(), String> {
+        let config = StreamConfig::timing_changes()
+            .with_window_sec(1.0)?
+            .with_overlap_sec(0.25)?
+            .with_step_sec(0.125)?
+            .with_horizon_sec(0.75)?
+            .with_seam_after_sec(0.375)?
+            .with_keep_silence_sec(0.0625)?
+            .apply(StreamConfig::checked_default(SampleRate::new(16_000)?)?)?
+            .with_rules(EndpointRules::new(0.0, 0.25)?)?
+            .with_lock_policy(StreamLockPolicy::CommitStable)?
+            .with_endpoint_source(EndpointSource::Vad)?
+            .with_vad_threshold(VadProbability::new(0.7)?)?;
+        assert_eq!(
+            applied_config_record(AppliedConfigOutput::Hidden, &config),
+            None
+        );
+        assert_eq!(
+            applied_config_record(AppliedConfigOutput::Shown, &config),
+            Some(concat!(
+                "{\"type\":\"applied_stream_config\",\"schema_version\":1,",
+                "\"model_sample_rate\":16000,\"endpoint\":\"vad\",",
+                "\"window_sec\":1,\"overlap_sec\":0.25,\"step_sec\":0.125,",
+                "\"horizon_sec\":0.75,\"lock\":\"commit_stable\",\"seam_after_sec\":0.375,",
+                "\"keep_silence_sec\":0.0625,\"endpoint_rules\":{\"after_speech_sec\":0,",
+                "\"without_speech_sec\":0.25},\"vad\":{\"enabled\":true,\"threshold\":0.699999988079071}}"
+            ).to_owned())
+        );
+        let blank = config.with_endpoint_source(EndpointSource::Blank)?;
+        let record = applied_config_record(AppliedConfigOutput::Shown, &blank)
+            .expect("shown applied policy produces a record");
+        assert!(record.contains("\"endpoint\":\"blank\""));
+        assert!(record.ends_with("\"vad\":{\"enabled\":false}}"));
+        assert!(
+            !record.contains("threshold"),
+            "inactive detector settings are not reported as applied"
+        );
+        Ok(())
+    }
 
     #[derive(Clone, Copy)]
     struct WordFact {
