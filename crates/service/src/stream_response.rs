@@ -13,9 +13,67 @@ use crate::json::{JSON_CONTENT_TYPE, Json, error_object, obj};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use gigaam_transcription::{
-    DialogTurn, FinalReason, MultiChannelStep, SourceChannelCount, StreamEvent, StreamWord,
-    TurnsPatch, WordFinality, WordStability,
+    DialogTurn, EndpointSource, FinalReason, MultiChannelStep, SourceChannelCount, StreamConfig,
+    StreamEvent, StreamLockPolicy, StreamWord, TurnsPatch, WordFinality, WordStability,
 };
+
+/// Confirms the immutable policy bound to an active session without claiming channel activation.
+pub(crate) fn applied_config_event(config: &StreamConfig) -> String {
+    let (endpoint, vad) = match config.endpoint_source() {
+        EndpointSource::Blank => ("blank", obj(vec![("enabled", Json::Bool(false))])),
+        EndpointSource::Vad => (
+            "vad",
+            obj(vec![
+                ("enabled", Json::Bool(true)),
+                (
+                    "threshold",
+                    Json::Num(f64::from(config.vad_threshold().get())),
+                ),
+            ]),
+        ),
+    };
+    let lock = match config.lock_policy() {
+        StreamLockPolicy::Advisory => "advisory",
+        StreamLockPolicy::CommitStable => "commit_stable",
+    };
+    obj(vec![
+        ("type", Json::str("applied_stream_config")),
+        ("schema_version", Json::Usize(1)),
+        (
+            "model_sample_rate",
+            Json::Num(f64::from(config.sample_rate().hertz())),
+        ),
+        ("endpoint", Json::str(endpoint)),
+        ("window_sec", Json::Num(f64::from(config.window_sec()))),
+        ("overlap_sec", Json::Num(f64::from(config.overlap_sec()))),
+        ("step_sec", Json::Num(f64::from(config.step_sec()))),
+        ("horizon_sec", Json::Num(f64::from(config.horizon_sec()))),
+        ("lock", Json::str(lock)),
+        (
+            "seam_after_sec",
+            Json::Num(f64::from(config.seam_after_sec())),
+        ),
+        (
+            "keep_silence_sec",
+            Json::Num(f64::from(config.keep_silence_sec())),
+        ),
+        (
+            "endpoint_rules",
+            obj(vec![
+                (
+                    "after_speech_sec",
+                    Json::Num(f64::from(config.rules().after_speech_seconds())),
+                ),
+                (
+                    "without_speech_sec",
+                    Json::Num(f64::from(config.rules().without_speech_seconds())),
+                ),
+            ]),
+        ),
+        ("vad", vad),
+    ])
+    .to_string()
+}
 
 fn word_json(word: &StreamWord) -> Json {
     obj(vec![
@@ -140,9 +198,46 @@ pub(crate) fn end_event() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{end_event, error_event, pre_upgrade_refusal};
+    use super::{applied_config_event, end_event, error_event, pre_upgrade_refusal};
     use axum::body::to_bytes;
     use axum::http::{StatusCode, header};
+    use gigaam_audio::SampleRate;
+    use gigaam_transcription::{
+        EndpointRules, EndpointSource, StreamConfig, StreamLockPolicy, VadProbability,
+    };
+
+    #[test]
+    fn applied_stream_policy_preserves_exact_bound_floats_and_active_detector_scope()
+    -> Result<(), String> {
+        let config = StreamConfig::timing_changes()
+            .with_window_sec(1.0)?
+            .with_overlap_sec(0.25)?
+            .with_step_sec(0.125)?
+            .with_horizon_sec(0.75)?
+            .with_seam_after_sec(0.375)?
+            .with_keep_silence_sec(0.0625)?
+            .apply(StreamConfig::checked_default(SampleRate::new(16_000)?)?)?
+            .with_rules(EndpointRules::new(0.0, 0.25)?)?
+            .with_lock_policy(StreamLockPolicy::CommitStable)?
+            .with_endpoint_source(EndpointSource::Vad)?
+            .with_vad_threshold(VadProbability::new(0.7)?)?;
+        assert_eq!(
+            applied_config_event(&config),
+            concat!(
+                "{\"type\":\"applied_stream_config\",\"schema_version\":1,",
+                "\"model_sample_rate\":16000,\"endpoint\":\"vad\",\"window_sec\":1,",
+                "\"overlap_sec\":0.25,\"step_sec\":0.125,\"horizon_sec\":0.75,",
+                "\"lock\":\"commit_stable\",\"seam_after_sec\":0.375,\"keep_silence_sec\":0.0625,",
+                "\"endpoint_rules\":{\"after_speech_sec\":0,\"without_speech_sec\":0.25},",
+                "\"vad\":{\"enabled\":true,\"threshold\":0.699999988079071}}"
+            )
+        );
+        let blank = applied_config_event(&config.with_endpoint_source(EndpointSource::Blank)?);
+        assert!(blank.contains("\"endpoint\":\"blank\""));
+        assert!(blank.ends_with("\"vad\":{\"enabled\":false}}"));
+        assert!(!blank.contains("threshold"));
+        Ok(())
+    }
 
     #[tokio::test]
     async fn stream_error_and_end_projections_share_the_exact_json_envelope() {
