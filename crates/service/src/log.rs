@@ -44,6 +44,8 @@ pub(crate) struct TranscribeAccess {
 pub(crate) enum BatchStage {
     AudioDecode,
     Resample,
+    VadInitialization,
+    VadDetection,
     BatchTranscription,
     ResponseProjection,
 }
@@ -53,6 +55,8 @@ impl BatchStage {
         match self {
             Self::AudioDecode => "audio_decode",
             Self::Resample => "resample",
+            Self::VadInitialization => "vad_initialization",
+            Self::VadDetection => "vad_detection",
             Self::BatchTranscription => "batch_transcription",
             Self::ResponseProjection => "response_projection",
         }

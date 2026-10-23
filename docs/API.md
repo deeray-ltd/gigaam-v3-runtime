@@ -12,9 +12,10 @@ and Prometheus metrics:
 | GET | /readyz | Admission readiness |
 | GET | /metrics | Prometheus text exposition |
 
-Application-owned HTTP responses use application/json; charset=utf-8. Errors use the
-shape {"error":"message"}. Messages are English diagnostics, not stable machine-readable
-error codes. The API has no formal schema version beyond its /v1 route prefix.
+Application-owned HTTP responses use application/json; charset=utf-8. Legacy errors use
+the shape {"error":"message"}; these English diagnostic messages are not stable error
+codes. HTTP batch requests can explicitly select response version 2, including typed
+post-binding errors, while the route prefix and other endpoint contracts remain unchanged.
 
 For both request types, a nonempty query string is parsed as unique nonempty key=value
 pairs after plus/percent decoding to UTF-8. Unknown names, duplicate names, empty values,
@@ -38,6 +39,28 @@ to select a decoder. Its configured body boundary is described in
 | turns | 1, 0, true, false | false |
 | turn_gap | finite seconds greater than zero | 1.0 |
 | channels | split | omitted |
+| response_version | 1 or 2 | 1 |
+| vad | true or false; requires explicit response_version=2 | false |
+| vad_threshold | Finite probability in [0, 1]; requires vad=true | 0.5 |
+| vad_neg_threshold | Finite probability in [0, vad_threshold]; requires vad=true | 0.35 |
+| vad_min_speech_ms | Finite nonnegative milliseconds; requires vad=true | 250 |
+| vad_min_silence_ms | Finite nonnegative milliseconds; requires vad=true | 100 |
+| vad_speech_pad_ms | Finite nonnegative one-sided padding milliseconds; requires vad=true | 30 |
+
+Every VAD query key, including `vad=false`, requires explicit `response_version=2`.
+Tuning keys require `vad=true`; disabled tuning is refused rather than ignored. Durations
+accept zero and fractional milliseconds when their sample counts, including doubled padding,
+are representable. Thresholds and durations bind to the same validated policy as CLI batch
+VAD. The enabled detector requires a 16000 Hz model/frontend; other supported source rates
+are resampled before detection. VAD-off requests do not select or construct a VAD asset.
+
+Enabled VAD processes each selected physical channel independently, after the existing
+channel-selection and dual-mono policy. Silent selected channels remain present. Accepted
+speech spans retain the original recording clock; recognition windows are stitched within
+each span, never across silent spans. The existing minimum frontend window geometry still
+applies to very short spans. One native detector belongs to the admitted request and is
+reused sequentially across its selected channels; no shared VAD worker or session pool is
+introduced.
 
 The body must be nonempty. Decoded source audio must have a rate in 4000 through 192000 Hz
 and at least one channel. Within that range, a rate is accepted only when its ratio to the
@@ -70,6 +93,19 @@ segments is present only when requested; each item has start, end, channel, and 
 turns is present only when requested and multichannel output exists; each item has
 channel, start, end, and text.
 
+Version 1 preserves the established response body. Explicit version 2 adds
+`schema_version: 2` and `applied.vad`. With VAD disabled that object is exactly
+`{"enabled":false}`. With VAD enabled it contains `enabled:true`, `sample_rate:16000`,
+`threshold`, `neg_threshold`, `min_speech_ms`, `min_silence_ms`, and `speech_pad_ms` from
+the validated policy actually used by the batch call. Policy values preserve the bound
+32-bit float value; they do not use word-timestamp rounding. They can therefore display
+more decimal digits than the query text.
+
+The `rtf` interval excludes audio ingest, resampling, and response projection. With VAD
+enabled it starts immediately before request-owned detector construction and includes
+construction, detection, segmentation, recognition, and stitching. The disabled interval
+is unchanged.
+
 ### Refusal and timeout behavior
 
 | Status | Meaning |
@@ -88,6 +124,26 @@ cannot begin after cancellation is observed; a native call already executing may
 its late result cannot replace the 504; and the request capacity remains reserved until
 the work terminalizes. This does not claim that ONNX Runtime interrupts an in-flight native
 call.
+
+After a query has completely bound to version 2, application errors use
+`{"schema_version":2,"error":{"code":"...","message":"..."}}` and retain the
+request-ID header:
+
+| Status | Code | Boundary |
+| --- | --- | --- |
+| 400 | invalid_request | Input/audio/resampling/channel-selection refusal. This broad category is not proof of a permanently invalid file. |
+| 400 | unsupported_capability | Requested model not loaded, enabled VAD model rate unsupported, or selected VAD asset missing/invalid at package selection. |
+| 503 | unavailable | Native initialization/execution or worker failure. A regular file that fails native graph construction is an operational failure. |
+| 503 | overloaded | Admission capacity unavailable. |
+| 503 | draining | Admission closed for shutdown. |
+| 504 | timeout | Whole-request processing deadline elapsed. |
+
+Request-ID validation, empty-body rejection, and all query-binding failures retain the
+legacy `{"error":"..."}` envelope, even when query text contains `response_version=2`.
+This includes invalid versions, duplicate keys, and invalid VAD policy. Version 1 errors
+and the layer-level 413 boundary remain unchanged. An executing VAD constructor or detector
+is cooperatively cancelled before/after its native call; its session and HTTP capacity stay
+owned until that call returns and the request actually terminalizes.
 
 ## Health, liveness, readiness, and metrics
 

@@ -15,7 +15,7 @@ use axum::response::{IntoResponse, Response};
 use gigaam_recognition::Device;
 use gigaam_transcription::{
     ChannelTranscript, DuplicateClassification, SourceChannelCount, TranscriptWord, Turn,
-    words_to_text,
+    VadPolicyConfig, words_to_text,
 };
 
 /// Query request parameters that affect response shape.
@@ -31,6 +31,7 @@ pub(crate) struct Options {
 /// Fully named input to response shaping. It prevents positional ambiguity at the
 /// public HTTP boundary and keeps the response constructor below the argument-count limit.
 pub(crate) struct ResponseInput<'a> {
+    pub contract: ResponseContract,
     pub channels: &'a [ChannelTranscript],
     pub segments: &'a [Turn],
     pub turns: &'a [Turn],
@@ -41,6 +42,81 @@ pub(crate) struct ResponseInput<'a> {
     pub duplicate: DuplicateClassification,
     pub model: &'a str,
     pub rtf: f32,
+}
+
+/// An explicitly selected response contract, carrying the policy actually used by execution.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ResponseVersion {
+    V1,
+    V2,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ResponseContract {
+    pub version: ResponseVersion,
+    pub vad: Option<VadPolicyConfig>,
+}
+
+impl ResponseContract {
+    fn applied_vad(self) -> Json {
+        let Some(policy) = self.vad else {
+            return obj(vec![("enabled", Json::Bool(false))]);
+        };
+        obj(vec![
+            ("enabled", Json::Bool(true)),
+            (
+                "sample_rate",
+                Json::Int(
+                    i64::try_from(gigaam_recognition::vad::VAD_SR)
+                        .expect("the fixed 16000 Hz VAD rate fits i64"),
+                ),
+            ),
+            (
+                "threshold",
+                Json::Num(f64::from(policy.thresholds().speech().get())),
+            ),
+            (
+                "neg_threshold",
+                Json::Num(f64::from(policy.thresholds().silence().get())),
+            ),
+            (
+                "min_speech_ms",
+                Json::Num(f64::from(policy.durations().minimum_speech_milliseconds())),
+            ),
+            (
+                "min_silence_ms",
+                Json::Num(f64::from(policy.durations().minimum_silence_milliseconds())),
+            ),
+            (
+                "speech_pad_ms",
+                Json::Num(f64::from(policy.padding().milliseconds())),
+            ),
+        ])
+    }
+}
+
+/// Stable v2 refusal categories. A broad input refusal does not imply a permanent bad file.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum TranscribeErrorCode {
+    InvalidRequest,
+    UnsupportedCapability,
+    Unavailable,
+    Overloaded,
+    Draining,
+    Timeout,
+}
+
+impl TranscribeErrorCode {
+    fn name(self) -> &'static str {
+        match self {
+            Self::InvalidRequest => "invalid_request",
+            Self::UnsupportedCapability => "unsupported_capability",
+            Self::Unavailable => "unavailable",
+            Self::Overloaded => "overloaded",
+            Self::Draining => "draining",
+            Self::Timeout => "timeout",
+        }
+    }
 }
 
 /// Validated immutable capability text retained by the health endpoint.
@@ -108,6 +184,7 @@ fn channel_index(value: usize) -> i64 {
 /// Precomputed Transcription projections are serialized without reconstructing application state.
 pub(crate) fn transcribe_response(input: ResponseInput<'_>) -> Json {
     let ResponseInput {
+        contract,
         channels,
         segments,
         turns,
@@ -130,6 +207,10 @@ pub(crate) fn transcribe_response(input: ResponseInput<'_>) -> Json {
         ("model", Json::str(model)),
         ("rtf", Json::round(rtf, 4)),
     ];
+    if contract.version == ResponseVersion::V2 {
+        f.push(("schema_version", Json::Int(2)));
+        f.push(("applied", obj(vec![("vad", contract.applied_vad())])));
+    }
 
     let multi = channels.len() > 1;
     // Text is shared for one channel/merge and an array by channel for split.
@@ -183,6 +264,34 @@ pub(crate) fn json_err(code: StatusCode, message: impl Into<String>) -> Response
         error_object(message),
     )
         .into_response()
+}
+
+pub(crate) fn transcribe_error_response(
+    version: ResponseVersion,
+    status: StatusCode,
+    code: TranscribeErrorCode,
+    message: impl Into<String>,
+) -> Response {
+    let message = message.into();
+    match version {
+        ResponseVersion::V1 => json_err(status, message),
+        ResponseVersion::V2 => (
+            status,
+            [(header::CONTENT_TYPE, JSON_CONTENT_TYPE)],
+            obj(vec![
+                ("schema_version", Json::Int(2)),
+                (
+                    "error",
+                    obj(vec![
+                        ("code", Json::str(code.name())),
+                        ("message", Json::str(message)),
+                    ]),
+                ),
+            ])
+            .to_string(),
+        )
+            .into_response(),
+    }
 }
 
 pub(crate) fn health_response(projection: HealthProjection) -> Response {
@@ -255,6 +364,10 @@ mod tests {
         let ch = vec![channel(0, vec![w("hello", 0.0, 0.4), w("world", 0.5, 0.8)])];
         let (segments, turns) = projections(&ch, 1.0);
         let j = transcribe_response(ResponseInput {
+            contract: ResponseContract {
+                version: ResponseVersion::V1,
+                vad: None,
+            },
             channels: &ch,
             segments: &segments,
             turns: &turns,
@@ -285,6 +398,10 @@ mod tests {
         };
         let (segments, turns) = projections(&ch, 1.0);
         let j = transcribe_response(ResponseInput {
+            contract: ResponseContract {
+                version: ResponseVersion::V1,
+                vad: None,
+            },
             channels: &ch,
             segments: &segments,
             turns: &turns,
@@ -317,6 +434,10 @@ mod tests {
             ..Options::default()
         };
         let rendered = transcribe_response(ResponseInput {
+            contract: ResponseContract {
+                version: ResponseVersion::V1,
+                vad: None,
+            },
             channels: &channels,
             segments: &segments,
             turns: &turns,
@@ -352,5 +473,65 @@ mod tests {
                 .expect("HTTP error response body is available"),
             "{\"error\":\"invalid audio\"}"
         );
+    }
+
+    #[tokio::test]
+    async fn v2_error_codes_preserve_status_and_escape_diagnostic_text() {
+        for (status, code, name) in [
+            (
+                StatusCode::BAD_REQUEST,
+                TranscribeErrorCode::InvalidRequest,
+                "invalid_request",
+            ),
+            (
+                StatusCode::BAD_REQUEST,
+                TranscribeErrorCode::UnsupportedCapability,
+                "unsupported_capability",
+            ),
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                TranscribeErrorCode::Unavailable,
+                "unavailable",
+            ),
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                TranscribeErrorCode::Overloaded,
+                "overloaded",
+            ),
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                TranscribeErrorCode::Draining,
+                "draining",
+            ),
+            (
+                StatusCode::GATEWAY_TIMEOUT,
+                TranscribeErrorCode::Timeout,
+                "timeout",
+            ),
+        ] {
+            let response = transcribe_error_response(
+                ResponseVersion::V2,
+                status,
+                code,
+                "diagnostic \"quoted\"\n",
+            );
+            assert_eq!(response.status(), status);
+            assert_eq!(
+                response
+                    .headers()
+                    .get(header::CONTENT_TYPE)
+                    .expect("application errors have a content type"),
+                JSON_CONTENT_TYPE
+            );
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("the complete error body is available");
+            assert_eq!(
+                body,
+                format!(
+                    "{{\"schema_version\":2,\"error\":{{\"code\":\"{name}\",\"message\":\"diagnostic \\\"quoted\\\"\\n\"}}}}"
+                )
+            );
+        }
     }
 }
