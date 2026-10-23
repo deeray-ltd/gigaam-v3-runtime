@@ -204,6 +204,8 @@ asr transcribe FILE [--model DIR] [--ep cpu|cuda|tensorrt] [--ort-dylib PATH]
                     [--fp16] [--rnnt] [--window S] [--overlap S] [--pad]
                     [--words] [--split-channels] [--turns] [--turn-gap S]
                     [--evidence PATH]
+                    [--vad] [--vad-threshold F] [--vad-neg-threshold F]
+                    [--vad-min-speech-ms N] [--vad-min-silence-ms N] [--vad-speech-pad-ms N]
 
 asr bench [--audio FILE] [--model DIR] [--ep cpu|cuda|tensorrt] [--ort-dylib PATH]
           [--fp16] [--window S] [--iters N] [--gap-ms N] [--alt-window S]
@@ -214,7 +216,7 @@ asr stream FILE [--model DIR] [--ep cpu|cuda|tensorrt] [--ort-dylib PATH]
               [--ref FILE] [--lock] [--events]
 
 asr vad FILE [--model DIR] [--ort-dylib PATH] [--threshold F] [--neg-threshold F]
-           [--min-speech-ms N] [--min-silence-ms N] [--speech-pad-ms N]
+           [--min-speech-ms N] [--min-silence-ms N] [--speech-pad-ms N] [--channels all|0,2]
 
 asr dialog FILE [--model DIR] [--ep cpu|cuda|tensorrt] [--ort-dylib PATH]
               [--turn-gap S] [--endpoint blank|vad] [--no-dedup]
@@ -223,10 +225,10 @@ asr dialog FILE [--model DIR] [--ep cpu|cuda|tensorrt] [--ort-dylib PATH]
 
 | Command | Defaults and constraints |
 | --- | --- |
-| transcribe | model is model; CTC is selected unless --rnnt; --window is 30 seconds; --overlap is 6 seconds and must be shorter than window; --turn-gap is 1 second; --words conflicts with --turns; --pad selects fixed-window padding; --evidence is optional and requires CTC. |
+| transcribe | model is model; CTC is selected unless --rnnt; --window is 30 seconds; --overlap is 6 seconds and must be shorter than window; --turn-gap is 1 second; --words conflicts with --turns; --pad selects fixed-window padding; --evidence is optional and requires CTC. --vad enables batch speech segmentation; VAD tuning flags require it. |
 | bench | audio defaults to fixtures/long_example.wav, a path not bundled by the repository; window is 30 seconds; iters is 20 and positive; gap-ms is 0 and nonnegative; alt-window is optional and positive. |
 | stream | chunk-ms is 100 and positive; step-ms is 500 and positive; horizon is 4 seconds and positive; window/overlap default to 30/6 seconds with overlap shorter than window; endpoint defaults to blank; silence-ms is optional and nonnegative; --lock selects committed-stable locking; --events prints event projections. |
-| vad | threshold is 0.5; neg-threshold is 0.35; both are finite in 0 through 1 and neg-threshold cannot exceed threshold; min-speech-ms and min-silence-ms default to 250 and 100 and are positive; speech-pad-ms defaults to 30 and is nonnegative. |
+| vad | threshold is 0.5; neg-threshold is 0.35; both are finite in 0 through 1 and neg-threshold cannot exceed threshold; min-speech-ms and min-silence-ms default to 250 and 100; speech-pad-ms defaults to 30. All durations accept finite nonnegative fractional milliseconds, including zero. Without --channels only physical channel 0 is processed; explicit selection accepts all or unique comma-separated zero-based physical indices. |
 | dialog | turn-gap is 0.8 seconds and positive; endpoint defaults to blank; --no-dedup disables offline dialog deduplication; backchannel-max-ms defaults to 0 and is nonnegative. |
 
 `bench` opens the selected package before native runtime initialization. Its --window and
@@ -234,6 +236,35 @@ asr dialog FILE [--model DIR] [--ep cpu|cuda|tensorrt] [--ort-dylib PATH]
 model-rate buffer length, and the decoded WAV input is resampled to the same rate before
 warmup or measurement. The default therefore remains a 30-second duration for every valid
 package rate rather than a fixed sample count.
+
+`transcribe --vad` uses the same segmentation policy and defaults as standalone `vad`, with
+the five tuning options prefixed by `--vad-`. Speech and silence thresholds use hysteresis;
+accepted speech must be strictly longer than the minimum speech duration, while the minimum
+silence comparison is inclusive. Duration conversion uses the library's checked truncation
+of `milliseconds / 1000 * 16000` to samples; unrepresentable counts or doubled padding refuse.
+Tiny positive durations may therefore become zero samples. Padding extends accepted speech
+within the input and divides shared gaps between adjacent spans. It does not change the
+separate ASR `--pad` policy, which pads each accepted crop to the configured ASR window.
+
+Batch VAD requires a 16 kHz model/frontend and refuses another rate before native initialization
+or evidence-file creation. Input audio is resampled to the model rate as usual. One local
+detector is reused for independent whole-channel calls over the existing batch selection:
+combined output selects the first channel, split/turn output selects separate channels, and
+existing dual-mono detection still selects the first channel. Silent selected channels remain
+in the result. Crops retain the original time coordinates and are not stitched across speech
+spans. Exact crops no longer than the frontend FFT window retain the existing no-decode
+behavior. Normal startup warmup is separate from transcription; a silent transcription adds
+no frontend or ASR decoder work. The enabled command reports its applied VAD policy and VAD
+duration separately from frontend time. Without `--vad`, its existing path and output remain
+unchanged and no VAD session or asset is required.
+
+Standalone `vad --channels` processes the requested physical channels in ascending original
+index order, including identical and silent channels, without correlation deduplication.
+Invalid or out-of-range selection refuses before any detector call. Each selected channel
+gets a labelled stdout section even when it has no speech; stderr identifies the selection
+and applied policy. Without this option, the existing channel-0 segment rows and summary are
+preserved. Standalone VAD resamples input to its fixed 16 kHz rate independently of the ASR
+frontend rate. Neither CLI path introduces a shared detector pool or service worker policy.
 
 `transcribe --evidence PATH` writes one per-window decode-evidence file alongside the ordinary
 transcript: a plain ASCII text file with a header line, one `model` line and one `audio` line
@@ -243,7 +274,8 @@ each decoded word, so an external reader can check its own word grouping against
 own word rule without re-implementing it. PATH is validated once, before any window is decoded:
 its parent directory must already exist, and PATH itself must not already be a directory. The
 transcript is unaffected by --evidence; only CTC transcription supports it, so it conflicts with
---rnnt.
+--rnnt. The existing `evidence v1` format also conflicts with `--vad`: it cannot represent
+segmented physical-channel/crop origins, so that combination refuses before creating a file.
 
 For applicable commands, --model defaults to model. --ort-dylib or ORT_DYLIB_PATH is
 required; when both are present, they must be identical. Provider selection and runtime
