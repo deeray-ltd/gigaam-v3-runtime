@@ -396,6 +396,56 @@ fn stream_cli_effect_order_and_checked_chunk_precedence() {
 }
 
 #[test]
+fn streaming_controls_bind_before_native_and_never_report_applied_policy_on_refusal() {
+    let witness = CliWitnessRoot::new();
+    for workflow in ["stream", "dialog"] {
+        let mut incompatible = witness.command(workflow, witness.benchmark_high_rate_package());
+        incompatible.args(["--endpoint", "vad", "--applied-config"]);
+        let stderr = failure_stderr(run(incompatible), "VAD endpoint model-rate refusal");
+        assert!(stderr.contains("vad endpoint requires 16 kHz, model has 4000000000"));
+        assert_no_ort_sentinel(
+            &stderr,
+            &witness,
+            "enabled VAD rate binds before native work",
+        );
+        assert!(!stderr.contains("applied_stream_config"));
+
+        let mut invalid = witness.command(workflow, witness.valid_package());
+        invalid.args(["--keep-silence", "3.4028235e38", "--applied-config"]);
+        let stderr = failure_stderr(run(invalid), "stream retained-silence overflow");
+        assert!(stderr.contains("stream retained silence duration at 16000 Hz sample count"));
+        assert_no_ort_sentinel(&stderr, &witness, "stream policy binds before native work");
+        assert!(!stderr.contains("applied_stream_config"));
+
+        let mut valid = witness.command(workflow, witness.valid_package());
+        valid.args([
+            "--window",
+            "1",
+            "--overlap",
+            "0.25",
+            "--step-ms",
+            "125.5",
+            "--silence-ms",
+            "0",
+            "--no-speech-ms",
+            "0",
+            "--seam-after",
+            "0",
+            "--keep-silence",
+            "0",
+            "--lock",
+            "--applied-config",
+        ]);
+        let stderr = failure_stderr(
+            run(valid),
+            "stream valid policy reaches native initialization",
+        );
+        assert!(stderr.contains(&witness.ort_diagnostic()));
+        assert!(!stderr.contains("applied_stream_config"));
+    }
+}
+
+#[test]
 fn dialog_cli_effect_order() {
     let witness = CliWitnessRoot::new();
 

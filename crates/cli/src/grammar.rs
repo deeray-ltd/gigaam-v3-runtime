@@ -4,10 +4,11 @@
 
 //! UTF-8 command-line grammar and validated invocation values for the offline CLI.
 
+use gigaam_audio::SampleRate;
 use gigaam_model_package::EncoderPrecision;
 use gigaam_transcription::{
-    EndpointSource, OfflineChannelPolicy, PadPolicy, StreamLockPolicy, VadDurations, VadPadding,
-    VadPolicyConfig, VadProbability, VadThresholds,
+    EndpointRules, EndpointSource, OfflineChannelPolicy, PadPolicy, StreamConfig, StreamLockPolicy,
+    VadDurations, VadPadding, VadPolicyConfig, VadProbability, VadThresholds,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
@@ -120,6 +121,61 @@ pub(crate) enum StreamEventOutput {
     Shown,
 }
 
+/// Whether a successful streaming command reports its bound policy on stderr.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AppliedConfigOutput {
+    Hidden,
+    Shown,
+}
+
+/// Scalar-validated stream controls, bound together at the selected package's model rate.
+#[derive(Clone, Debug)]
+pub(crate) struct StreamPolicyArguments {
+    window_seconds: f32,
+    overlap_seconds: f32,
+    step_seconds: f32,
+    horizon_seconds: f32,
+    endpoint: EndpointSource,
+    silence_milliseconds: Option<f32>,
+    no_speech_milliseconds: Option<f32>,
+    vad_threshold: Option<VadProbability>,
+    seam_after_seconds: Option<f32>,
+    keep_silence_seconds: Option<f32>,
+    lock_policy: StreamLockPolicy,
+}
+
+impl StreamPolicyArguments {
+    pub(crate) fn bind(&self, sample_rate: SampleRate) -> Result<StreamConfig, String> {
+        let base = StreamConfig::checked_default(sample_rate)?;
+        let mut changes = StreamConfig::timing_changes()
+            .with_window_sec(self.window_seconds)?
+            .with_overlap_sec(self.overlap_seconds)?
+            .with_step_sec(self.step_seconds)?
+            .with_horizon_sec(self.horizon_seconds)?;
+        if let Some(value) = self.seam_after_seconds {
+            changes = changes.with_seam_after_sec(value)?;
+        }
+        if let Some(value) = self.keep_silence_seconds {
+            changes = changes.with_keep_silence_sec(value)?;
+        }
+        let mut config = changes.apply(base)?.with_lock_policy(self.lock_policy)?;
+        let defaults = config.rules();
+        let after_speech = match self.silence_milliseconds {
+            Some(value) => value / 1_000.0,
+            None => defaults.after_speech_seconds(),
+        };
+        let without_speech = match self.no_speech_milliseconds {
+            Some(value) => value / 1_000.0,
+            None => defaults.without_speech_seconds(),
+        };
+        config = config.with_rules(EndpointRules::new(after_speech, without_speech)?)?;
+        if let Some(threshold) = self.vad_threshold {
+            config = config.with_vad_threshold(threshold)?;
+        }
+        config.with_endpoint_source(self.endpoint)
+    }
+}
+
 /// Validated stream-simulator input and command choices.
 #[derive(Clone, Debug)]
 pub(crate) struct StreamInvocation {
@@ -128,15 +184,10 @@ pub(crate) struct StreamInvocation {
     pub(crate) runtime: RuntimeRequest,
     pub(crate) precision: EncoderPrecision,
     pub(crate) chunk_milliseconds: usize,
-    pub(crate) step_seconds: f32,
-    pub(crate) horizon_seconds: f32,
-    pub(crate) window_seconds: f32,
-    pub(crate) overlap_seconds: f32,
-    pub(crate) endpoint: EndpointSource,
-    pub(crate) silence_milliseconds: Option<f32>,
+    pub(crate) stream_policy: StreamPolicyArguments,
     pub(crate) reference: Option<PathBuf>,
-    pub(crate) lock_policy: StreamLockPolicy,
     pub(crate) events: StreamEventOutput,
+    pub(crate) applied_config: AppliedConfigOutput,
 }
 
 /// Validated fixed-domain VAD input and command choices.
@@ -220,9 +271,10 @@ pub(crate) struct DialogInvocation {
     pub(crate) model: PathBuf,
     pub(crate) runtime: RuntimeRequest,
     pub(crate) turn_gap_seconds: f32,
-    pub(crate) endpoint: EndpointSource,
+    pub(crate) stream_policy: StreamPolicyArguments,
     pub(crate) channel_policy: OfflineChannelPolicy,
     pub(crate) backchannel_maximum_milliseconds: f32,
+    pub(crate) applied_config: AppliedConfigOutput,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -291,6 +343,10 @@ impl Command {
                     | "--overlap"
                     | "--endpoint"
                     | "--silence-ms"
+                    | "--no-speech-ms"
+                    | "--vad-threshold"
+                    | "--seam-after"
+                    | "--keep-silence"
                     | "--ref"
             ),
             Self::Vad => matches!(
@@ -311,6 +367,15 @@ impl Command {
                     | "--ort-dylib"
                     | "--turn-gap"
                     | "--endpoint"
+                    | "--window"
+                    | "--overlap"
+                    | "--step-ms"
+                    | "--horizon"
+                    | "--silence-ms"
+                    | "--no-speech-ms"
+                    | "--vad-threshold"
+                    | "--seam-after"
+                    | "--keep-silence"
                     | "--backchannel-max-ms"
             ),
         }
@@ -329,9 +394,14 @@ impl Command {
                     | "--vad"
             ),
             Self::Bench => option == "--fp16",
-            Self::Stream => matches!(option, "--fp16" | "--lock" | "--events"),
+            Self::Stream => {
+                matches!(
+                    option,
+                    "--fp16" | "--lock" | "--events" | "--applied-config"
+                )
+            }
             Self::Vad => false,
-            Self::Dialog => option == "--no-dedup",
+            Self::Dialog => matches!(option, "--no-dedup" | "--lock" | "--applied-config"),
         }
     }
 }
@@ -556,9 +626,12 @@ fn bench(parsed: ParsedArguments) -> Result<Invocation, String> {
     }))
 }
 
-fn stream(parsed: ParsedArguments) -> Result<Invocation, String> {
-    let window_seconds = positive_f32(&parsed, "--window", 30.0)?;
-    let overlap_seconds = nonnegative_f32(&parsed, "--overlap", 6.0)?;
+fn stream_policy(
+    parsed: &ParsedArguments,
+    default_horizon: f32,
+) -> Result<StreamPolicyArguments, String> {
+    let window_seconds = positive_f32(parsed, "--window", 30.0)?;
+    let overlap_seconds = nonnegative_f32(parsed, "--overlap", 6.0)?;
     if overlap_seconds >= window_seconds {
         return Err("--overlap must be smaller than --window".into());
     }
@@ -567,6 +640,46 @@ fn stream(parsed: ParsedArguments) -> Result<Invocation, String> {
         true => StreamLockPolicy::CommitStable,
         false => StreamLockPolicy::Advisory,
     };
+    let vad_threshold = parsed
+        .value("--vad-threshold")
+        .map(|value| {
+            if endpoint != EndpointSource::Vad {
+                return Err("--vad-threshold requires --endpoint vad".into());
+            }
+            let value = parse_nonnegative_f32(value, "--vad-threshold")?;
+            VadProbability::new(value).map_err(|error| format!("--vad-threshold: {error}"))
+        })
+        .transpose()?;
+    let optional_nonnegative = |option| {
+        parsed
+            .value(option)
+            .map(|value| parse_nonnegative_f32(value, option))
+            .transpose()
+    };
+    Ok(StreamPolicyArguments {
+        window_seconds,
+        overlap_seconds,
+        step_seconds: positive_f32(parsed, "--step-ms", 500.0)? / 1_000.0,
+        horizon_seconds: positive_f32(parsed, "--horizon", default_horizon)?,
+        endpoint,
+        silence_milliseconds: optional_nonnegative("--silence-ms")?,
+        no_speech_milliseconds: optional_nonnegative("--no-speech-ms")?,
+        vad_threshold,
+        seam_after_seconds: optional_nonnegative("--seam-after")?,
+        keep_silence_seconds: optional_nonnegative("--keep-silence")?,
+        lock_policy,
+    })
+}
+
+fn applied_config_output(parsed: &ParsedArguments) -> AppliedConfigOutput {
+    match parsed.has_flag("--applied-config") {
+        true => AppliedConfigOutput::Shown,
+        false => AppliedConfigOutput::Hidden,
+    }
+}
+
+fn stream(parsed: ParsedArguments) -> Result<Invocation, String> {
+    let stream_policy = stream_policy(&parsed, 4.0)?;
     let events = match parsed.has_flag("--events") {
         true => StreamEventOutput::Shown,
         false => StreamEventOutput::Hidden,
@@ -577,18 +690,10 @@ fn stream(parsed: ParsedArguments) -> Result<Invocation, String> {
         runtime: parsed.runtime(),
         precision: parsed.precision(),
         chunk_milliseconds: positive_usize(&parsed, "--chunk-ms", 100)?,
-        step_seconds: positive_f32(&parsed, "--step-ms", 500.0)? / 1_000.0,
-        horizon_seconds: positive_f32(&parsed, "--horizon", 4.0)?,
-        window_seconds,
-        overlap_seconds,
-        endpoint,
-        silence_milliseconds: parsed
-            .value("--silence-ms")
-            .map(|value| parse_nonnegative_f32(value, "--silence-ms"))
-            .transpose()?,
+        stream_policy,
         reference: parsed.value("--ref").map(PathBuf::from),
-        lock_policy,
         events,
+        applied_config: applied_config_output(&parsed),
     }))
 }
 
@@ -717,9 +822,10 @@ fn dialog(parsed: ParsedArguments) -> Result<Invocation, String> {
         model: parsed.model(),
         runtime: parsed.runtime(),
         turn_gap_seconds: positive_f32(&parsed, "--turn-gap", 0.8)?,
-        endpoint: endpoint_source(parsed.value("--endpoint"))?,
+        stream_policy: stream_policy(&parsed, 5.0)?,
         channel_policy,
         backchannel_maximum_milliseconds: nonnegative_f32(&parsed, "--backchannel-max-ms", 0.0)?,
+        applied_config: applied_config_output(&parsed),
     }))
 }
 
@@ -821,6 +927,160 @@ mod tests {
 
     fn arguments(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_owned()).collect()
+    }
+
+    fn streaming_arguments(
+        command: &str,
+        extra: &[&str],
+    ) -> (super::StreamPolicyArguments, super::AppliedConfigOutput) {
+        let mut values = arguments(&[command, "audio.wav"]);
+        values.extend(arguments(extra));
+        match parse_text(&values).expect("the fixture streaming arguments are valid") {
+            Invocation::Stream(value) => (value.stream_policy, value.applied_config),
+            Invocation::Dialog(value) => (value.stream_policy, value.applied_config),
+            other => panic!("a streaming command must produce stream or dialog: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn streaming_commands_preserve_their_distinct_default_horizons_and_hidden_policy() {
+        let rate = gigaam_audio::SampleRate::new(16_000).expect("fixture rate is valid");
+        for (command, horizon) in [("stream", 4.0), ("dialog", 5.0)] {
+            let (arguments, output) = streaming_arguments(command, &[]);
+            let expected = gigaam_transcription::StreamConfig::checked_default(rate)
+                .and_then(|config| config.with_horizon_sec(horizon))
+                .expect("the established defaults are valid");
+            assert_eq!(arguments.bind(rate), Ok(expected));
+            assert_eq!(output, super::AppliedConfigOutput::Hidden);
+        }
+    }
+
+    #[test]
+    fn both_streaming_commands_bind_every_control_and_coupled_window_changes() {
+        let rate = gigaam_audio::SampleRate::new(16_000).expect("fixture rate is valid");
+        for command in ["stream", "dialog"] {
+            let (arguments, output) = streaming_arguments(
+                command,
+                &[
+                    "--endpoint",
+                    "vad",
+                    "--vad-threshold",
+                    "0.625",
+                    "--window",
+                    "1",
+                    "--overlap",
+                    "0.25",
+                    "--step-ms",
+                    "125.5",
+                    "--horizon",
+                    "0.75",
+                    "--silence-ms",
+                    "125.25",
+                    "--no-speech-ms",
+                    "250.5",
+                    "--seam-after",
+                    "0.375",
+                    "--keep-silence",
+                    "0.125",
+                    "--lock",
+                    "--applied-config",
+                ],
+            );
+            let actual = arguments.bind(rate).expect("the combined policy is valid");
+            assert_eq!(actual.sample_rate(), rate);
+            assert_eq!(actual.endpoint_source(), EndpointSource::Vad);
+            assert_eq!(actual.vad_threshold().get(), 0.625);
+            assert_eq!(actual.window_sec(), 1.0);
+            assert_eq!(actual.overlap_sec(), 0.25);
+            assert_eq!(actual.step_sec(), 125.5 / 1_000.0);
+            assert_eq!(actual.horizon_sec(), 0.75);
+            assert_eq!(actual.rules().after_speech_seconds(), 125.25 / 1_000.0);
+            assert_eq!(actual.rules().without_speech_seconds(), 250.5 / 1_000.0);
+            assert_eq!(actual.seam_after_sec(), 0.375);
+            assert_eq!(actual.keep_silence_sec(), 0.125);
+            assert_eq!(
+                actual.lock_policy(),
+                gigaam_transcription::StreamLockPolicy::CommitStable
+            );
+            assert_eq!(output, super::AppliedConfigOutput::Shown);
+        }
+    }
+
+    #[test]
+    fn blank_endpoint_accepts_zero_silence_rules_and_retention_but_not_vad_threshold() {
+        let rate = gigaam_audio::SampleRate::new(8_000).expect("fixture rate is valid");
+        for command in ["stream", "dialog"] {
+            let (arguments, _) = streaming_arguments(
+                command,
+                &[
+                    "--silence-ms",
+                    "0",
+                    "--no-speech-ms",
+                    "0",
+                    "--seam-after",
+                    "0",
+                    "--keep-silence",
+                    "0",
+                    "--overlap",
+                    "0",
+                ],
+            );
+            let actual = arguments
+                .bind(rate)
+                .expect("blank endpoint accepts a non-16k rate");
+            assert_eq!(actual.rules().after_speech_seconds(), 0.0);
+            assert_eq!(actual.rules().without_speech_seconds(), 0.0);
+            assert_eq!(actual.seam_after_sec(), 0.0);
+            assert_eq!(actual.keep_silence_sec(), 0.0);
+            assert_eq!(actual.overlap_sec(), 0.0);
+            assert!(parse_text(&arguments_for(command, &["--vad-threshold", "0.5"])).is_err());
+        }
+    }
+
+    fn arguments_for(command: &str, extra: &[&str]) -> Vec<String> {
+        let mut values = arguments(&[command, "audio.wav"]);
+        values.extend(arguments(extra));
+        values
+    }
+
+    #[test]
+    fn streaming_controls_refuse_invalid_scalars_duplicates_and_bound_sample_counts() {
+        let rate = gigaam_audio::SampleRate::new(16_000).expect("fixture rate is valid");
+        for command in ["stream", "dialog"] {
+            for extra in [
+                vec!["--window", "0"],
+                vec!["--overlap", "30"],
+                vec!["--step-ms", "0"],
+                vec!["--horizon", "0"],
+                vec!["--silence-ms", "-1"],
+                vec!["--no-speech-ms", "NaN"],
+                vec!["--seam-after", "inf"],
+                vec!["--keep-silence", "-0.1"],
+                vec!["--endpoint", "vad", "--vad-threshold", "1.1"],
+                vec!["--endpoint", "vad", "--vad-threshold", "NaN"],
+                vec!["--no-speech-ms", "1", "--no-speech-ms", "2"],
+                vec!["--applied-config", "--applied-config"],
+                vec!["--lock", "false"],
+            ] {
+                assert!(
+                    parse_text(&arguments_for(command, &extra)).is_err(),
+                    "{command} {extra:?}"
+                );
+            }
+            for extra in [
+                vec!["--keep-silence", "3.4028235e38"],
+                vec!["--step-ms", "0.0000001"],
+            ] {
+                let (arguments, _) = streaming_arguments(command, &extra);
+                assert!(arguments.bind(rate).is_err(), "{command} {extra:?}");
+            }
+            let (arguments, _) = streaming_arguments(command, &["--endpoint", "vad"]);
+            assert!(
+                arguments
+                    .bind(gigaam_audio::SampleRate::new(8_000).expect("fixture rate is valid"))
+                    .is_err()
+            );
+        }
     }
 
     #[test]
