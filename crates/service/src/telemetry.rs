@@ -603,6 +603,20 @@ pub(crate) mod test_support {
             Arc::clone(&self.metrics)
         }
 
+        /// Observes accepted wire records through the real receiver and delivery accounting.
+        pub(crate) fn drain_lines(&self) -> Vec<String> {
+            self.prepared
+                .receiver
+                .try_iter()
+                .map(|mut record| {
+                    record.release_slot_before_write();
+                    let bytes = std::mem::take(&mut record.bytes);
+                    record.delivered();
+                    bytes
+                })
+                .collect()
+        }
+
         /// Drops the real receiver before an offer, exercising standard-channel disconnection.
         pub(crate) fn into_receiver_dropped(self) -> ReceiverDroppedHarness {
             let producer = self.prepared.producer();

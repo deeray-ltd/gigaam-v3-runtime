@@ -9,6 +9,7 @@
 
 //! Structured access logs to stdout as JSON lines, using the service JSON writer.
 use crate::json::{Json, obj};
+use gigaam_recognition::ExecutionState;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -38,6 +39,65 @@ pub(crate) struct TranscribeAccess {
     pub(crate) model: String,
 }
 
+/// Batch phases observable at the Service boundary, without inferring native queue progress.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BatchStage {
+    AudioDecode,
+    Resample,
+    BatchTranscription,
+    ResponseProjection,
+}
+
+impl BatchStage {
+    fn name(self) -> &'static str {
+        match self {
+            Self::AudioDecode => "audio_decode",
+            Self::Resample => "resample",
+            Self::BatchTranscription => "batch_transcription",
+            Self::ResponseProjection => "response_projection",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BatchStageOutcome {
+    Completed,
+    Failed,
+    Interrupted,
+}
+
+impl BatchStageOutcome {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Interrupted => "interrupted",
+        }
+    }
+}
+
+/// Deadline publication and actual work terminalization are separate observations.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BatchProgress {
+    Admitted,
+    WorkStarted,
+    StageStarted(BatchStage),
+    StageFinished {
+        stage: BatchStage,
+        outcome: BatchStageOutcome,
+        milliseconds: u128,
+    },
+    DeadlineElapsed(ExecutionState),
+    WorkFinished(ExecutionState),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct TranscribeProgress {
+    pub(crate) request_id: String,
+    pub(crate) elapsed_milliseconds: u128,
+    pub(crate) progress: BatchProgress,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct WsOpenAccess {
     pub(crate) request_id: String,
@@ -62,9 +122,49 @@ pub(crate) struct WsErrorAccess {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum AccessEvent {
     Transcribe(TranscribeAccess),
+    TranscribeProgress(TranscribeProgress),
     WsOpen(WsOpenAccess),
     WsClose(WsCloseAccess),
     WsError(WsErrorAccess),
+}
+
+fn execution_state_name(state: ExecutionState) -> &'static str {
+    match state {
+        ExecutionState::Ready => "ready",
+        ExecutionState::Queued => "queued",
+        ExecutionState::Running => "running",
+        ExecutionState::CancelRequested => "cancel_requested",
+        ExecutionState::Completed => "completed",
+        ExecutionState::Failed => "failed",
+        ExecutionState::Cancelled => "cancelled",
+    }
+}
+
+fn progress_fields(event: TranscribeProgress) -> Vec<(&'static str, Json)> {
+    let mut fields = vec![
+        ("req_id", Json::str(event.request_id)),
+        ("elapsed_ms", Json::UInt128(event.elapsed_milliseconds)),
+    ];
+    let (phase, state) = match event.progress {
+        BatchProgress::Admitted => ("admission", "admitted"),
+        BatchProgress::WorkStarted => ("work", "started"),
+        BatchProgress::StageStarted(stage) => (stage.name(), "started"),
+        BatchProgress::StageFinished { stage, outcome, .. } => (stage.name(), outcome.name()),
+        BatchProgress::DeadlineElapsed(_) => ("deadline", "elapsed"),
+        BatchProgress::WorkFinished(_) => ("work", "terminal"),
+    };
+    fields.push(("phase", Json::str(phase)));
+    fields.push(("state", Json::str(state)));
+    match event.progress {
+        BatchProgress::StageFinished { milliseconds, .. } => {
+            fields.push(("phase_ms", Json::UInt128(milliseconds)));
+        }
+        BatchProgress::DeadlineElapsed(state) | BatchProgress::WorkFinished(state) => {
+            fields.push(("execution_state", Json::str(execution_state_name(state))));
+        }
+        BatchProgress::Admitted | BatchProgress::WorkStarted | BatchProgress::StageStarted(_) => {}
+    }
+    fields
 }
 
 /// A Unix timestamp that has been checked to fit the JSON integer boundary.
@@ -135,6 +235,9 @@ pub(crate) fn render(event: AccessEvent) -> AccessLine {
             ],
             timestamp,
         ),
+        AccessEvent::TranscribeProgress(event) => {
+            access_line("transcribe_phase", progress_fields(event), timestamp)
+        }
         AccessEvent::WsOpen(event) => access_line(
             "ws_open",
             vec![
@@ -218,6 +321,30 @@ mod tests {
         assert!(
             line.as_str()
                 .ends_with("\"phase\":\"stream\",\"message\":\"broken\"}\n")
+        );
+    }
+
+    #[test]
+    fn deadline_record_preserves_the_observed_execution_state_and_correlation() {
+        let line = render(AccessEvent::TranscribeProgress(TranscribeProgress {
+            request_id: "request-\"quoted\"".to_owned(),
+            elapsed_milliseconds: 123,
+            // The deadline and actual completion can race; never invent cancellation here.
+            progress: BatchProgress::DeadlineElapsed(ExecutionState::Completed),
+        }));
+        assert!(line.as_str().contains("\"event\":\"transcribe_phase\""));
+        assert!(
+            line.as_str()
+                .contains("\"req_id\":\"request-\\\"quoted\\\"\"")
+        );
+        assert!(line.as_str().contains("\"elapsed_ms\":123"));
+        assert!(
+            line.as_str()
+                .contains("\"phase\":\"deadline\",\"state\":\"elapsed\"")
+        );
+        assert!(
+            line.as_str()
+                .ends_with("\"execution_state\":\"completed\"}\n")
         );
     }
 }

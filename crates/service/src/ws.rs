@@ -1396,6 +1396,7 @@ mod tests {
                 .iter()
                 .map(|event| match event {
                     crate::log::AccessEvent::Transcribe(_) => "transcribe",
+                    crate::log::AccessEvent::TranscribeProgress(_) => "transcribe_phase",
                     crate::log::AccessEvent::WsOpen(_) => "ws_open",
                     crate::log::AccessEvent::WsClose(_) => "ws_close",
                     crate::log::AccessEvent::WsError(_) => "ws_error",
@@ -1436,6 +1437,7 @@ mod tests {
         fn emit_access(&mut self, event: crate::log::AccessEvent) {
             let kind = match &event {
                 crate::log::AccessEvent::Transcribe(_) => "transcribe",
+                crate::log::AccessEvent::TranscribeProgress(_) => "transcribe_phase",
                 crate::log::AccessEvent::WsOpen(_) => "ws_open",
                 crate::log::AccessEvent::WsClose(_) => "ws_close",
                 crate::log::AccessEvent::WsError(_) => "ws_error",
