@@ -203,7 +203,7 @@ help or version command grammar.
 asr transcribe FILE [--model DIR] [--ep cpu|cuda|tensorrt] [--ort-dylib PATH]
                     [--fp16] [--rnnt] [--window S] [--overlap S] [--pad]
                     [--words] [--split-channels] [--turns] [--turn-gap S]
-                    [--evidence PATH]
+                    [--evidence PATH] [--evidence-version 1|2]
                     [--vad] [--vad-threshold F] [--vad-neg-threshold F]
                     [--vad-min-speech-ms N] [--vad-min-silence-ms N] [--vad-speech-pad-ms N]
 
@@ -274,8 +274,38 @@ each decoded word, so an external reader can check its own word grouping against
 own word rule without re-implementing it. PATH is validated once, before any window is decoded:
 its parent directory must already exist, and PATH itself must not already be a directory. The
 transcript is unaffected by --evidence; only CTC transcription supports it, so it conflicts with
---rnnt. The existing `evidence v1` format also conflicts with `--vad`: it cannot represent
-segmented physical-channel/crop origins, so that combination refuses before creating a file.
+--rnnt. Version 1 remains the default and retains its existing bytes. `--evidence-version`
+requires a destination and accepts only `1` or `2`. With VAD enabled, evidence requires an
+explicit `--evidence-version 2`; version 1 cannot represent segmented origins and refuses
+before file creation. Version 2 also works with VAD disabled.
+
+`evidence v2` retains each window's existing local feature/token coordinates and adds
+`channel` (the zero-based physical source channel) and `frontend_origin_sample` (the integer
+model-rate sample offset of the feature crop in that channel). Temporal fields and
+`first_sample` are already on the source-channel timeline; never add the crop origin to
+them again. The crop offset need not be divisible by the frontend hop length. Each channel
+has its own planned window indices; gaps in indices need not be missing records because
+short no-decode windows can be planned without emitting evidence.
+
+After the audio header, version 2 records `vad disabled` or `vad enabled` with the applied
+rate, thresholds and duration parameters. After successful transcription it adds:
+
+~~~text
+coverage source_channels 3 selected_channels 0 1 2 duplicate not-dual-mono
+channel_windows 0 emitted 0
+channel_windows 1 emitted 2
+channel_windows 2 emitted 1
+complete
+~~~
+
+Coverage comes from the successful multi-channel result, including every selected quiet or
+short channel. `emitted` counts actual written window records, not planned windows.
+Duplicate classification is `dual-mono` or `not-dual-mono`; selected identities are never
+renumbered. Failed transcription, invalid coverage, or a previously observed write failure
+does not receive a successful closing record. Earlier records are flushed before attempting
+the footer. A late final write/flush failure still fails the command and may leave footer
+bytes, so success requires both zero CLI exit status and a valid complete file. The format
+does not promise atomic publication or durable storage.
 
 For applicable commands, --model defaults to model. --ort-dylib or ORT_DYLIB_PATH is
 required; when both are present, they must be identical. Provider selection and runtime

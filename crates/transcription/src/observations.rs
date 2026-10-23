@@ -9,6 +9,7 @@
 
 //! Process-independent per-window observation contracts.
 
+use crate::channel_selection::OriginalChannel;
 use gigaam_recognition::Token;
 use std::sync::Arc;
 
@@ -71,6 +72,7 @@ pub enum WindowKind {
 /// Named inputs for constructing one validated window-evidence record. Grouped because the
 /// record has more independent fields than a positional constructor can keep unambiguous.
 pub(crate) struct WindowEvidenceInput {
+    pub(crate) channel: Option<OriginalChannel>,
     pub(crate) index: usize,
     pub(crate) kind: WindowKind,
     pub(crate) start_sec: f32,
@@ -99,6 +101,7 @@ pub(crate) struct WindowEvidenceInput {
 /// token frames remain local to the decoded window. A crop need not start on the source hop grid.
 #[derive(Clone, Debug, PartialEq)]
 pub struct WindowEvidence {
+    channel: Option<OriginalChannel>,
     index: usize,
     kind: WindowKind,
     start_sec: f32,
@@ -163,6 +166,7 @@ impl WindowEvidence {
             }
         }
         Ok(Self {
+            channel: input.channel,
             index: input.index,
             kind: input.kind,
             start_sec: input.start_sec,
@@ -184,6 +188,12 @@ impl WindowEvidence {
 
     pub const fn index(&self) -> usize {
         self.index
+    }
+
+    /// Physical source-channel identity supplied by the multi-channel owner. Direct single-channel
+    /// calls have no enclosing selection and return `None`; indices are never inferred from windows.
+    pub const fn channel(&self) -> Option<OriginalChannel> {
+        self.channel
     }
 
     pub const fn kind(&self) -> WindowKind {
@@ -329,6 +339,7 @@ mod tests {
 
     fn valid_input() -> WindowEvidenceInput {
         WindowEvidenceInput {
+            channel: None,
             frontend_origin_sample: 0,
             index: 0,
             kind: WindowKind::Body,

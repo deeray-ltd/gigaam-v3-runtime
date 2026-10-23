@@ -7,7 +7,8 @@
 use crate::composition;
 use crate::configuration;
 use crate::grammar::{
-    ChannelOutput, DecoderChoice, TranscribeInvocation, TranscribeOutput, TurnOutput,
+    ChannelOutput, DecoderChoice, EvidenceVersion, TranscribeInvocation, TranscribeOutput,
+    TurnOutput,
 };
 use crate::projection::{
     self, EvidenceAudioHeader, EvidenceModelHeader, EvidenceWriter, TranscribeSummary,
@@ -35,11 +36,11 @@ pub(crate) fn run(invocation: TranscribeInvocation) -> Result<(), String> {
     if evidence_path.is_some() && invocation.decoder == DecoderChoice::Rnnt {
         return Err("--evidence requires CTC; it does not support --rnnt".into());
     }
-    if evidence_path.is_some() && invocation.vad.is_some() {
-        return Err(
-            "--vad cannot use evidence v1: segmented evidence requires a channel-aware format"
-                .into(),
-        );
+    if evidence_path.is_some()
+        && invocation.vad.is_some()
+        && invocation.evidence_version == EvidenceVersion::V1
+    {
+        return Err("--vad requires --evidence-version 2 when --evidence is enabled".into());
     }
     let vad_policy = invocation.vad.map(|policy| policy.bind()).transpose()?;
     let runtime = configuration::runtime(&invocation.runtime, required_roles)
@@ -106,6 +107,7 @@ pub(crate) fn run(invocation: TranscribeInvocation) -> Result<(), String> {
             path,
             &invocation.model,
             &package,
+            invocation.evidence_version,
         )?)),
         None => None,
     };
@@ -141,6 +143,7 @@ pub(crate) fn run(invocation: TranscribeInvocation) -> Result<(), String> {
             samples: audio.frames(),
             total_seconds: audio.duration_seconds(),
         })?;
+        evidence.write_vad_policy(vad_policy)?;
     }
     let inference_started = Instant::now();
     let result = match &mut vad {
@@ -150,7 +153,7 @@ pub(crate) fn run(invocation: TranscribeInvocation) -> Result<(), String> {
     .map_err(|error| error.to_string())?;
     let inference_elapsed = inference_started.elapsed();
     if let Some(evidence) = &evidence {
-        evidence.finish()?;
+        evidence.finish(&result)?;
     }
     projection::transcribe(TranscribeSummary {
         result: &result,
@@ -168,13 +171,14 @@ pub(crate) fn run(invocation: TranscribeInvocation) -> Result<(), String> {
     Ok(())
 }
 
-/// Opens the evidence file and writes its `evidence v1` and `model` header lines from the
+/// Opens the evidence file and writes its selected version and `model` header lines from the
 /// package's own typed frontend and CTC definitions. The subsampling factor is derived, never a
 /// hard-coded constant, through the exact function the batch window loop uses internally.
 fn open_evidence_writer(
     path: &Path,
     model_path: &Path,
     package: &ModelPackage,
+    version: EvidenceVersion,
 ) -> Result<EvidenceWriter, String> {
     let model_id = evidence_token(model_path, "model")?;
     let frame_rate = FrameRate::new(f64_to_f32(package.frontend().frames_per_second()))
@@ -199,6 +203,7 @@ fn open_evidence_writer(
             space,
             subsampling,
         },
+        version,
     )
 }
 
