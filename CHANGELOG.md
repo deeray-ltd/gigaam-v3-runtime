@@ -6,6 +6,13 @@ All notable changes are recorded here. Pre-1.0 releases do not promise a stable 
 
 ### Added
 
+- Opt-in `transcribe --vad` for CTC and RNN-T batch speech segmentation, with explicit
+  threshold, minimum speech/silence, and padding controls. It requires a 16 kHz model,
+  preserves batch channel selection and source times, and reports applied policy and VAD
+  duration separately. Existing `evidence v1` is refused with VAD until it can represent
+  segmented channel origins.
+- Standalone `vad --channels all|0,2` selects physical channels without deduplication,
+  including labelled silent channels. Omitting selection preserves channel-0 output.
 - Correlated batch HTTP phase records for actual audio decoding, resampling, aggregate
   transcription, response projection and work termination through the existing bounded
   telemetry writer. HTTP deadline notification remains distinct from actual cancellation
@@ -26,6 +33,8 @@ All notable changes are recorded here. Pre-1.0 releases do not promise a stable 
 
 ### Changed
 
+- Standalone VAD minimum speech/silence and padding accept finite nonnegative fractional
+  milliseconds, including zero, through the same checked policy as batch VAD.
 - Speech segmentation now refuses incomplete or excess detector probability coverage,
   including silent output, instead of interpreting it as a complete waveform. Each
   independent 16 kHz input requires one finite probability in `[0, 1]` per 512 samples,

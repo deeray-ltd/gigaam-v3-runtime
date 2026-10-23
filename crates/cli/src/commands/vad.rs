@@ -6,34 +6,19 @@
 
 use crate::composition;
 use crate::configuration;
-use crate::grammar::VadInvocation;
-use crate::numeric::{count_to_f32, usize_to_u32};
+use crate::grammar::{VadChannels, VadInvocation};
+use crate::numeric::usize_to_u32;
 use crate::projection::{self, VadSummary};
-use gigaam_audio::{SampleRate, load};
-use gigaam_recognition::{RequiredEncoderRoles, vad::VAD_SR};
-use gigaam_transcription::{
-    VadDurations, VadPadding, VadPolicyConfig, VadProbability, VadThresholds, speech_segments,
-};
-use std::time::Instant;
+use gigaam_audio::{DecodedAudio, SampleRate, load};
+use gigaam_recognition::{RequiredEncoderRoles, SpeechProbabilityDetector, vad::VAD_SR};
+use gigaam_transcription::{SpeechSegment, VadPolicyConfig, speech_segments};
+use std::time::{Duration, Instant};
 
 /// Executes direct fixed-domain VAD with package binding before native construction.
 pub(crate) fn run(invocation: VadInvocation) -> Result<(), String> {
     let runtime = configuration::runtime(&invocation.runtime, RequiredEncoderRoles::none())
         .map_err(|error| format!("runtime configuration: {error}"))?;
-    let speech_threshold = VadProbability::new(invocation.speech_threshold)
-        .map_err(|error| format!("VAD speech threshold: {error}"))?;
-    let silence_threshold = VadProbability::new(invocation.silence_threshold)
-        .map_err(|error| format!("VAD silence threshold: {error}"))?;
-    let thresholds = VadThresholds::new(speech_threshold, silence_threshold)
-        .map_err(|error| format!("VAD thresholds: {error}"))?;
-    let durations = VadDurations::new(
-        count_to_f32(invocation.minimum_speech_milliseconds),
-        count_to_f32(invocation.minimum_silence_milliseconds),
-    )
-    .map_err(|error| format!("VAD durations: {error}"))?;
-    let padding = VadPadding::new(count_to_f32(invocation.speech_padding_milliseconds))
-        .map_err(|error| format!("VAD padding: {error}"))?;
-    let config = VadPolicyConfig::new(thresholds, durations, padding);
+    let config = invocation.policy.bind()?;
 
     let package = composition::open_package(&invocation.model)?;
     composition::initialize_runtime(&runtime)?;
@@ -43,16 +28,139 @@ pub(crate) fn run(invocation: VadInvocation) -> Result<(), String> {
     let target_rate = SampleRate::new(usize_to_u32(VAD_SR, "VAD sample rate")?)?;
     let audio = composition::resample_to(loaded, target_rate)
         .map_err(|error| format!("resample: {error}"))?;
-    let channel = audio
-        .channels()
-        .first()
-        .ok_or_else(|| "VAD audio must contain at least one channel".to_owned())?;
-    let started = Instant::now();
-    let segments = speech_segments(&mut detector, channel.view(), config)?;
-    projection::vad(VadSummary {
-        segments: &segments,
-        sample_rate: VAD_SR,
-        total_samples: channel.len(),
-        elapsed: started.elapsed(),
-    })
+    let results = detect_channels(&audio, &invocation.channels, &mut detector, config)?;
+    if invocation.channels.is_explicit() {
+        projection::vad_policy(config);
+        projection::vad_selection(
+            audio.channels().len(),
+            results.iter().map(|result| result.index),
+        );
+    }
+    for result in results {
+        projection::vad(VadSummary {
+            segments: &result.segments,
+            sample_rate: VAD_SR,
+            total_samples: audio.frames(),
+            elapsed: result.elapsed,
+            channel: invocation.channels.is_explicit().then_some(result.index),
+        })?;
+    }
+    Ok(())
+}
+
+struct ChannelDetection {
+    index: usize,
+    segments: Vec<SpeechSegment>,
+    elapsed: Duration,
+}
+
+/// Resolve the complete physical selection before any detector call; project only a complete result.
+fn detect_channels<D: SpeechProbabilityDetector>(
+    audio: &DecodedAudio,
+    selection: &VadChannels,
+    detector: &mut D,
+    policy: VadPolicyConfig,
+) -> Result<Vec<ChannelDetection>, String> {
+    let selected = selection.resolve(audio.channels().len())?;
+    let mut results = Vec::with_capacity(selected.len());
+    for index in selected {
+        let channel = audio
+            .channels()
+            .get(index)
+            .ok_or_else(|| "validated VAD selection must belong to the source audio".to_owned())?;
+        let started = Instant::now();
+        let segments = speech_segments(detector, channel.view(), policy)?;
+        results.push(ChannelDetection {
+            index,
+            segments,
+            elapsed: started.elapsed(),
+        });
+    }
+    Ok(results)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gigaam_audio::{ChannelAudio, ChannelAudioView};
+
+    struct Detector {
+        calls: Vec<f32>,
+    }
+
+    impl SpeechProbabilityDetector for Detector {
+        fn probabilities(&mut self, audio: ChannelAudioView<'_>) -> Result<Vec<f32>, String> {
+            let marker = audio.samples()[0];
+            self.calls.push(marker);
+            let probability = if marker == 0.0 { 0.0 } else { 1.0 };
+            Ok(vec![probability; audio.len().div_ceil(512)])
+        }
+    }
+
+    fn audio() -> DecodedAudio {
+        DecodedAudio::new(
+            SampleRate::new(16_000).expect("test VAD rate is positive"),
+            [0.25, 0.0, 0.25]
+                .into_iter()
+                .map(|marker| {
+                    ChannelAudio::new(vec![marker; 8192]).expect("finite test channel is valid")
+                })
+                .collect(),
+        )
+        .expect("three equal nonempty physical channels are valid")
+    }
+
+    #[test]
+    fn explicit_all_retains_silent_and_duplicate_physical_channels() {
+        let mut detector = Detector { calls: Vec::new() };
+        let result = detect_channels(
+            &audio(),
+            &VadChannels::All,
+            &mut detector,
+            VadPolicyConfig::default(),
+        )
+        .expect("complete per-channel probabilities produce complete results");
+        assert_eq!(detector.calls, vec![0.25, 0.0, 0.25]);
+        assert_eq!(
+            result
+                .iter()
+                .map(|channel| channel.index)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        assert_eq!(result[0].segments.len(), 1);
+        assert!(result[1].segments.is_empty());
+        assert_eq!(result[0].segments, result[2].segments);
+    }
+
+    #[test]
+    fn subset_is_physical_and_invalid_selection_precedes_every_detector_call() {
+        let mut detector = Detector { calls: Vec::new() };
+        assert!(
+            detect_channels(
+                &audio(),
+                &VadChannels::Selected(vec![0, 3]),
+                &mut detector,
+                VadPolicyConfig::default()
+            )
+            .is_err()
+        );
+        assert!(detector.calls.is_empty());
+        let result = detect_channels(
+            &audio(),
+            &VadChannels::Selected(vec![1, 2]),
+            &mut detector,
+            VadPolicyConfig::default(),
+        )
+        .expect("valid physical subset is preserved");
+        assert_eq!(detector.calls, vec![0.0, 0.25]);
+        assert_eq!(
+            result
+                .iter()
+                .map(|channel| channel.index)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert!(result[0].segments.is_empty());
+    }
 }

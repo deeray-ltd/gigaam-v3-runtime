@@ -16,7 +16,7 @@ use crate::projection::{
 use gigaam_audio::load;
 use gigaam_model_package::ModelPackage;
 use gigaam_primitives::f64_to_f32;
-use gigaam_recognition::{ExecutionControl, FrameRate, RequiredEncoderRoles};
+use gigaam_recognition::{ExecutionControl, FrameRate, RequiredEncoderRoles, vad::VAD_SR};
 use gigaam_transcription::{
     BatchChannelPolicy, BatchConfig, BatchSetup, MultiChannelBatchOptions, MultiChannelBatchSetup,
     MultiChannelBatchTranscriber, TurnGap, WindowEvidenceObserver, subsampling_factor,
@@ -35,6 +35,13 @@ pub(crate) fn run(invocation: TranscribeInvocation) -> Result<(), String> {
     if evidence_path.is_some() && invocation.decoder == DecoderChoice::Rnnt {
         return Err("--evidence requires CTC; it does not support --rnnt".into());
     }
+    if evidence_path.is_some() && invocation.vad.is_some() {
+        return Err(
+            "--vad cannot use evidence v1: segmented evidence requires a channel-aware format"
+                .into(),
+        );
+    }
+    let vad_policy = invocation.vad.map(|policy| policy.bind()).transpose()?;
     let runtime = configuration::runtime(&invocation.runtime, required_roles)
         .map_err(|error| format!("runtime configuration: {error}"))?;
     let options = MultiChannelBatchOptions::new(
@@ -49,6 +56,11 @@ pub(crate) fn run(invocation: TranscribeInvocation) -> Result<(), String> {
 
     let package = composition::open_package(&invocation.model)?;
     let sample_rate = composition::package_sample_rate(&package)?;
+    if vad_policy.is_some() && sample_rate.as_usize()? != VAD_SR {
+        return Err(format!(
+            "batch VAD requires a {VAD_SR} Hz model/frontend rate"
+        ));
+    }
     let config = BatchConfig::new(
         sample_rate,
         invocation.window_seconds,
@@ -56,6 +68,13 @@ pub(crate) fn run(invocation: TranscribeInvocation) -> Result<(), String> {
         invocation.padding,
     )?;
     composition::initialize_runtime(&runtime)?;
+    let mut vad = vad_policy
+        .map(|policy| {
+            composition::vad(&package, runtime.plan().intra_threads())
+                .map(|detector| (detector, policy))
+                .map_err(|error| format!("vad: {error}"))
+        })
+        .transpose()?;
     let frontend = composition::frontend_for_package(&package, frontend_mode)
         .map_err(|error| format!("frontend: {error}"))?;
     let decoder = match invocation.decoder {
@@ -124,9 +143,11 @@ pub(crate) fn run(invocation: TranscribeInvocation) -> Result<(), String> {
         })?;
     }
     let inference_started = Instant::now();
-    let result = transcriber
-        .transcribe(&audio)
-        .map_err(|error| error.to_string())?;
+    let result = match &mut vad {
+        Some((detector, policy)) => transcriber.transcribe_with_vad(&audio, detector, *policy),
+        None => transcriber.transcribe(&audio),
+    }
+    .map_err(|error| error.to_string())?;
     let inference_elapsed = inference_started.elapsed();
     if let Some(evidence) = &evidence {
         evidence.finish()?;
@@ -142,6 +163,7 @@ pub(crate) fn run(invocation: TranscribeInvocation) -> Result<(), String> {
         overlap_seconds: invocation.overlap_seconds,
         loading_elapsed,
         inference_elapsed,
+        vad_policy,
     });
     Ok(())
 }
