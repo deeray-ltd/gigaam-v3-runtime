@@ -181,8 +181,17 @@ validates this query:
 | channels | integer 1 through 8 | 1 |
 | emit | turns, words, both | turns |
 | endpoint | blank, vad | blank |
+| vad_threshold | Finite probability in [0, 1]; requires endpoint=vad | 0.5 |
+| silence_ms | Finite nonnegative after-speech silence, milliseconds | 1200 |
+| no_speech_ms | Finite nonnegative silence without recognized speech, milliseconds | 2400 |
+| window | Finite positive seconds | 30 |
+| overlap | Finite nonnegative seconds, shorter than window | 6 |
+| step_ms | Finite positive milliseconds | 500 |
 | horizon | finite seconds greater than zero | 5.0 |
 | lock | 1, 0, true, false | false |
+| seam_after | Finite nonnegative seam delay, seconds | 2 |
+| keep_silence | Finite nonnegative retained silence, seconds | 0.5 |
+| applied_config | 1, 0, true, false | false |
 | turn_gap | finite seconds greater than zero | 0.8 |
 | dedup | 1, 0, true, false | ASR_DEDUP for multichannel input; disabled for mono input |
 | backchannel_max_ms | finite milliseconds greater than or equal to zero | ASR_BACKCHANNEL_MAX_MS |
@@ -190,6 +199,15 @@ validates this query:
 Within the accepted range, rate is admitted only when its ratio to the model rate, reduced
 to lowest terms, stays within 1000 on both sides; other rates refuse with an explicit
 message.
+
+Streaming timing controls bind together at the selected model rate before upgrade or native
+session construction. Fractions and zero are accepted where stated; window and step must
+truncate to at least one model-rate sample, and all derived counts must be representable.
+Overlap and retained silence may truncate to zero. Both blank and VAD endpointing use the
+silence rules, seam delay, and retained silence. Only an explicit `vad_threshold` requires
+`endpoint=vad`. Enabled VAD requires a 16000 Hz model/frontend; `rate` still describes the
+source audio, which is resampled normally. These controls preserve the existing endpoint
+algorithm and do not enable batch segmentation or skip recognition on silence.
 
 The connection reserves one streaming admission permit per requested source channel, not
 per socket. It cannot reserve more than the configured streaming limit even though the
@@ -232,12 +250,24 @@ The server sends JSON text frames:
 
 | Type | Fields | Meaning |
 | --- | --- | --- |
+| applied_stream_config | type, schema_version, model_sample_rate, endpoint, window_sec, overlap_sec, step_sec, horizon_sec, lock, seam_after_sec, keep_silence_sec, endpoint_rules, vad | Opt-in confirmation of the immutable policy bound to the active session. |
 | words | type, at, revise_from, words | Replace the channel word tail at revise_from. Each word has start, end, text, stable. |
 | stable | type, at, upto | Word order is settled through upto. |
 | final | type, at, upto, endpoint | Output is immutable through upto; endpoint indicates endpoint-caused finality. |
 | turns | type, revise_from, frontier, turns | Replace the dialogue tail from revise_from. Each turn has channel, k, start, end, text, stable, final, backchannel. |
 | error | type, message | Terminal diagnostic before server close for an in-band application failure. |
 | end | type | Successful terminal event. |
+
+`applied_config=1` or `true` requests one `applied_stream_config` event after successful
+active-session construction and before transcript events. Its version-1 object has the same
+fields and numeric semantics as the CLI applied-policy record below; the WebSocket horizon
+default remains 5 seconds. Values come from the setup bound to the actual session. The event
+does not assert completed inference or selected physical-channel identities: deduplication
+may defer channel activation until enough input arrives. No record is sent after failed
+construction or shutdown before opening. An already-ready active shutdown takes precedence
+over pending metadata. A metadata delivery failure terminates through the existing event
+delivery failure path without recursive error delivery. Omitted, `0`, or `false` preserves
+the existing event stream; new control keys do not require opting into this event.
 
 Channel is omitted from words, stable, and final in mono sessions and present in
 multichannel sessions. In every emission group, channel events appear in ascending original

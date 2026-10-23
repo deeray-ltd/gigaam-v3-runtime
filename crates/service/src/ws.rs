@@ -15,7 +15,7 @@ use crate::admission::{
 use crate::context::ApplicationContext;
 use crate::metrics::Metrics;
 use crate::protocol::{QueryParameters, query_bool, query_finite_f32};
-use crate::stream_response::{end_event, error_event, serialize_step};
+use crate::stream_response::{applied_config_event, end_event, error_event, serialize_step};
 use crate::telemetry::TelemetryProducer;
 use axum::extract::ws::{CloseCode, CloseFrame, Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{RawQuery, State};
@@ -25,11 +25,12 @@ use gigaam_audio::{FrontendProcessor, RatePair, SampleFormat, SampleRate};
 use gigaam_model_package::ModelPackage;
 use gigaam_recognition::{ExecutionControl, ExecutionScheduler, ScheduledRecognizer, Vad};
 use gigaam_transcription::{
-    BackchannelDuration, BackchannelPolicy, CorrelationThreshold, EndpointDetector, EndpointSource,
-    MultiChannelFailure, MultiChannelSession, MultiChannelStep, MultiChannelStreamOptions,
-    MultiChannelStreamSetup, MultiChannelStreamSetupInput, OriginalChannel, SelectionWindowSamples,
-    SourceChannelCount, StreamChannelFactory, StreamConfig, StreamEmissionMode, StreamLockPolicy,
-    StreamSetup, StreamingChannelPolicy, TranscriptionObservation, TurnGap,
+    BackchannelDuration, BackchannelPolicy, CorrelationThreshold, EndpointDetector, EndpointRules,
+    EndpointSource, MultiChannelFailure, MultiChannelSession, MultiChannelStep,
+    MultiChannelStreamOptions, MultiChannelStreamSetup, MultiChannelStreamSetupInput,
+    OriginalChannel, SelectionWindowSamples, SourceChannelCount, StreamChannelFactory,
+    StreamConfig, StreamEmissionMode, StreamLockPolicy, StreamSetup, StreamingChannelPolicy,
+    TranscriptionObservation, TurnGap, VadProbability,
 };
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -97,6 +98,7 @@ struct StreamQuery {
     turn_gap: f32,
     backchannel_max_sec: f32,
     dedup: bool,
+    applied_config: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -126,8 +128,17 @@ impl StreamQuery {
             "channels",
             "emit",
             "endpoint",
+            "vad_threshold",
+            "silence_ms",
+            "no_speech_ms",
+            "window",
+            "overlap",
+            "step_ms",
             "horizon",
             "lock",
+            "seam_after",
+            "keep_silence",
+            "applied_config",
             "turn_gap",
             "dedup",
             "backchannel_max_ms",
@@ -166,12 +177,47 @@ impl StreamQuery {
             Some("both") => EmitMode::Both,
             Some(value) => return Err(format!("emit must be turns|words|both, got {value:?}")),
         };
+        let base = defaults.stream_base;
+        let rules = EndpointRules::new(
+            query_milliseconds_as_seconds(
+                &parameters,
+                "silence_ms",
+                base.rules().after_speech_seconds(),
+            )?,
+            query_milliseconds_as_seconds(
+                &parameters,
+                "no_speech_ms",
+                base.rules().without_speech_seconds(),
+            )?,
+        )?;
         let config = StreamConfig::timing_changes()
+            .with_window_sec(query_finite_f32(&parameters, "window", base.window_sec())?)?
+            .with_overlap_sec(query_finite_f32(
+                &parameters,
+                "overlap",
+                base.overlap_sec(),
+            )?)?
+            .with_step_sec(query_milliseconds_as_seconds(
+                &parameters,
+                "step_ms",
+                base.step_sec(),
+            )?)?
             .with_horizon_sec(positive_f32(
                 query_finite_f32(&parameters, "horizon", 5.0)?,
                 "horizon",
             )?)?
-            .apply(defaults.stream_base)?;
+            .with_seam_after_sec(query_finite_f32(
+                &parameters,
+                "seam_after",
+                base.seam_after_sec(),
+            )?)?
+            .with_keep_silence_sec(query_finite_f32(
+                &parameters,
+                "keep_silence",
+                base.keep_silence_sec(),
+            )?)?
+            .apply(base)?
+            .with_rules(rules)?;
         let config = config.with_lock_policy(match query_bool(&parameters, "lock", false)? {
             true => StreamLockPolicy::CommitStable,
             false => StreamLockPolicy::Advisory,
@@ -181,7 +227,18 @@ impl StreamQuery {
             Some("vad") => EndpointSource::Vad,
             Some(value) => return Err(format!("endpoint must be blank or vad, got {value:?}")),
         };
-        let config = config.with_endpoint_source(endpoint)?;
+        let mut config = config.with_endpoint_source(endpoint)?;
+        if parameters.get("vad_threshold").is_some() {
+            if endpoint != EndpointSource::Vad {
+                return Err("vad_threshold requires endpoint=vad".into());
+            }
+            let threshold = VadProbability::new(query_finite_f32(
+                &parameters,
+                "vad_threshold",
+                config.vad_threshold().get(),
+            )?)?;
+            config = config.with_vad_threshold(threshold)?;
+        }
         let turn_gap = positive_f32(query_finite_f32(&parameters, "turn_gap", 0.8)?, "turn_gap")?;
         let backchannel_milliseconds = query_finite_f32(
             &parameters,
@@ -205,7 +262,25 @@ impl StreamQuery {
             turn_gap,
             backchannel_max_sec: backchannel_milliseconds / 1000.0,
             dedup,
+            applied_config: query_bool(&parameters, "applied_config", false)?,
         })
+    }
+}
+
+fn query_milliseconds_as_seconds(
+    parameters: &QueryParameters,
+    key: &str,
+    default_seconds: f32,
+) -> Result<f32, String> {
+    match parameters.get(key) {
+        Some(_) => {
+            let milliseconds = query_finite_f32(parameters, key, 0.0)?;
+            if milliseconds < 0.0 {
+                return Err(format!("{key} must be nonnegative"));
+            }
+            Ok(milliseconds / 1_000.0)
+        }
+        None => Ok(default_seconds),
     }
 }
 
@@ -431,13 +506,17 @@ impl StreamChannelFactory for ServiceStreamChannelFactory {
 /// Validated setup data that is safe to compute before reserving an upgrade token.
 struct PreparedStream {
     setup: MultiChannelStreamSetup,
+    applied_config: bool,
 }
 
 impl PreparedStream {
     fn parse(raw: Option<&str>, context: &ApplicationContext) -> Result<Self, String> {
         let query = StreamQuery::parse(raw, StreamDefaults::from(context))?;
         let setup = multi_channel_setup(&query, context)?;
-        Ok(Self { setup })
+        Ok(Self {
+            setup,
+            applied_config: query.applied_config,
+        })
     }
 }
 
@@ -609,6 +688,7 @@ struct PostWarmupInput<S> {
     phase_rx: tokio::sync::watch::Receiver<AdmissionPhase>,
     source_sample_rate: SampleRate,
     source_channels: SourceChannelCount,
+    applied_config: Option<StreamConfig>,
 }
 
 impl SessionFailure {
@@ -688,6 +768,7 @@ async fn run_post_warmup<S: StreamingSession, E: SessionEffects>(
         phase_rx,
         source_sample_rate,
         source_channels,
+        applied_config,
     } = input;
     match result {
         PostWarmup::ShutdownBeforeOpen(session) => {
@@ -714,6 +795,7 @@ async fn run_post_warmup<S: StreamingSession, E: SessionEffects>(
                 source_channels,
                 &mut phase_rx,
                 terminal_context,
+                applied_config,
             )
             .await;
         }
@@ -864,6 +946,10 @@ async fn handle(
     let mut effects = AxumEffects::new(socket, state.telemetry.clone());
     let source_sample_rate = prepared.setup.source_sample_rate();
     let source_channels = prepared.setup.source_channels();
+    let applied_config = match prepared.applied_config {
+        true => Some(prepared.setup.stream_config().clone()),
+        false => None,
+    };
     let factory = ServiceStreamChannelFactory::new(
         Arc::clone(&state.context.capabilities.pack),
         Arc::clone(&state.context.capabilities.frontend),
@@ -912,6 +998,7 @@ async fn handle(
             phase_rx,
             source_sample_rate,
             source_channels,
+            applied_config,
         },
     )
     .await;
@@ -924,18 +1011,36 @@ async fn run_active<S: StreamingSession, E: SessionEffects>(
     source_channels: SourceChannelCount,
     phase_rx: &mut tokio::sync::watch::Receiver<AdmissionPhase>,
     mut terminal_context: ActiveTerminalContext,
+    mut applied_config: Option<StreamConfig>,
 ) {
     let end = loop {
         enum Next {
             Shutdown(Result<(), tokio::sync::watch::error::RecvError>),
+            AppliedConfig,
             Message(Result<Option<InboundFrame>, ReceiveError>),
         }
         let next = tokio::select! {
             biased;
             changed = phase_rx.changed() => Next::Shutdown(changed),
+            () = std::future::ready(()), if applied_config.is_some() => Next::AppliedConfig,
             message = effects.receive() => Next::Message(message),
         };
         match next {
+            Next::AppliedConfig => {
+                let config = applied_config.take().expect(
+                    "the applied-config branch is enabled only while a bound policy is pending",
+                );
+                if let Err(error) = send_text(effects, applied_config_event(&config)).await {
+                    report_session_failure(
+                        effects,
+                        metrics,
+                        SessionFailure::new("event_delivery", error),
+                        FailureDelivery::RecordOnly,
+                    )
+                    .await;
+                    return;
+                }
+            }
             Next::Shutdown(Ok(())) => break TerminalPurpose::ActiveShutdown(terminal_context),
             Next::Shutdown(Err(error)) => {
                 report_session_failure(
@@ -1579,6 +1684,7 @@ mod tests {
             source_channels,
             &mut phase_rx,
             terminal,
+            None,
         )
         .await;
         assert_eq!(finishes.load(Ordering::Relaxed), 1);
@@ -1793,6 +1899,105 @@ mod tests {
         );
         assert!(!query.dedup);
         assert_eq!(query.backchannel_max_sec, 0.25);
+    }
+
+    #[test]
+    fn complete_stream_policy_binds_at_model_rate_and_preserves_legacy_defaults()
+    -> Result<(), String> {
+        let baseline = defaults();
+        let expected = baseline.stream_base.clone();
+        for suffix in ["", "&applied_config=0", "&applied_config=false"] {
+            let query = StreamQuery::parse(Some(&format!("rate=8000{suffix}")), defaults())?;
+            assert_eq!(query.config, expected);
+            assert!(!query.applied_config);
+        }
+        let query = StreamQuery::parse(
+            Some(concat!(
+                "rate=8000&endpoint=vad&vad_threshold=0.7&window=1&overlap=0.25&step_ms=125.5",
+                "&horizon=0.75&silence_ms=125.25&no_speech_ms=250.5&seam_after=0.375",
+                "&keep_silence=0.125&lock=1&applied_config=true"
+            )),
+            defaults(),
+        )?;
+        assert_eq!(query.rate.hertz(), 8_000);
+        assert_eq!(query.config.sample_rate().hertz(), 16_000);
+        assert_eq!(
+            query.config.endpoint_source(),
+            gigaam_transcription::EndpointSource::Vad
+        );
+        assert_eq!(query.config.vad_threshold().get(), 0.7);
+        assert_eq!(query.config.window_sec(), 1.0);
+        assert_eq!(query.config.overlap_sec(), 0.25);
+        assert_eq!(query.config.step_sec(), 125.5 / 1_000.0);
+        assert_eq!(query.config.horizon_sec(), 0.75);
+        assert_eq!(
+            query.config.rules().after_speech_seconds(),
+            125.25 / 1_000.0
+        );
+        assert_eq!(
+            query.config.rules().without_speech_seconds(),
+            250.5 / 1_000.0
+        );
+        assert_eq!(query.config.seam_after_sec(), 0.375);
+        assert_eq!(query.config.keep_silence_sec(), 0.125);
+        assert_eq!(
+            query.config.lock_policy(),
+            gigaam_transcription::StreamLockPolicy::CommitStable
+        );
+        assert!(query.applied_config);
+        Ok(())
+    }
+
+    #[test]
+    fn stream_policy_accepts_shared_zero_rules_and_refuses_inapplicable_or_unbound_controls()
+    -> Result<(), String> {
+        let query = StreamQuery::parse(
+            Some(
+                "rate=16000&silence_ms=0&no_speech_ms=0&seam_after=0&keep_silence=0&overlap=0&applied_config=1",
+            ),
+            defaults(),
+        )?;
+        assert_eq!(query.config.rules().after_speech_seconds(), 0.0);
+        assert_eq!(query.config.rules().without_speech_seconds(), 0.0);
+        assert_eq!(query.config.seam_after_sec(), 0.0);
+        assert_eq!(query.config.keep_silence_sec(), 0.0);
+        assert_eq!(query.config.overlap_sec(), 0.0);
+        let signed_zero =
+            StreamQuery::parse(Some("rate=16000&silence_ms=-0&no_speech_ms=-0"), defaults())?;
+        assert_eq!(signed_zero.config.rules().after_speech_seconds(), 0.0);
+        assert_eq!(signed_zero.config.rules().without_speech_seconds(), 0.0);
+        for suffix in [
+            "vad_threshold=0.5",
+            "endpoint=vad&vad_threshold=NaN",
+            "endpoint=vad&vad_threshold=1.1",
+            "silence_ms=-1",
+            "silence_ms=-1e-43",
+            "no_speech_ms=-1e-43",
+            "step_ms=-1e-43",
+            "no_speech_ms=inf",
+            "window=0",
+            "overlap=30",
+            "step_ms=0",
+            "step_ms=0.0000001",
+            "horizon=0",
+            "seam_after=-0.1",
+            "keep_silence=3.4028235e38",
+            "applied_config=on",
+            "silence_ms=1&silence_ms=2",
+            "applied_config=1&applied_config=0",
+        ] {
+            assert!(
+                StreamQuery::parse(Some(&format!("rate=16000&{suffix}")), defaults()).is_err(),
+                "{suffix}"
+            );
+        }
+        let mut unsupported = defaults();
+        unsupported.stream_base = StreamConfig::checked_default(SampleRate::new(8_000)?)?;
+        let error =
+            StreamQuery::parse(Some("rate=8000&endpoint=vad&applied_config=1"), unsupported)
+                .expect_err("model-rate refusal precedes session construction");
+        assert!(error.contains("vad endpoint requires 16 kHz"));
+        Ok(())
     }
 
     #[test]
@@ -2050,6 +2255,123 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn upgraded_socket_reports_bound_policy_only_after_successful_session_construction()
+    -> Result<(), String> {
+        for endpoint in ["blank", "vad"] {
+            let fixture = crate::tests::assembly_fixture()?;
+            let settings = ServiceAdmission::new(1, 1, Duration::from_secs(5))?;
+            let admission = Arc::new(AdmissionState::new(&settings)?);
+            let telemetry = test_support::prepare(8, 8)?;
+            let metrics = telemetry.metrics_arc();
+            let state = active_session_state(
+                &fixture,
+                Arc::clone(&admission),
+                Arc::clone(&metrics),
+                telemetry.producer(),
+            )?;
+            let query = format!(
+                "rate=16000&endpoint={endpoint}&window=1&overlap=0&step_ms=125&silence_ms=250&applied_config=1"
+            );
+            let prepared = super::PreparedStream::parse(Some(&query), &state.context)?;
+            let expected =
+                crate::stream_response::applied_config_event(prepared.setup.stream_config());
+            let listener = TcpListener::bind("127.0.0.1:0")
+                .await
+                .map_err(|error| format!("bind applied-policy listener: {error}"))?;
+            let address = listener.local_addr().map_err(|error| error.to_string())?;
+            let routes = Router::new()
+                .route("/v1/stream", get(stream))
+                .with_state(state);
+            let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+            let server = tokio::spawn(async move {
+                axum::serve(listener, routes)
+                    .with_graceful_shutdown(async {
+                        shutdown_rx
+                            .await
+                            .expect("the applied-policy test signals listener shutdown");
+                    })
+                    .await
+            });
+            let mut client = TcpStream::connect(address)
+                .await
+                .map_err(|error| error.to_string())?;
+            let request = format!(
+                "GET /v1/stream?{query} HTTP/1.1\r\nHost: {address}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n"
+            );
+            client
+                .write_all(request.as_bytes())
+                .await
+                .map_err(|error| error.to_string())?;
+            let mut response = Vec::new();
+            let mut byte = [0_u8; 1];
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while !response.ends_with(b"\r\n\r\n") {
+                    let read = client
+                        .read(&mut byte)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    if read == 0 {
+                        return Err("applied-policy upgrade ended before headers".to_owned());
+                    }
+                    response.push(byte[0]);
+                }
+                Ok::<_, String>(())
+            })
+            .await
+            .map_err(|_| "applied-policy upgrade timed out".to_owned())??;
+            assert!(response.starts_with(b"HTTP/1.1 101"));
+            if endpoint == "blank" {
+                let text = b"{\"type\":\"end\"}";
+                let mask = [0x37_u8, 0xfa, 0x21, 0x3d];
+                let length =
+                    u8::try_from(text.len()).expect("the fixed end message fits a short frame");
+                let mut frame = vec![0x81, 0x80 | length];
+                frame.extend_from_slice(&mask);
+                frame.extend(
+                    text.iter()
+                        .enumerate()
+                        .map(|(index, byte)| byte ^ mask[index % 4]),
+                );
+                client
+                    .write_all(&frame)
+                    .await
+                    .map_err(|error| error.to_string())?;
+            }
+            let mut trailing = Vec::new();
+            tokio::time::timeout(Duration::from_secs(10), client.read_to_end(&mut trailing))
+                .await
+                .map_err(|_| "applied-policy session did not close".to_owned())?
+                .map_err(|error| error.to_string())?;
+            shutdown_tx
+                .send(())
+                .map_err(|_| "applied-policy listener stopped early".to_owned())?;
+            server
+                .await
+                .map_err(|error| error.to_string())?
+                .map_err(|error| error.to_string())?;
+            let text = String::from_utf8_lossy(&trailing);
+            if endpoint == "blank" {
+                assert!(
+                    text.contains(&expected),
+                    "the socket must carry the bound setup policy"
+                );
+                assert!(text.contains("{\"type\":\"end\"}"));
+                assert_eq!(metric_counter(&metrics, "asr_ws_errors_total"), 0);
+            } else {
+                assert!(
+                    text.contains("\"type\":\"error\""),
+                    "the fixture deliberately lacks a native VAD asset"
+                );
+                assert!(!text.contains("applied_stream_config"));
+                assert!(!text.contains("\"type\":\"end\""));
+                assert_eq!(metric_counter(&metrics, "asr_ws_errors_total"), 1);
+            }
+            assert_eq!(admission.available_ws(), 1);
+        }
+        Ok(())
+    }
+
     #[test]
     fn refused_pre_upgrade_requests_never_register_a_callback_or_start_factory_work() {
         let settings = ServiceAdmission::new(1, 2, Duration::from_secs(1))
@@ -2183,6 +2505,7 @@ mod tests {
                 source_sample_rate: SampleRate::new(16000)
                     .expect("the controlled source sample rate is valid"),
                 source_channels,
+                applied_config: Some(defaults().stream_base),
             },
         )
         .await;
@@ -2583,6 +2906,7 @@ mod tests {
                     source_channels,
                     &mut phase_rx,
                     terminal,
+                    None,
                 )
                 .await;
                 assert_eq!(finishes.load(Ordering::Relaxed), 1);
@@ -2656,6 +2980,7 @@ mod tests {
                 source_channels,
                 &mut phase_rx,
                 terminal,
+                None,
             )
             .await;
             assert!(
@@ -2715,6 +3040,7 @@ mod tests {
                 source_channels,
                 &mut phase_rx,
                 terminal,
+                None,
             )
             .await;
             assert_eq!(finishes.load(Ordering::Relaxed), 1);
@@ -2730,6 +3056,131 @@ mod tests {
             drop(lifetime);
             assert_eq!(admission.available_ws(), 1);
         }
+    }
+
+    #[tokio::test]
+    async fn applied_policy_precedes_real_channel_events_without_changing_their_history()
+    -> Result<(), String> {
+        let channels = SourceChannelCount::new(2)?;
+        let (session, rate) = serializer_session(channels, StreamEmissionMode::WordsAndDialog)?;
+        let config = serializer_stream_config(rate)?;
+        let expected_policy = crate::stream_response::applied_config_event(&config);
+        let settings = ServiceAdmission::new(1, 2, Duration::from_secs(1))?;
+        let admission = AdmissionState::new(&settings)?;
+        let token = admission
+            .admit_ws(WsPermitCount::from_source_channels(channels)?)
+            .expect("both controlled source channels are admitted");
+        let phase_rx = admission.subscribe();
+        let metrics = Metrics::new(1, 2);
+        let mut effects = RecorderEffects::with_inbound([
+            Ok(Some(InboundFrame::Binary(pcm16_interleaved_silence(
+                2,
+                rate.as_usize()?,
+            )?))),
+            Ok(Some(InboundFrame::Text("{\"type\":\"end\"}".to_owned()))),
+        ]);
+        run_post_warmup(
+            &mut effects,
+            &metrics,
+            PostWarmupInput {
+                result: PostWarmup::Active(session),
+                admission: token,
+                phase_rx,
+                source_sample_rate: rate,
+                source_channels: channels,
+                applied_config: Some(config),
+            },
+        )
+        .await;
+        let mut prefix = vec![expected_policy];
+        prefix.extend(expected_stereo_word_messages());
+        prefix.push(expected_stereo_turns_message());
+        assert!(
+            effects.sent_text.starts_with(&prefix),
+            "metadata must precede unchanged channel and dialog events"
+        );
+        assert_eq!(
+            effects.sent_text.last(),
+            Some(&"{\"type\":\"end\"}".to_owned())
+        );
+        assert_eq!(
+            effects
+                .sent_text
+                .iter()
+                .filter(|event| event.contains("applied_stream_config"))
+                .count(),
+            1
+        );
+        assert_eq!(effects.closes, 1);
+        assert_eq!(metric_counter(&metrics, "asr_ws_errors_total"), 0);
+        assert_eq!(admission.available_ws(), 2);
+        Ok(())
+    }
+
+    impl StreamingSession for MultiChannelSession<SerializerDecoder, BlankDetector> {
+        fn push(&mut self, bytes: &[u8]) -> Result<MultiChannelStep, MultiChannelFailure> {
+            MultiChannelSession::push(self, bytes)
+        }
+
+        fn finish(self) -> Result<MultiChannelStep, MultiChannelFailure> {
+            MultiChannelSession::finish(self)
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_applied_policy_yields_to_drain_and_delivery_failure_terminates_once()
+    -> Result<(), String> {
+        for drain in [false, true] {
+            let settings = ServiceAdmission::new(1, 1, Duration::from_secs(1))?;
+            let admission = AdmissionState::new(&settings)?;
+            let channels = SourceChannelCount::new(1)?;
+            let token = admission
+                .admit_ws(WsPermitCount::from_source_channels(channels)?)
+                .expect("the controlled channel is admitted");
+            let phase_rx = admission.subscribe();
+            let metrics = Metrics::new(1, 1);
+            let finishes = Arc::new(AtomicU64::new(0));
+            let session = TerminalSession::new(Arc::clone(&finishes), TerminalResult::Success);
+            let mut effects = RecorderEffects::with_inbound([Ok(Some(InboundFrame::Text(
+                "{\"type\":\"end\"}".to_owned(),
+            )))]);
+            if drain {
+                admission.begin_draining();
+            } else {
+                effects.fail_text = Some("controlled policy delivery failure".to_owned());
+            }
+            run_post_warmup(
+                &mut effects,
+                &metrics,
+                PostWarmupInput {
+                    result: PostWarmup::Active(session),
+                    admission: token,
+                    phase_rx,
+                    source_sample_rate: SampleRate::new(16_000)?,
+                    source_channels: channels,
+                    applied_config: Some(defaults().stream_base),
+                },
+            )
+            .await;
+            assert_eq!(
+                effects.inbound.len(),
+                1,
+                "neither terminal case consumes audio or control input"
+            );
+            if drain {
+                assert_eq!(effects.sent_text, vec!["{\"type\":\"end\"}"]);
+                assert_eq!(effects.access_kinds(), vec!["ws_open", "ws_close"]);
+                assert_eq!(finishes.load(Ordering::Relaxed), 1);
+                assert_eq!(metric_counter(&metrics, "asr_ws_errors_total"), 0);
+            } else {
+                assert!(effects.sent_text.is_empty());
+                assert_eq!(effects.access_kinds(), vec!["ws_open", "ws_error"]);
+                assert_eq!(finishes.load(Ordering::Relaxed), 0);
+                assert_eq!(metric_counter(&metrics, "asr_ws_errors_total"), 1);
+            }
+            assert_eq!(admission.available_ws(), 1);
+        }
+        Ok(())
     }
 
     #[tokio::test]
