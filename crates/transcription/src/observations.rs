@@ -60,8 +60,8 @@ pub trait WindowTimingObserver: Send + Sync {
 }
 
 /// Whether a decoded window sits on the encoder frame-rate subsampling grid (`Body`), or is the
-/// final window of one channel, which is widened backward to real audio content and may start
-/// off that grid (`Tail`).
+/// final window of a decoded waveform span, which is widened backward to real audio content and
+/// may start off that grid (`Tail`). Without VAD the span is the complete channel.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WindowKind {
     Body,
@@ -76,6 +76,7 @@ pub(crate) struct WindowEvidenceInput {
     pub(crate) start_sec: f32,
     pub(crate) end_sec: f32,
     pub(crate) first_sample: usize,
+    pub(crate) frontend_origin_sample: usize,
     pub(crate) first_feature_frame: usize,
     pub(crate) feature_frames: usize,
     pub(crate) residue: usize,
@@ -93,6 +94,9 @@ pub(crate) struct WindowEvidenceInput {
 /// labels, its collapsed pre-word-merge tokens, and the token-index span behind each decoded
 /// word, all in this window's local frame/token coordinates, so an external tool can reproduce
 /// word segmentation without re-running recognition or re-implementing the decoder's word rule.
+/// Temporal fields and `first_sample` refer to the original channel. Feature frames, `origin`,
+/// and `residue` refer to the crop whose original sample offset is `frontend_origin_sample`;
+/// token frames remain local to the decoded window. A crop need not start on the source hop grid.
 #[derive(Clone, Debug, PartialEq)]
 pub struct WindowEvidence {
     index: usize,
@@ -100,6 +104,7 @@ pub struct WindowEvidence {
     start_sec: f32,
     end_sec: f32,
     first_sample: usize,
+    frontend_origin_sample: usize,
     first_feature_frame: usize,
     feature_frames: usize,
     residue: usize,
@@ -122,6 +127,9 @@ impl WindowEvidence {
         }
         if !input.keep_until_sec.is_finite() || input.keep_until_sec < 0.0 {
             return Err("window evidence keep-until must be finite and nonnegative".into());
+        }
+        if input.first_sample < input.frontend_origin_sample {
+            return Err("window evidence first sample precedes its frontend origin".into());
         }
         if input.labels.len() != input.output_frames {
             return Err(format!(
@@ -160,6 +168,7 @@ impl WindowEvidence {
             start_sec: input.start_sec,
             end_sec: input.end_sec,
             first_sample: input.first_sample,
+            frontend_origin_sample: input.frontend_origin_sample,
             first_feature_frame: input.first_feature_frame,
             feature_frames: input.feature_frames,
             residue: input.residue,
@@ -191,6 +200,14 @@ impl WindowEvidence {
 
     pub const fn first_sample(&self) -> usize {
         self.first_sample
+    }
+
+    /// Original-channel sample offset of the waveform used to compute this crop's features.
+    /// It is zero on the complete-channel path. Add this offset before interpreting local
+    /// feature/token geometry on the source timeline; dividing it into frames loses precision
+    /// when a VAD boundary does not lie on the frontend hop grid.
+    pub const fn frontend_origin_sample(&self) -> usize {
+        self.frontend_origin_sample
     }
 
     pub const fn first_feature_frame(&self) -> usize {
@@ -312,6 +329,7 @@ mod tests {
 
     fn valid_input() -> WindowEvidenceInput {
         WindowEvidenceInput {
+            frontend_origin_sample: 0,
             index: 0,
             kind: WindowKind::Body,
             start_sec: 0.0,
@@ -338,6 +356,7 @@ mod tests {
         assert_eq!(evidence.kind(), WindowKind::Body);
         assert_eq!((evidence.start_sec(), evidence.end_sec()), (0.0, 1.0));
         assert_eq!(evidence.feature_frames(), 4);
+        assert_eq!(evidence.frontend_origin_sample(), 0);
         assert_eq!((evidence.residue(), evidence.origin()), (0, 0));
         assert_eq!(evidence.output_frames(), 2);
         assert_eq!(evidence.keep_until_sec(), 1.0);
@@ -382,6 +401,10 @@ mod tests {
         let mut negative_keep_until = valid_input();
         negative_keep_until.keep_until_sec = -1.0;
         assert!(WindowEvidence::new(negative_keep_until).is_err());
+
+        let mut preceding_source_sample = valid_input();
+        preceding_source_sample.frontend_origin_sample = 1;
+        assert!(WindowEvidence::new(preceding_source_sample).is_err());
 
         let mut out_of_range_word_span = valid_input();
         out_of_range_word_span.word_spans = vec![(0, 1)];

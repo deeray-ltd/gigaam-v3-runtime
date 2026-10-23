@@ -222,7 +222,8 @@ enum DetectionState {
     },
 }
 
-/// Obtains speech probabilities from the injected detector and applies the configured policy.
+/// Obtains complete 16 kHz waveform probabilities from the injected detector and applies the
+/// configured policy. Refuses incomplete or excess coverage and non-finite/out-of-domain values.
 pub fn speech_segments<D: SpeechProbabilityDetector>(
     detector: &mut D,
     audio: ChannelAudioView<'_>,
@@ -232,11 +233,18 @@ pub fn speech_segments<D: SpeechProbabilityDetector>(
     segments_from_probabilities(&probabilities, audio.len(), config)
 }
 
-fn segments_from_probabilities(
+pub(crate) fn segments_from_probabilities(
     probabilities: &[f32],
     audio_length: usize,
     config: VadPolicyConfig,
 ) -> Result<Vec<SpeechSegment>, String> {
+    let expected = audio_length.div_ceil(HOP_SAMPLES);
+    if probabilities.len() != expected {
+        return Err(format!(
+            "speech detector returned {} probabilities, expected {expected} for {audio_length} samples",
+            probabilities.len()
+        ));
+    }
     let minimum_speech = config.durations.minimum_speech_samples().get();
     let minimum_silence = config.durations.minimum_silence_samples().get();
     let padding = config.padding.one_sided_samples().get();
@@ -490,7 +498,7 @@ mod tests {
         let input = audio(4_096);
         let mut detector = FixedDetector {
             expected: input.clone(),
-            probabilities: vec![0.1, 0.5, 0.4, 0.2, 0.2],
+            probabilities: vec![0.1, 0.5, 0.4, 0.2, 0.2, 0.2, 0.2, 0.2],
         };
         let segments = speech_segments(
             &mut detector,
@@ -512,7 +520,7 @@ mod tests {
         let input = audio(4_096);
         let mut detector = FixedDetector {
             expected: input.clone(),
-            probabilities: vec![0.1, 0.9, 0.1, 0.1],
+            probabilities: vec![0.1, 0.9, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1],
         };
         let segments = speech_segments(
             &mut detector,
@@ -524,11 +532,79 @@ mod tests {
     }
 
     #[test]
+    fn minimum_speech_boundary_is_strict_and_partial_terminal_frames_keep_input_length() {
+        let input = audio(1_024);
+        let mut detector = FixedDetector {
+            expected: input.clone(),
+            probabilities: vec![1.0, 0.0],
+        };
+        let equal = speech_segments(
+            &mut detector,
+            input.view(),
+            policy(0.5, 0.35, 32.0, 0.0, 0.0),
+        )
+        .expect("complete probability coverage is valid");
+        assert!(
+            equal.is_empty(),
+            "speech equal to the configured minimum is discarded"
+        );
+        let less = speech_segments(
+            &mut detector,
+            input.view(),
+            policy(0.5, 0.35, 31.0, 0.0, 0.0),
+        )
+        .expect("the lower minimum admits the same speech");
+        assert_eq!(less[0].end_sample(), 512);
+        let tail = audio(513);
+        let mut detector = FixedDetector {
+            expected: tail.clone(),
+            probabilities: vec![0.0, 1.0],
+        };
+        let terminal =
+            speech_segments(&mut detector, tail.view(), policy(0.5, 0.35, 0.0, 0.0, 0.0))
+                .expect("partial final VAD frame is capped to actual input");
+        assert_eq!(
+            (terminal[0].start_sample(), terminal[0].end_sample()),
+            (512, 513)
+        );
+    }
+
+    #[test]
+    fn public_segmentation_refuses_incomplete_or_excess_probability_coverage() {
+        let input = audio(513);
+        for probabilities in [vec![], vec![0.0], vec![0.0; 3]] {
+            let mut detector = FixedDetector {
+                expected: input.clone(),
+                probabilities,
+            };
+            let error = speech_segments(
+                &mut detector,
+                input.view(),
+                policy(0.5, 0.35, 0.0, 0.0, 0.0),
+            )
+            .expect_err("silent probabilities must still cover the whole input exactly");
+            assert!(error.contains("expected 2"));
+        }
+        let empty = audio(0);
+        let mut detector = FixedDetector {
+            expected: empty.clone(),
+            probabilities: Vec::new(),
+        };
+        assert!(
+            speech_segments(&mut detector, empty.view(), VadPolicyConfig::default())
+                .expect("empty input has empty probability coverage")
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn neighboring_segments_share_an_insufficient_gap_without_overlap() {
         let input = audio(8_192);
         let mut detector = FixedDetector {
             expected: input.clone(),
-            probabilities: vec![0.9, 0.1, 0.1, 0.9, 0.1, 0.1, 0.1],
+            probabilities: vec![
+                0.9, 0.1, 0.1, 0.9, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1,
+            ],
         };
         let segments = speech_segments(
             &mut detector,
