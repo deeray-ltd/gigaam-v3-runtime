@@ -80,6 +80,45 @@ own audio validation, bounded admission, provider refusal, and lifecycle behavio
 5. Service or CLI project those typed results to a transport or terminal without recreating
    transcription policy.
 
+### Library batch speech segmentation
+
+`BatchTranscriber::transcribe_channel_with_vad` and
+`MultiChannelBatchTranscriber::transcribe_with_vad` borrow a caller-owned
+`SpeechProbabilityDetector` for one operation. The existing `BatchSetup` and methods without
+VAD retain their behavior. The VAD path requires a 16 kHz model/frontend rate before detector
+execution; Audio adapters still own source-to-model resampling. Each detector call covers a
+complete independent waveform with one probability per 512 samples, including its partial
+last frame. Segmentation refuses incomplete/excess coverage and values outside finite `[0, 1]`.
+
+Multi-channel batch selects original physical channels before detection and reuses the one
+detector and decoder sequentially. A selected silent channel remains in the result with no
+words. All-silence input performs no frontend or decoder work; a separately requested warmup
+is not part of that guarantee. Detector ownership, native-session creation, admission and
+worker allocation remain process-composition decisions.
+
+Each accepted, padded speech span uses the existing frontend, window, overlap and stitching
+policy. Stitching is local to a span; distinct spans are concatenated without deleting repeated
+words across a silence. Words are clipped to the real span, then shifted once onto the original
+channel clock. Planned window counts sum across spans even when a window has no usable feature
+frames. `PadPolicy::Exact` retains the existing limit that spans no longer than the frontend FFT
+length produce no decoder call; `PadToWindow` explicitly supplies the configured window shape.
+Minimum speech duration remains a strict boundary: equality is discarded.
+
+Window timings and evidence temporal fields use the original channel clock, including any
+synthetic window padding. Evidence retains local feature/token coordinates and the exact integer
+`frontend_origin_sample` of the crop. The source offset of a local token is that origin divided
+by the sample rate, plus `first_feature_frame * hop_length / sample_rate`, plus the token frame
+divided by the decoder frame rate. A crop may begin between source hop boundaries, so its sample
+origin must not be rounded into a feature-frame index. The original complete-channel path has
+zero origin and preserves its observation values and existing CLI evidence bytes.
+
+Cancellation is checked before/after detector and segmentation, spans, frontend and recognition
+work. An executing native call may finish; cancellation prevents successor work and a completed
+batch result. Successful detector/segmentation time is a separate `StageTimings::vad_seconds`
+component, not frontend time. HTTP/CLI batch VAD switches are not provided by this library
+capability: their integration must choose native detector lifecycle and propagate nonzero crop
+origins through the CLI evidence format before enabling segmented evidence output.
+
 The package graph deliberately has one ONNX Runtime owner: Recognition. CPU and TensorRT
 either initialize as selected or refuse; TensorRT requires the CUDA feature but registers
 TensorRT rather than silently using CUDA. CUDA registers exactly CUDA as its accelerator

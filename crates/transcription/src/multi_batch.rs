@@ -13,10 +13,11 @@ use crate::batch::{BatchSetup, BatchTranscriber};
 use crate::channel_selection::{
     BatchChannelPolicy, DuplicateClassification, SourceChannelCount, select_batch_channels,
 };
-use crate::contracts::{StageTimings, Turn, checkpoint};
+use crate::contracts::{StageTimings, Transcript, Turn, checkpoint};
 use crate::turns::{ChannelTranscript, TurnGap, channel_segments, turns};
-use gigaam_audio::DecodedAudio;
-use gigaam_recognition::{ExecutionControl, WindowDecoder};
+use crate::vad_policy::VadPolicyConfig;
+use gigaam_audio::{ChannelAudio, DecodedAudio};
+use gigaam_recognition::{ExecutionControl, SpeechProbabilityDetector, WindowDecoder};
 use std::fmt::{Display, Formatter};
 
 /// Typed options that determine multi-channel batch selection and final turn construction.
@@ -182,8 +183,37 @@ impl<D: WindowDecoder> MultiChannelBatchTranscriber<D> {
 
     /// Transcribes every selected source channel or returns no result.
     pub fn transcribe(
+        self,
+        input: &DecodedAudio,
+    ) -> Result<MultiChannelBatchResult, MultiChannelBatchError> {
+        self.transcribe_using(input, |batch, channel| batch.transcribe_channel(channel))
+    }
+
+    /// Applies batch VAD independently to every selected physical channel using one borrowed
+    /// detector and the existing sequential decoder. Empty speech results retain their original
+    /// channel identities. Input must already be at the 16 kHz model/frontend rate.
+    pub fn transcribe_with_vad<V: SpeechProbabilityDetector>(
+        self,
+        input: &DecodedAudio,
+        detector: &mut V,
+        policy: VadPolicyConfig,
+    ) -> Result<MultiChannelBatchResult, MultiChannelBatchError> {
+        checkpoint(&self.control).map_err(MultiChannelBatchError::Transcription)?;
+        self.batch
+            .validate_vad_sample_rate()
+            .map_err(MultiChannelBatchError::Input)?;
+        self.transcribe_using(input, |batch, channel| {
+            batch.transcribe_channel_with_vad(channel, detector, policy)
+        })
+    }
+
+    fn transcribe_using(
         mut self,
         input: &DecodedAudio,
+        mut transcribe: impl FnMut(
+            &mut BatchTranscriber<D>,
+            &ChannelAudio,
+        ) -> Result<Transcript, String>,
     ) -> Result<MultiChannelBatchResult, MultiChannelBatchError> {
         checkpoint(&self.control).map_err(MultiChannelBatchError::Transcription)?;
         let input_sample_rate = input
@@ -217,9 +247,7 @@ impl<D: WindowDecoder> MultiChannelBatchTranscriber<D> {
                 .channels()
                 .get(selected.index())
                 .expect("validated channel selection must reference its source audio");
-            let transcript = self
-                .batch
-                .transcribe_channel(channel)
+            let transcript = transcribe(&mut self.batch, channel)
                 .map_err(MultiChannelBatchError::Transcription)?;
             checkpoint(&self.control).map_err(MultiChannelBatchError::Transcription)?;
             timing_aggregate
@@ -313,6 +341,7 @@ impl ChannelTimingAggregate {
 }
 
 fn stage_timing_delta(before: StageTimings, after: StageTimings) -> Result<StageTimings, String> {
+    let vad = stage_timing_delta_seconds(before.vad_seconds(), after.vad_seconds(), "VAD")?;
     let frontend = stage_timing_delta_seconds(
         before.frontend_seconds(),
         after.frontend_seconds(),
@@ -323,6 +352,7 @@ fn stage_timing_delta(before: StageTimings, after: StageTimings) -> Result<Stage
     let decode =
         stage_timing_delta_seconds(before.decode_seconds(), after.decode_seconds(), "decode")?;
     let mut contribution = StageTimings::default();
+    contribution.add_vad(vad);
     contribution.add_frontend(frontend);
     contribution.add_encoder(encoder);
     contribution.add_decode(decode);
@@ -340,6 +370,7 @@ fn stage_timing_delta_seconds(before: f64, after: f64, stage: &str) -> Result<f6
 }
 
 fn validate_stage_timings(timings: StageTimings, context: &str) -> Result<(), String> {
+    validate_stage_timing(timings.vad_seconds(), context, "VAD")?;
     validate_stage_timing(timings.frontend_seconds(), context, "frontend")?;
     validate_stage_timing(timings.encoder_seconds(), context, "encoder")?;
     validate_stage_timing(timings.decode_seconds(), context, "decode")?;
@@ -363,11 +394,17 @@ mod tests {
     };
     use crate::batch::BatchSetup;
     use crate::channel_selection::{BatchChannelPolicy, DuplicateClassification};
+    use crate::contracts::VadProbability;
     use crate::contracts::{BatchConfig, PadPolicy, StageTimings};
     use crate::observations::ObservationMode;
     use crate::turns::TurnGap;
-    use gigaam_audio::{ChannelAudio, DecodedAudio, FeatureMatrixView, SampleRate};
-    use gigaam_recognition::{Decoded, ExecutionControl, FrameRate, WindowDecoder, Word};
+    use crate::vad_policy::{VadDurations, VadPadding, VadPolicyConfig, VadThresholds};
+    use gigaam_audio::{
+        ChannelAudio, ChannelAudioView, DecodedAudio, FeatureMatrixView, SampleRate,
+    };
+    use gigaam_recognition::{
+        Decoded, ExecutionControl, FrameRate, SpeechProbabilityDetector, WindowDecoder, Word,
+    };
     use std::sync::{Arc, Mutex};
 
     #[derive(Clone, Copy)]
@@ -549,6 +586,213 @@ mod tests {
         timings.add_encoder(encoder);
         timings.add_decode(decode);
         timings
+    }
+
+    struct ChannelVad {
+        inputs: Vec<Vec<f32>>,
+    }
+
+    impl SpeechProbabilityDetector for ChannelVad {
+        fn probabilities(&mut self, audio: ChannelAudioView<'_>) -> Result<Vec<f32>, String> {
+            assert_eq!(
+                audio.len(),
+                1_536,
+                "fixture channels contain three VAD frames"
+            );
+            self.inputs.push(audio.samples().to_vec());
+            let probability = if audio.samples().iter().all(|sample| *sample == 0.0) {
+                0.0
+            } else {
+                1.0
+            };
+            Ok(vec![probability; 3])
+        }
+    }
+
+    fn vad_policy() -> VadPolicyConfig {
+        VadPolicyConfig::new(
+            VadThresholds::new(
+                VadProbability::DEFAULT,
+                VadProbability::new(0.35).expect("fixture silence threshold is valid"),
+            )
+            .expect("fixture thresholds are ordered"),
+            VadDurations::new(0.0, 0.0).expect("zero minimum durations are valid"),
+            VadPadding::new(0.0).expect("zero padding is valid"),
+        )
+    }
+
+    fn vad_batch(
+        decoder: StatefulDecoder,
+        channel_policy: BatchChannelPolicy,
+        control: ExecutionControl,
+    ) -> MultiChannelBatchTranscriber<StatefulDecoder> {
+        MultiChannelBatchTranscriber::new(MultiChannelBatchSetup::new(
+            BatchSetup {
+                frontend: crate::test_support::frontend_at_sample_rate(16_000),
+                decoder,
+                config: BatchConfig::new(
+                    SampleRate::new(16_000).expect("fixture VAD rate is valid"),
+                    0.128,
+                    0.032,
+                    PadPolicy::Exact,
+                )
+                .expect("fixture windows are valid"),
+                control,
+                observations: ObservationMode::disabled(),
+            },
+            MultiChannelBatchOptions::new(
+                channel_policy,
+                TurnGap::new(0.1).expect("fixture gap is valid"),
+            ),
+        ))
+        .expect("fixture model and input rates agree")
+    }
+
+    fn vad_word_plans(count: usize) -> Vec<WordPlan> {
+        vec![
+            WordPlan {
+                text: "speech",
+                start: 0.0,
+                end: 0.02
+            };
+            count
+        ]
+    }
+
+    #[test]
+    fn batch_vad_reuses_detector_and_decoder_without_losing_silent_physical_channels() {
+        let input = audio_at_sample_rate(
+            16_000,
+            vec![
+                channel(vec![0.0; 1_536]),
+                channel(vec![0.25; 1_536]),
+                channel(vec![0.5; 1_536]),
+            ],
+        );
+        let trace = Arc::new(Mutex::new(Vec::new()));
+        let mut detector = ChannelVad { inputs: Vec::new() };
+        let result = vad_batch(
+            StatefulDecoder::new(trace.clone(), DecoderAction::Complete, vad_word_plans(2)),
+            BatchChannelPolicy::separate_channels(),
+            ExecutionControl::without_deadline(),
+        )
+        .transcribe_with_vad(&input, &mut detector, vad_policy())
+        .expect("each physical channel completes independently");
+        assert_eq!(channel_ids(&result), vec![0, 1, 2]);
+        assert_eq!(
+            detector.inputs,
+            input
+                .channels()
+                .iter()
+                .map(|channel| channel.samples().to_vec())
+                .collect::<Vec<_>>()
+        );
+        assert!(result.channels()[0].words().is_empty());
+        assert_eq!(result.channels()[1].words()[0].text(), "speech");
+        assert_eq!(result.channels()[2].words()[0].text(), "speech");
+        assert_eq!(calls(&trace), vec![0, 1]);
+        assert_eq!(
+            result
+                .turns()
+                .iter()
+                .map(|turn| turn.channel())
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert!(result.timings().vad_seconds().is_finite());
+        assert_eq!(result.timings().encoder_seconds(), 0.0);
+    }
+
+    #[test]
+    fn batch_vad_preserves_existing_duplicate_and_single_output_selection_before_detection() {
+        let duplicate = channel([0.0, 0.5, -0.5, 0.25].repeat(384));
+        let input = audio_at_sample_rate(16_000, vec![duplicate.clone(), duplicate]);
+        for policy in [
+            BatchChannelPolicy::separate_channels(),
+            BatchChannelPolicy::single_output(),
+        ] {
+            let trace = Arc::new(Mutex::new(Vec::new()));
+            let mut detector = ChannelVad { inputs: Vec::new() };
+            let result = vad_batch(
+                StatefulDecoder::new(trace.clone(), DecoderAction::Complete, vad_word_plans(1)),
+                policy,
+                ExecutionControl::without_deadline(),
+            )
+            .transcribe_with_vad(&input, &mut detector, vad_policy())
+            .expect("duplicate channel selection remains unchanged");
+            assert_eq!(result.duplicate(), DuplicateClassification::DualMono);
+            assert_eq!(channel_ids(&result), vec![0]);
+            assert_eq!(detector.inputs.len(), 1);
+            assert_eq!(calls(&trace), vec![0]);
+        }
+    }
+
+    #[test]
+    fn batch_vad_cancellation_does_not_start_the_next_physical_channel() {
+        let input = audio_at_sample_rate(
+            16_000,
+            vec![
+                channel(vec![0.25; 1_536]),
+                channel(vec![0.5; 1_536]),
+                channel(vec![-0.25; 1_536]),
+            ],
+        );
+        let control = ExecutionControl::without_deadline();
+        let trace = Arc::new(Mutex::new(Vec::new()));
+        let mut detector = ChannelVad { inputs: Vec::new() };
+        let result = vad_batch(
+            StatefulDecoder::new(
+                trace.clone(),
+                DecoderAction::CancelAfterFirst(control.clone()),
+                vad_word_plans(3),
+            ),
+            BatchChannelPolicy::separate_channels(),
+            control,
+        )
+        .transcribe_with_vad(&input, &mut detector, vad_policy());
+        assert!(result.is_err());
+        assert_eq!(detector.inputs.len(), 1);
+        assert_eq!(calls(&trace), vec![0]);
+    }
+
+    #[test]
+    fn batch_vad_input_rate_mismatch_refuses_before_detector_or_decoder() {
+        let input = audio_at_sample_rate(8_000, vec![channel(vec![0.25; 1_536])]);
+        let trace = Arc::new(Mutex::new(Vec::new()));
+        let mut detector = ChannelVad { inputs: Vec::new() };
+        let result = vad_batch(
+            StatefulDecoder::new(trace.clone(), DecoderAction::Complete, vad_word_plans(1)),
+            BatchChannelPolicy::separate_channels(),
+            ExecutionControl::without_deadline(),
+        )
+        .transcribe_with_vad(&input, &mut detector, vad_policy());
+        assert!(matches!(result, Err(MultiChannelBatchError::Input(_))));
+        assert!(detector.inputs.is_empty());
+        assert!(calls(&trace).is_empty());
+    }
+
+    #[test]
+    fn vad_stage_time_is_aggregated_separately_and_invalid_deltas_refuse() {
+        let mut initial = StageTimings::default();
+        initial.add_vad(1.0);
+        let mut first = initial;
+        first.add_vad(2.0);
+        let mut second = first;
+        second.add_vad(3.0);
+        let mut aggregate =
+            ChannelTimingAggregate::new(initial).expect("initial finite stage times are valid");
+        aggregate
+            .record(initial, first)
+            .expect("first VAD contribution is valid");
+        aggregate
+            .record(first, second)
+            .expect("second VAD contribution is valid");
+        assert_eq!(aggregate.finish().vad_seconds(), 5.0);
+        assert_eq!(aggregate.finish().frontend_seconds(), 0.0);
+        let mut invalid = StageTimings::default();
+        invalid.add_vad(f64::NAN);
+        assert!(ChannelTimingAggregate::new(invalid).is_err());
+        assert!(aggregate.record(second, first).is_err());
     }
 
     #[test]

@@ -10,6 +10,11 @@ All notable changes are recorded here. Pre-1.0 releases do not promise a stable 
   transcription, response projection and work termination through the existing bounded
   telemetry writer. HTTP deadline notification remains distinct from actual cancellation
   completion; transcript responses and terminal access records are unchanged.
+- Library batch VAD methods for one channel or selected physical channels, borrowing a
+  caller-owned detector at the 16 kHz model rate. Accepted speech spans preserve source
+  time, crop origins in window evidence, and independent repeated words; silent channels
+  remain present without frontend or decoder work. VAD duration is reported separately
+  from frontend time. HTTP batch activation and its native detector lifecycle remain pending.
 - OCI image labels (title, description, source, url, documentation, vendor, licenses, version)
   on the CPU, CUDA, and TensorRT image definitions.
 - `transcribe --evidence PATH`, an opt-in per-window decode-evidence file (raw CTC labels,
@@ -18,6 +23,13 @@ All notable changes are recorded here. Pre-1.0 releases do not promise a stable 
 - A `words` line in `transcribe --evidence` output, recording the token-index span the decoder's
   own word rule assigned to each decoded word, so an external reader can check its word grouping
   against the decoder's without re-implementing the rule.
+
+### Changed
+
+- Speech segmentation now refuses incomplete or excess detector probability coverage,
+  including silent output, instead of interpreting it as a complete waveform. Each
+  independent 16 kHz input requires one finite probability in `[0, 1]` per 512 samples,
+  including a partial final frame.
 
 ## 0.1.0 - 2026-09-03
 

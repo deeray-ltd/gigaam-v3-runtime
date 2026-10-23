@@ -71,11 +71,12 @@ mod tests {
     #[test]
     fn injected_probability_port_projects_current_silence_mask() {
         let mut detector = FakeDetector {
-            expected_audio: ChannelAudio::new(vec![0.1, -0.1])
+            expected_audio: ChannelAudio::new([0.1, -0.1].repeat(768))
                 .expect("test audio samples are finite"),
             probabilities: vec![0.2, 0.5, 0.7],
         };
-        let audio = ChannelAudio::new(vec![0.1, -0.1]).expect("test audio samples are finite");
+        let audio = ChannelAudio::new([0.1, -0.1].repeat(768))
+            .expect("test audio has three complete finite VAD frames");
         let silence = detect_mask(&mut detector, audio.view(), 0.5)
             .expect("fake detector returns the declared probabilities");
         assert_eq!(silence, vec![true, false, false]);

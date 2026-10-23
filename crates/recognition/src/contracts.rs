@@ -300,6 +300,13 @@ impl WindowDecoder for Box<dyn WindowDecoder> {
 }
 
 /// Injected speech-probability execution port over Audio's validated sample value.
+///
+/// Each call covers one complete independent 16 kHz waveform and returns exactly
+/// `ceil(audio.len() / 512)` finite probabilities in `[0, 1]`, one per consecutive
+/// 512-sample frame, including a partial final frame. Empty input returns no probabilities.
+/// Implementations reset waveform-specific recurrent/context state between calls; reusing a
+/// detector for another physical channel must not carry the preceding channel's state.
+/// The Audio view carries no rate, so callers must establish the fixed rate before execution.
 pub trait SpeechProbabilityDetector {
     fn probabilities(&mut self, audio: ChannelAudioView<'_>) -> Result<Vec<f32>, String>;
 }
