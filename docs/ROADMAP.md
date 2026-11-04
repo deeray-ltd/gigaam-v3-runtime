@@ -24,11 +24,12 @@ how a new schema version replaces version 1.
 
 ### Wire protocol maturity
 
-- Errors are English messages under one `error` key; there are no stable machine-readable
-  codes, so a client can distinguish causes only by HTTP status, and 503 currently covers
-  overload, draining, a stopped worker, queue-wait expiry, and transcription failure. The
-  intended direction is RFC 9457 Problem Details with a registry of stable codes and a
-  `Retry-After` hint on overload and draining responses.
+- Legacy version 1 errors and failures before version 2 query binding use English messages
+  under one `error` key without stable machine-readable codes. After an HTTP batch request
+  binds to version 2, application errors use typed codes, including distinct overload,
+  draining, and unavailable responses. Broader protocol harmonization remains deferred,
+  including RFC 9457 Problem Details, a consistent code registry, and a `Retry-After` hint
+  on overload and draining responses.
 - A recognition call waits at most 60 seconds to start; that bound is fixed in the source
   and independent of `ASR_REQ_TIMEOUT_SEC`. The two limits should be one consistent
   contract, either derived from the request deadline or configured explicitly.
@@ -106,3 +107,80 @@ across sessions.
 
 Unlocked by: agreed product semantics, the privacy boundary above, an evaluation set with
 speaker-turn references, and the timestamp calibration from the quality work.
+
+### API selection and OpenAI-compatible transcription
+
+Planned: select one API at startup with `ASR_API_MODE=native|openai`, defaulting to
+`native`. Empty, unknown, and non-Unicode values must refuse startup before model or
+listener initialization. Native mode exposes the native transcription and WebSocket
+routes; OpenAI mode exposes compatible transcription, model listing, and, when delivered,
+Realtime routes, and disables the native WebSocket. Health and metrics remain available
+in both modes; unselected routes return 404.
+
+The compatible file API is planned to support multipart transcription, model listing,
+JSON, text, and complete `verbose_json` responses for CTC and RNN-T. Define supported
+language, prompt, temperature, timestamp, and model options and refuse unsupported
+combinations. Verbose output must use truthful language, duration, text, word and requested
+segment fields, including token, timing, compression, and score data with documented
+provenance. Do not substitute fabricated scores or imply Whisper calibration. Token and
+score provenance must survive filtering, source-time shifts, window stitching, and segment
+projection; no-speech semantics require a supported measurement, not CTC blank alone.
+
+Both APIs should use a shared batch execution result while retaining native response
+versions, VAD policy, channel semantics, cancellation, and shutdown behavior. Define upload
+admission, body and processing deadlines, decoded-memory bounds, and ownership through
+physical work and response projection before exposing the new interface. Validate both
+models, formats, errors, and supported client behavior against the selected contract.
+
+### Incremental file output and Realtime
+
+Planned file SSE and Realtime WebSocket transcription must provide genuine partial output
+before all audio has arrived or been processed for every supported CTC and RNN-T model.
+The final file result must agree with the corresponding batch result, including source
+clock, VAD grouping, window seams, text and metadata. Define the supported combinations of
+streaming, output format, and timestamp granularity; handle failures after streaming begins
+as terminal stream errors.
+
+Realtime needs an explicit revision and finalization contract: provisional words can change,
+so publication cannot blindly append revisions as irreversible text. Define item identity,
+commit, clear, completion, cancellation, and ordering, and bound media and event queues
+with backpressure. Validate disconnect, slow consumers, shutdown, model-specific quality,
+latency and CPU capacity. Native WebSocket currently supports CTC; RNN-T support requires
+an actual model-specific streaming path and acceptance. WebRTC is deferred.
+
+### VAD and configuration
+
+Batch VAD groups consecutive padded detector spans within the configured recognition window;
+it retains intervening original audio and source time. CLI and native WebSocket expose the
+existing streaming endpoint controls, including optional confirmation of applied policy.
+Preserve independent detector thresholds, speech and silence durations, and padding, together
+with validated window, overlap, step, horizon, seam, and endpoint settings. Make supported
+settings consistently available and explicit across applicable file and streaming interfaces;
+reject invalid or inapplicable combinations and bind model-rate-dependent values before work.
+Evaluate short and quiet speech, multiple channels, endpoint behavior and quality across
+representative audio rather than treating a particular crop as a general quality guarantee.
+
+### CPU pipeline
+
+Improve CPU throughput and latency across audio decoding, resampling, feature extraction,
+VAD, encoder and decoder execution, stitching, and response projection. Measure actual
+stage costs and memory under representative batch and streaming workloads before selecting
+optimizations; preserve recognition quality, timestamps, cancellation, bounded admission,
+and provider behavior. Review window reuse, avoidable copying and allocation, threading,
+queue fairness and optional silence skipping against their quality and resource tradeoffs.
+
+### Model variants and decoding
+
+Bind advertised model variants to their actual package assets, tokenizer, frontend,
+precision, and decoder capabilities. Plan explicit base and end-to-end CTC and RNN-T
+variants with compatible package evolution; support each variant's word boundaries and
+streaming contract. Evaluate beam decoding against greedy decoding using comparable quality
+and cost measurements before offering a supported selectable decoder. SSL output remains
+separate future work.
+
+### CTC acoustic timestamps
+
+Dedicated correction of CTC acoustic timing is deferred. Token emission times do not establish
+word onset; a correction requires representative aligned references and must preserve source
+clock and existing model/tokenizer semantics. Decoder or tokenizer changes alone do not
+establish timing accuracy.
