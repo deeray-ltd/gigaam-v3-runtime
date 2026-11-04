@@ -56,9 +56,12 @@ are resampled before detection. VAD-off requests do not select or construct a VA
 
 Enabled VAD processes each selected physical channel independently, after the existing
 channel-selection and dual-mono policy. Silent selected channels remain present. Accepted
-speech spans retain the original recording clock; recognition windows are stitched within
-each span, never across silent spans. The existing minimum frontend window geometry still
-applies to very short spans. One native detector belongs to the admitted request and is
+speech spans are grouped greedily when the envelope from the first span's start through the
+next span's end fits the configured recognition window. Oversized individual spans remain
+separate and use the existing windowing. Recognition uses original samples within each group,
+including gaps, so speech rejected by the detector in a gap can still be recognized. Windows
+are stitched only within groups, and words retain the original recording clock. The existing
+minimum frontend window geometry still applies to very short groups. One native detector belongs to the admitted request and is
 reused sequentially across its selected channels; no shared VAD worker or session pool is
 introduced.
 
@@ -375,19 +378,20 @@ package rate rather than a fixed sample count.
 `transcribe --vad` uses the same segmentation policy and defaults as standalone `vad`, with
 the five tuning options prefixed by `--vad-`. Speech and silence thresholds use hysteresis;
 accepted speech must be strictly longer than the minimum speech duration, while the minimum
-silence comparison is inclusive. Duration conversion uses the library's checked truncation
+silence comparison is inclusive and closes detector spans without necessarily separating
+recognition groups. Duration conversion uses the library's checked truncation
 of `milliseconds / 1000 * 16000` to samples; unrepresentable counts or doubled padding refuse.
 Tiny positive durations may therefore become zero samples. Padding extends accepted speech
 within the input and divides shared gaps between adjacent spans. It does not change the
-separate ASR `--pad` policy, which pads each accepted crop to the configured ASR window.
+separate ASR `--pad` policy, which pads each recognition group to the configured ASR window.
 
 Batch VAD requires a 16 kHz model/frontend and refuses another rate before native initialization
 or evidence-file creation. Input audio is resampled to the model rate as usual. One local
 detector is reused for independent whole-channel calls over the existing batch selection:
 combined output selects the first channel, split/turn output selects separate channels, and
 existing dual-mono detection still selects the first channel. Silent selected channels remain
-in the result. Crops retain the original time coordinates and are not stitched across speech
-spans. Exact crops no longer than the frontend FFT window retain the existing no-decode
+in the result. Recognition groups retain intervening original audio and original time coordinates;
+windows are not stitched across groups. Exact groups no longer than the frontend FFT window retain the existing no-decode
 behavior. Normal startup warmup is separate from transcription; a silent transcription adds
 no frontend or ASR decoder work. The enabled command reports its applied VAD policy and VAD
 duration separately from frontend time. Without `--vad`, its existing path and output remain

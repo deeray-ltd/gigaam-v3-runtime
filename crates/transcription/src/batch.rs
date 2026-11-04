@@ -18,7 +18,7 @@ use crate::observations::{
 };
 use crate::padding::pad_noise;
 use crate::stitch::{WindowWords, stitch_aligned, windows};
-use crate::vad_policy::{VadPolicyConfig, segments_from_probabilities};
+use crate::vad_policy::{SpeechSegment, VadPolicyConfig, segments_from_probabilities};
 use gigaam_audio::{ChannelAudio, FeatureMatrix, FrontendProcessor};
 use gigaam_primitives::{trunc_f32_to_usize, usize_to_f32, usize_to_u64_checked};
 use gigaam_recognition::{
@@ -52,6 +52,39 @@ struct SpanOrigin {
     channel: Option<OriginalChannel>,
     sample: usize,
     window_index: usize,
+}
+
+/// A contiguous source envelope used for recognition, distinct from detector spans.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RecognitionGroup {
+    start: usize,
+    end: usize,
+}
+
+fn recognition_groups(
+    segments: &[SpeechSegment],
+    window_samples: usize,
+    control: &ExecutionControl,
+) -> Result<Vec<RecognitionGroup>, String> {
+    let mut groups: Vec<RecognitionGroup> = Vec::new();
+    for segment in segments {
+        checkpoint(control)?;
+        if let Some(group) = groups.last_mut() {
+            let length = segment
+                .end_sample()
+                .checked_sub(group.start)
+                .ok_or_else(|| "VAD recognition group bounds are inverted".to_owned())?;
+            if length <= window_samples {
+                group.end = segment.end_sample();
+                continue;
+            }
+        }
+        groups.push(RecognitionGroup {
+            start: segment.start_sample(),
+            end: segment.end_sample(),
+        });
+    }
+    Ok(groups)
 }
 
 /// Derives the encoder's frame-subsampling factor from a frontend's sample rate and hop length
@@ -274,8 +307,9 @@ impl<D: WindowDecoder> BatchTranscriber<D> {
     /// reset detector for this call. The caller retains detector ownership; no worker or native
     /// session is created here. Audio must already be at the configured model/frontend rate.
     ///
-    /// Accepted spans use the existing padding/window policy and keep source-channel time.
-    /// All-silence input performs no frontend or decoder work. With `PadPolicy::Exact`, spans
+    /// Nearby accepted spans share contiguous original recognition context within the configured
+    /// window bound. Groups keep source-channel time and use the caller's padding policy.
+    /// All-silence input performs no frontend or decoder work. With `PadPolicy::Exact`, groups
     /// no longer than the frontend FFT length retain the existing no-decode behavior.
     pub fn transcribe_channel_with_vad<V: SpeechProbabilityDetector>(
         &mut self,
@@ -303,16 +337,18 @@ impl<D: WindowDecoder> BatchTranscriber<D> {
         checkpoint(&self.control)?;
         self.timings.add_vad(started.elapsed().as_secs_f64());
 
+        let groups =
+            recognition_groups(&segments, self.config.full_window_samples(), &self.control)?;
         let mut words = Vec::new();
         let mut planned_windows = 0_usize;
-        for segment in segments {
+        for group in groups {
             checkpoint(&self.control)?;
-            let samples = &input.samples()[segment.start_sample()..segment.end_sample()];
+            let samples = &input.samples()[group.start..group.end];
             let transcript = self.transcribe_span(
                 samples,
                 SpanOrigin {
                     channel,
-                    sample: segment.start_sample(),
+                    sample: group.start,
                     window_index: planned_windows,
                 },
             )?;
@@ -320,8 +356,8 @@ impl<D: WindowDecoder> BatchTranscriber<D> {
             planned_windows = planned_windows
                 .checked_add(transcript.windows())
                 .ok_or_else(|| "VAD batch planned window count overflows".to_owned())?;
-            // Independent speech spans have no recognition overlap to stitch. In particular,
-            // repeated words separated by silence must not be mistaken for duplicate context.
+            // Separate groups have no recognition overlap to stitch. Repeated words across
+            // groups must not be mistaken for duplicate context.
             words.extend(transcript.into_words());
         }
         checkpoint(&self.control)?;
@@ -455,7 +491,9 @@ impl<D: WindowDecoder> BatchTranscriber<D> {
 
 #[cfg(test)]
 mod tests {
-    use super::{BatchSetup, BatchTranscriber, subsampling_factor};
+    use super::{
+        BatchSetup, BatchTranscriber, RecognitionGroup, recognition_groups, subsampling_factor,
+    };
     use crate::contracts::VadProbability;
     use crate::contracts::{BatchConfig, PadPolicy};
     use crate::observations::{
@@ -463,7 +501,9 @@ mod tests {
         WindowTimingObserver,
     };
     use crate::test_support;
-    use crate::vad_policy::{VadDurations, VadPadding, VadPolicyConfig, VadThresholds};
+    use crate::vad_policy::{
+        VadDurations, VadPadding, VadPolicyConfig, VadThresholds, segments_from_probabilities,
+    };
     use gigaam_audio::{ChannelAudio, ChannelAudioView, SampleRate};
     use gigaam_recognition::{
         Decoded, ExecutionControl, ExecutionState, FrameRate, SpeechProbabilityDetector, Token,
@@ -690,6 +730,103 @@ mod tests {
 
     fn pcm(length: usize) -> ChannelAudio {
         ChannelAudio::new(vec![0.25; length]).expect("test PCM is finite")
+    }
+
+    #[test]
+    fn recognition_groups_respect_exact_bound_and_oversized_individual_spans() {
+        let control = ExecutionControl::without_deadline();
+        let equal = segments_from_probabilities(&[1.0, 0.0, 1.0], 1_536, vad_policy(0.0))
+            .expect("detector spans cover the test input");
+        assert_eq!(
+            recognition_groups(&equal, 1_536, &control).expect("groups are ordered"),
+            vec![RecognitionGroup {
+                start: 0,
+                end: 1_536
+            }]
+        );
+        let over = segments_from_probabilities(&[1.0, 0.0, 1.0, 1.0], 1_537, vad_policy(0.0))
+            .expect("terminal detector span includes one extra sample");
+        assert_eq!(
+            recognition_groups(&over, 1_536, &control).expect("groups are ordered"),
+            vec![
+                RecognitionGroup { start: 0, end: 512 },
+                RecognitionGroup {
+                    start: 1_024,
+                    end: 1_537
+                }
+            ]
+        );
+        let oversized =
+            segments_from_probabilities(&[1.0, 1.0, 1.0, 1.0, 0.0, 1.0], 3_072, vad_policy(0.0))
+                .expect("oversized and short spans are valid");
+        assert_eq!(
+            recognition_groups(&oversized, 1_536, &control).expect("groups are ordered"),
+            vec![
+                RecognitionGroup {
+                    start: 0,
+                    end: 2_048
+                },
+                RecognitionGroup {
+                    start: 2_560,
+                    end: 3_072
+                }
+            ]
+        );
+        control.request_cancellation();
+        assert!(recognition_groups(&equal, 1_536, &control).is_err());
+    }
+
+    struct FeatureRecorder(Arc<Mutex<Vec<Vec<f32>>>>);
+
+    impl WindowDecoder for FeatureRecorder {
+        fn frame_rate(&self) -> FrameRate {
+            FrameRate::new(8.0).expect("test decoder frame rate is positive")
+        }
+        fn decode(
+            &mut self,
+            features: gigaam_audio::FeatureMatrixView<'_>,
+        ) -> Result<Decoded, String> {
+            self.0
+                .lock()
+                .expect("feature recording lock is not poisoned")
+                .push(features.values().to_vec());
+            Decoded::new(
+                vec![Word::new("word".into(), 0.0, 0.01)?],
+                vec![false; features.frames()],
+                features.frames(),
+                0.0,
+            )
+        }
+    }
+
+    #[test]
+    fn grouped_spans_feed_original_gap_and_caller_padding_to_the_frontend() {
+        for padding in [PadPolicy::Exact, PadPolicy::PadToWindow] {
+            let mut samples = vec![0.25; 1_536];
+            samples[512..1_024].fill(-0.75);
+            let input = ChannelAudio::new(samples).expect("test samples are finite");
+            let reference_features = Arc::new(Mutex::new(Vec::new()));
+            let grouped_features = Arc::new(Mutex::new(Vec::new()));
+            let make = |features| {
+                vad_batch(
+                    FeatureRecorder(features),
+                    vad_config(padding, 0.128),
+                    ObservationMode::disabled(),
+                    ExecutionControl::without_deadline(),
+                )
+            };
+            let reference = make(reference_features.clone())
+                .transcribe_channel(&input)
+                .expect("whole envelope transcribes");
+            let grouped = make(grouped_features.clone())
+                .transcribe_channel_with_vad(&input, &mut vad(vec![1.0, 0.0, 1.0]), vad_policy(0.0))
+                .expect("spans group inside the window");
+            assert_eq!(grouped, reference);
+            assert_eq!(
+                *grouped_features.lock().expect("group features lock"),
+                *reference_features.lock().expect("reference features lock")
+            );
+        }
     }
 
     #[test]
@@ -979,28 +1116,30 @@ mod tests {
             assert_eq!(calls.load(Ordering::SeqCst), 0);
             assert_eq!(batch.timings().frontend_seconds(), 0.0);
         }
-        let control = ExecutionControl::without_deadline();
-        let calls = Arc::new(AtomicUsize::new(0));
-        let mut batch = vad_batch(
-            DeterministicDecoder::cancelling(calls.clone(), control.clone()),
-            vad_config(PadPolicy::Exact, 0.128),
-            ObservationMode::disabled(),
-            control,
-        );
-        assert!(
-            batch
-                .transcribe_channel_with_vad(
-                    &pcm(2_048),
-                    &mut vad(vec![1.0, 0.0, 1.0, 0.0]),
-                    vad_policy(0.0)
-                )
-                .is_err()
-        );
-        assert_eq!(
-            calls.load(Ordering::SeqCst),
-            1,
-            "cancellation after native work suppresses the next span"
-        );
+        for probabilities in [vec![1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0], vec![1.0; 8]] {
+            let control = ExecutionControl::without_deadline();
+            let calls = Arc::new(AtomicUsize::new(0));
+            let mut batch = vad_batch(
+                DeterministicDecoder::cancelling(calls.clone(), control.clone()),
+                vad_config(PadPolicy::Exact, 0.128),
+                ObservationMode::disabled(),
+                control,
+            );
+            assert!(
+                batch
+                    .transcribe_channel_with_vad(
+                        &pcm(4_096),
+                        &mut vad(probabilities),
+                        vad_policy(0.0)
+                    )
+                    .is_err()
+            );
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                1,
+                "cancellation suppresses the next group or window"
+            );
+        }
     }
 
     #[test]

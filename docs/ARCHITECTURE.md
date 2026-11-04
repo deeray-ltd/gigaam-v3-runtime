@@ -96,13 +96,17 @@ words. All-silence input performs no frontend or decoder work; a separately requ
 is not part of that guarantee. Detector ownership, native-session creation, admission and
 worker allocation remain process-composition decisions.
 
-Each accepted, padded speech span uses the existing frontend, window, overlap and stitching
-policy. Stitching is local to a span; distinct spans are concatenated without deleting repeated
-words across a silence. Words are clipped to the real span, then shifted once onto the original
-channel clock. Planned window counts sum across spans even when a window has no usable feature
-frames. `PadPolicy::Exact` retains the existing limit that spans no longer than the frontend FFT
-length produce no decoder call; `PadToWindow` explicitly supplies the configured window shape.
-Minimum speech duration remains a strict boundary: equality is discarded.
+Accepted padded detector spans are greedily grouped while the envelope from the first start to
+the next end fits the configured recognition window. An oversized individual span remains alone
+and uses the existing internal windowing. Each group retains the contiguous original samples,
+including gaps and any detector-rejected speech within them. The caller's padding policy applies
+to each group. Stitching is local to a group; separate groups are concatenated without deleting
+repeated words. Words are clipped to the real group, then shifted once onto the original channel
+clock. Planned window counts sum across groups even when a window has no usable feature frames.
+`PadPolicy::Exact` retains the existing limit that groups no longer than the frontend FFT length
+produce no decoder call; `PadToWindow` explicitly supplies the configured window shape. Minimum
+speech duration remains a strict detector boundary: equality is discarded; minimum silence closes
+a detector span and does not itself force a recognition group boundary.
 
 Window timings and evidence temporal fields use the original channel clock, including any
 synthetic window padding. Evidence retains local feature/token coordinates and the exact integer
