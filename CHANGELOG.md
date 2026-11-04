@@ -29,8 +29,9 @@ All notable changes are recorded here. Pre-1.0 releases do not promise a stable 
   telemetry writer. HTTP deadline notification remains distinct from actual cancellation
   completion; transcript responses and terminal access records are unchanged.
 - Library batch VAD methods for one channel or selected physical channels, borrowing a
-  caller-owned detector at the 16 kHz model rate. Accepted speech spans preserve source
-  time, crop origins in window evidence, and independent repeated words; silent channels
+  caller-owned detector at the 16 kHz model rate. Accepted speech spans are grouped within
+  the recognition window while retaining original gaps, source time, crop origins in window
+  evidence, and repeated words across groups; silent channels
   remain present without frontend or decoder work. VAD duration is reported separately
   from frontend time. HTTP and CLI adapters opt into this library path explicitly.
 - OCI image labels (title, description, source, url, documentation, vendor, licenses, version)
