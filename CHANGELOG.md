@@ -6,6 +6,9 @@ All notable changes are recorded here. Pre-1.0 releases do not promise a stable 
 
 ### Added
 
+- Optional native token emission scores and source-window provenance for scored batch
+  segments, while ordinary transcript words and timing remain unchanged.
+
 - Complete existing WebSocket stream-policy controls, bound before upgrade at the model
   rate. Optional `applied_config` adds a versioned bound-policy event before transcript
   events while preserving default output, active shutdown precedence, and session ownership.

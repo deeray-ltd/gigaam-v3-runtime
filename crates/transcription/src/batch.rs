@@ -11,7 +11,8 @@
 
 use crate::channel_selection::OriginalChannel;
 use crate::contracts::{
-    BatchConfig, PadPolicy, StageTimings, Transcript, TranscriptWord, checkpoint,
+    BatchConfig, PadPolicy, StageTimings, Transcript, TranscriptWord, WindowProvenance,
+    WordProvenance, checkpoint,
 };
 use crate::observations::{
     ObservationMode, WindowEvidence, WindowEvidenceInput, WindowKind, WindowTiming,
@@ -43,6 +44,7 @@ struct WindowGeometry {
     keep_until_sec: f32,
     subsampling_factor: Option<usize>,
     frontend_origin_sample: usize,
+    real_end_sample: usize,
 }
 
 /// The waveform crop's location in the source channel and its first planned window index.
@@ -126,6 +128,7 @@ pub struct BatchTranscriber<D: WindowDecoder> {
     frame_rate: FrameRate,
     sample_rate: usize,
     timings: StageTimings,
+    score_observations: Option<(Vec<f32>, usize)>,
 }
 
 /// Typed capabilities required to create one batch transcriber.
@@ -158,6 +161,7 @@ impl<D: WindowDecoder> BatchTranscriber<D> {
             control: setup.control,
             observations: setup.observations,
             timings: StageTimings::default(),
+            score_observations: None,
         })
     }
 
@@ -218,7 +222,12 @@ impl<D: WindowDecoder> BatchTranscriber<D> {
         let feature_frames = features.frames();
         checkpoint(&self.control)?;
         let started = std::time::Instant::now();
-        let decoded = self.decoder.decode(features.view())?;
+        let detail = if self.score_observations.is_some() {
+            gigaam_recognition::ScoreDetail::TokenLogProbabilities
+        } else {
+            gigaam_recognition::ScoreDetail::None
+        };
+        let decoded = self.decoder.decode_with_detail(features.view(), detail)?;
         checkpoint(&self.control)?;
         let total_seconds = started.elapsed().as_secs_f64();
         let encoder_seconds = decoded.encoder_seconds();
@@ -262,11 +271,65 @@ impl<D: WindowDecoder> BatchTranscriber<D> {
             })?;
             self.observations.emit_evidence(evidence);
         }
+        let provenance = if let Some((probabilities, source_len)) = &self.score_observations {
+            let first = geometry
+                .frontend_origin_sample
+                .checked_add(geometry.first_sample)
+                .ok_or_else(|| "window origin overflows".to_owned())?;
+            let end = geometry.real_end_sample.min(*source_len);
+            if first >= end {
+                return Err("scored window has no real source coverage".into());
+            }
+            let first_observation = first / 512;
+            let last_observation = (end - 1) / 512;
+            let observations = probabilities
+                .get(first_observation..=last_observation)
+                .ok_or_else(|| "missing window VAD observations".to_owned())?;
+            let maximum = observations.iter().copied().fold(0.0_f32, f32::max);
+            let tokens = decoded
+                .tokens()
+                .ok_or_else(|| "decoder omitted token occurrences".to_owned())?
+                .to_vec();
+            if tokens.iter().any(|token| token.log_probability().is_none()) {
+                return Err("decoder omitted token scores".into());
+            }
+            let spans = decoded
+                .word_spans()
+                .ok_or_else(|| "decoder omitted word spans".to_owned())?
+                .to_vec();
+            if spans.len() != decoded.words().len() {
+                return Err("word provenance count mismatch".into());
+            }
+            Some((
+                Arc::new(WindowProvenance {
+                    origin: first,
+                    end,
+                    sample_rate: self.sample_rate,
+                    no_speech_probability: 1.0 - f64::from(maximum),
+                    tokens,
+                }),
+                spans,
+            ))
+        } else {
+            None
+        };
         let words = decoded
             .into_words()
             .into_iter()
-            .map(TranscriptWord::from_recognition)
-            .collect::<Result<Vec<_>, _>>()?
+            .enumerate()
+            .map(|(index, word)| {
+                let mut word = TranscriptWord::from_recognition(word)?;
+                if let Some((window, spans)) = &provenance {
+                    let (first, last) = spans[index];
+                    word.provenance = Some(WordProvenance {
+                        window: Arc::clone(window),
+                        first,
+                        last,
+                    });
+                }
+                Ok(word)
+            })
+            .collect::<Result<Vec<_>, String>>()?
             .into_iter()
             .map(|word| word.shifted(geometry.offset))
             .collect::<Result<Vec<_>, _>>()?
@@ -330,12 +393,18 @@ impl<D: WindowDecoder> BatchTranscriber<D> {
         checkpoint(&self.control)?;
         self.validate_vad_sample_rate()?;
         let started = std::time::Instant::now();
-        let probabilities = detector.probabilities(input.view())?;
+        let cached = self.score_observations.is_some();
+        let probabilities = match &self.score_observations {
+            Some((probabilities, _)) => probabilities.clone(),
+            None => detector.probabilities(input.view())?,
+        };
         checkpoint(&self.control)?;
         let segments = segments_from_probabilities(&probabilities, input.len(), policy)?;
         drop(probabilities);
         checkpoint(&self.control)?;
-        self.timings.add_vad(started.elapsed().as_secs_f64());
+        if !cached {
+            self.timings.add_vad(started.elapsed().as_secs_f64());
+        }
 
         let groups =
             recognition_groups(&segments, self.config.full_window_samples(), &self.control)?;
@@ -362,6 +431,38 @@ impl<D: WindowDecoder> BatchTranscriber<D> {
         }
         checkpoint(&self.control)?;
         Ok(Transcript::new(words, planned_windows))
+    }
+
+    pub(crate) fn transcribe_scored_in_context<V: SpeechProbabilityDetector>(
+        &mut self,
+        input: &ChannelAudio,
+        detector: &mut V,
+        policy: Option<VadPolicyConfig>,
+        channel: Option<OriginalChannel>,
+    ) -> Result<Transcript, String> {
+        checkpoint(&self.control)?;
+        self.validate_vad_sample_rate()?;
+        let started = std::time::Instant::now();
+        let probabilities = detector.probabilities(input.view())?;
+        checkpoint(&self.control)?;
+        // Validate cardinality and probability domain through the same VAD contract.
+        if probabilities.len() != input.len().div_ceil(512)
+            || probabilities
+                .iter()
+                .any(|p| !p.is_finite() || !(0.0..=1.0).contains(p))
+        {
+            return Err("invalid diagnostic VAD observations".into());
+        }
+        self.timings.add_vad(started.elapsed().as_secs_f64());
+        self.score_observations = Some((probabilities, input.len()));
+        let result = match policy {
+            Some(policy) => {
+                self.transcribe_channel_with_vad_in_context(input, detector, policy, channel)
+            }
+            None => self.transcribe_channel_in_context(input, channel),
+        };
+        self.score_observations = None;
+        result
     }
 
     pub(crate) fn validate_vad_sample_rate(&self) -> Result<(), String> {
@@ -471,6 +572,10 @@ impl<D: WindowDecoder> BatchTranscriber<D> {
                     keep_until_sec: end.min(keep_until),
                     subsampling_factor,
                     frontend_origin_sample: origin.sample,
+                    real_end_sample: origin
+                        .sample
+                        .checked_add(last_sample.min(input_samples.len()))
+                        .ok_or_else(|| "window real end overflows".to_owned())?,
                 },
             )?;
             window_words.push(WindowWords::new(*window, words));
@@ -1413,5 +1518,111 @@ mod tests {
             "a cancellation racing the first return prevents every successor window"
         );
         assert_eq!(race_control.state(), ExecutionState::CancelRequested);
+    }
+    #[test]
+    fn scored_batch_preserves_words_and_uses_real_padded_window_observations() -> Result<(), String>
+    {
+        use gigaam_recognition::ScoreDetail;
+        struct ScoredDecoder(f32);
+        impl WindowDecoder for ScoredDecoder {
+            fn frame_rate(&self) -> FrameRate {
+                match FrameRate::new(50.0) {
+                    Ok(rate) => rate,
+                    Err(error) => panic!("invalid test frame rate: {error}"),
+                }
+            }
+            fn decode(
+                &mut self,
+                features: gigaam_audio::FeatureMatrixView<'_>,
+            ) -> Result<Decoded, String> {
+                self.decode_with_detail(features, ScoreDetail::None)
+            }
+            fn decode_with_detail(
+                &mut self,
+                _: gigaam_audio::FeatureMatrixView<'_>,
+                detail: ScoreDetail,
+            ) -> Result<Decoded, String> {
+                let token = match detail {
+                    ScoreDetail::None => Token::new(1, 0),
+                    ScoreDetail::TokenLogProbabilities => Token::scored(1, 0, -0.25)?,
+                };
+                Decoded::new_with_tokens(gigaam_recognition::DecodedTokensInput {
+                    words: vec![Word::new("hello".into(), self.0, self.0 + 0.02)?],
+                    silence: vec![false],
+                    output_frames: 1,
+                    encoder_seconds: 0.0,
+                    tokens: vec![token],
+                    word_spans: vec![(0, 0)],
+                })
+            }
+        }
+        let config = vad_config(PadPolicy::PadToWindow, 0.2);
+        let mut plain = vad_batch(
+            ScoredDecoder(0.0),
+            config,
+            ObservationMode::disabled(),
+            ExecutionControl::without_deadline(),
+        );
+        let mut scored = vad_batch(
+            ScoredDecoder(0.0),
+            config,
+            ObservationMode::disabled(),
+            ExecutionControl::without_deadline(),
+        );
+        let input = pcm(1025);
+        let expected = plain.transcribe_channel(&input)?;
+        let mut detector = vad(vec![0.1, 0.7, 0.3]);
+        let result = scored.transcribe_scored_in_context(&input, &mut detector, None, None)?;
+        assert_eq!(expected.text(), result.text());
+        assert_eq!(expected.words()[0].start(), result.words()[0].start());
+        assert_eq!(expected.words()[0].end(), result.words()[0].end());
+        let channel = crate::turns::ChannelTranscript::new(0, result.into_words())?;
+        let segments = channel.scored_segments(crate::turns::TurnGap::new(1.0)?)?;
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0].tokens()[0].id(), 1);
+        assert_eq!(segments[0].seek(), 0);
+        assert!((segments[0].no_speech_probability() - (1.0 - f64::from(0.7_f32))).abs() < 1e-12);
+        assert_eq!(segments[0].average_log_probability(), -0.25);
+        assert_eq!(detector.calls.load(Ordering::SeqCst), 1);
+        assert!(scored.timings().vad_seconds() > 0.0);
+
+        let mut long_batch = vad_batch(
+            ScoredDecoder(0.3),
+            vad_config(PadPolicy::PadToWindow, 0.8),
+            ObservationMode::disabled(),
+            ExecutionControl::without_deadline(),
+        );
+        let long_input = pcm(32_000);
+        let mut long_detector = vad(vec![0.6; 63]);
+        let long_result =
+            long_batch.transcribe_scored_in_context(&long_input, &mut long_detector, None, None)?;
+        let segments = crate::turns::ChannelTranscript::new(0, long_result.into_words())?
+            .scored_segments(crate::turns::TurnGap::new(1.0)?)?;
+        assert!(segments.len() > 1);
+        assert_eq!(segments[0].seek(), 0);
+        assert_eq!(segments[1].seek(), 60);
+        assert!(segments.iter().all(|segment| segment.end() <= 2.0));
+        assert_eq!(long_detector.calls.load(Ordering::SeqCst), 1);
+
+        let mut grouped = vad_batch(
+            ScoredDecoder(0.0),
+            vad_config(PadPolicy::PadToWindow, 0.2),
+            ObservationMode::disabled(),
+            ExecutionControl::without_deadline(),
+        );
+        let mut grouped_detector = vad(vec![0.0, 0.0, 0.8, 0.8, 0.8, 0.0]);
+        let grouped_result = grouped.transcribe_scored_in_context(
+            &pcm(3_072),
+            &mut grouped_detector,
+            Some(vad_policy(0.0)),
+            None,
+        )?;
+        let grouped_segments =
+            crate::turns::ChannelTranscript::new(0, grouped_result.into_words())?
+                .scored_segments(crate::turns::TurnGap::new(1.0)?)?;
+        assert_eq!(grouped_segments.len(), 1);
+        assert_eq!(grouped_segments[0].seek(), 6);
+        assert_eq!(grouped_detector.calls.load(Ordering::SeqCst), 1);
+        Ok(())
     }
 }

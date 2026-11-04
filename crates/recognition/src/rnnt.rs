@@ -23,6 +23,14 @@ pub trait RnntTransition {
 
     fn select(&mut self, encoder_frame: &[f32], state: &Self::State) -> Result<usize, String>;
 
+    fn select_scored(
+        &mut self,
+        _encoder_frame: &[f32],
+        _state: &Self::State,
+    ) -> Result<(usize, f64), String> {
+        Err("RNN-T transition does not support token scores".into())
+    }
+
     fn advance(&mut self, token: usize, state: &mut Self::State) -> Result<(), String>;
 }
 
@@ -60,6 +68,16 @@ pub fn greedy<T: RnntTransition, F: RnntFrameSource>(
     blank: usize,
     max_symbols_per_step: usize,
 ) -> Result<RnntOutput, String> {
+    greedy_with_detail(transition, frames, blank, max_symbols_per_step, false)
+}
+
+pub fn greedy_with_detail<T: RnntTransition, F: RnntFrameSource>(
+    transition: &mut T,
+    frames: &F,
+    blank: usize,
+    max_symbols_per_step: usize,
+    scored: bool,
+) -> Result<RnntOutput, String> {
     let mut state = transition.start(blank)?;
     let output_frames = frames.output_frames();
     let mut tokens = Vec::new();
@@ -69,7 +87,12 @@ pub fn greedy<T: RnntTransition, F: RnntFrameSource>(
         validate_encoder_frame(frame, frame_index)?;
         let mut emitted = false;
         for _ in 0..max_symbols_per_step {
-            let token = transition.select(frame, &state)?;
+            let (token, score) = if scored {
+                let (token, score) = transition.select_scored(frame, &state)?;
+                (token, Some(score))
+            } else {
+                (transition.select(frame, &state)?, None)
+            };
             if token > blank {
                 return Err(format!(
                     "RNN-T selected token {token} exceeds blank vocabulary boundary {blank}"
@@ -78,7 +101,10 @@ pub fn greedy<T: RnntTransition, F: RnntFrameSource>(
             if token == blank {
                 break;
             }
-            tokens.push(Token::new(token, frame_index));
+            tokens.push(match score {
+                Some(value) => Token::scored(token, frame_index, value)?,
+                None => Token::new(token, frame_index),
+            });
             emitted = true;
             transition.advance(token, &mut state)?;
         }
@@ -233,5 +259,40 @@ mod tests {
             transition.advances.is_empty(),
             "an out-of-domain selected token must not mutate recurrent state"
         );
+    }
+    #[test]
+    fn scored_multiple_symbols_keep_each_actual_joint_step() -> Result<(), String> {
+        struct Scored {
+            step: usize,
+        }
+        impl RnntTransition for Scored {
+            type State = ();
+            fn start(&mut self, _: usize) -> Result<(), String> {
+                Ok(())
+            }
+            fn select(&mut self, _: &[f32], _: &()) -> Result<usize, String> {
+                Err("unexpected unscored selection".into())
+            }
+            fn select_scored(&mut self, _: &[f32], _: &()) -> Result<(usize, f64), String> {
+                let result = match self.step {
+                    0 => (0, -0.25),
+                    1 => (1, -0.5),
+                    _ => (2, -0.75),
+                };
+                self.step += 1;
+                Ok(result)
+            }
+            fn advance(&mut self, _: usize, _: &mut ()) -> Result<(), String> {
+                Ok(())
+            }
+        }
+        let mut transition = Scored { step: 0 };
+        let output = greedy_with_detail(&mut transition, &FakeFrames(vec![vec![1.0]]), 2, 4, true)?;
+        assert_eq!(output.tokens().len(), 2);
+        assert_eq!(output.tokens()[0].frame(), 0);
+        assert_eq!(output.tokens()[1].frame(), 0);
+        assert_eq!(output.tokens()[0].log_probability(), Some(-0.25));
+        assert_eq!(output.tokens()[1].log_probability(), Some(-0.5));
+        Ok(())
     }
 }

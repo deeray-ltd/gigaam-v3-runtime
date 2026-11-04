@@ -30,6 +30,7 @@ enum Priority {
 }
 
 struct Job {
+    detail: crate::contracts::ScoreDetail,
     features: FeatureMatrix,
     control: ExecutionControl,
     events: Sender<JobEvent>,
@@ -133,7 +134,9 @@ impl ExecutionScheduler {
                 }
                 send_event(job.events.clone(), JobEvent::Started);
 
-                match catch_unwind(AssertUnwindSafe(|| decoder.decode(job.features.view()))) {
+                match catch_unwind(AssertUnwindSafe(|| {
+                    decoder.decode_with_detail(job.features.view(), job.detail)
+                })) {
                     Ok(result) => {
                         if job.control.cancellation_won() {
                             job.control.acknowledge_cancellation();
@@ -318,9 +321,18 @@ impl WindowDecoder for ScheduledRecognizer {
     }
 
     fn decode(&mut self, features: FeatureMatrixView<'_>) -> Result<Decoded, String> {
+        self.decode_with_detail(features, crate::contracts::ScoreDetail::None)
+    }
+
+    fn decode_with_detail(
+        &mut self,
+        features: FeatureMatrixView<'_>,
+        detail: crate::contracts::ScoreDetail,
+    ) -> Result<Decoded, String> {
         self.control.enqueue()?;
         let (events_tx, events_rx): (Sender<JobEvent>, Receiver<JobEvent>) = mpsc::channel();
         self.enqueue(Job {
+            detail,
             // Queued work outlives the caller's feature borrow, so the scheduler is the one
             // execution boundary that materializes an owned validated matrix.
             features: features.to_owned(),

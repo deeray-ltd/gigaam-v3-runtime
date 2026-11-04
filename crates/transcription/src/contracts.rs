@@ -224,6 +224,23 @@ pub struct TranscriptWord {
     text: String,
     start: f32,
     end: f32,
+    pub(crate) provenance: Option<WordProvenance>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct WindowProvenance {
+    pub origin: usize,
+    pub end: usize,
+    pub sample_rate: usize,
+    pub no_speech_probability: f64,
+    pub tokens: Vec<gigaam_recognition::Token>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct WordProvenance {
+    pub window: std::sync::Arc<WindowProvenance>,
+    pub first: usize,
+    pub last: usize,
 }
 
 impl TranscriptWord {
@@ -236,7 +253,12 @@ impl TranscriptWord {
         if end < start {
             return Err("transcript word end must not precede its start".into());
         }
-        Ok(Self { text, start, end })
+        Ok(Self {
+            text,
+            start,
+            end,
+            provenance: None,
+        })
     }
 
     pub fn from_recognition(word: RecognitionWord) -> Result<Self, String> {
@@ -259,7 +281,9 @@ impl TranscriptWord {
         if !offset.is_finite() {
             return Err("transcript word offset must be finite".into());
         }
-        Self::new(self.text, self.start + offset, self.end + offset)
+        let mut word = Self::new(self.text, self.start + offset, self.end + offset)?;
+        word.provenance = self.provenance;
+        Ok(word)
     }
 
     pub fn capped_end(self, maximum: f32) -> Result<Self, String> {
@@ -267,7 +291,9 @@ impl TranscriptWord {
         if maximum < self.start {
             return Err("transcript word end boundary precedes the word start".into());
         }
-        Self::new(self.text, self.start, self.end.min(maximum))
+        let mut word = Self::new(self.text, self.start, self.end.min(maximum))?;
+        word.provenance = self.provenance;
+        Ok(word)
     }
 }
 

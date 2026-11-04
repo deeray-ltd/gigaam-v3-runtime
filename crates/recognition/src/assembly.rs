@@ -96,4 +96,15 @@ impl WindowDecoder for DirectRecognizer {
             Implementation::Rnnt(decoder) => decoder.decode(features),
         }
     }
+
+    fn decode_with_detail(
+        &mut self,
+        features: FeatureMatrixView<'_>,
+        detail: crate::contracts::ScoreDetail,
+    ) -> Result<Decoded, String> {
+        match &mut self.0 {
+            Implementation::Ctc { decoder, .. } => decoder.decode_with_detail(features, detail),
+            Implementation::Rnnt(decoder) => decoder.decode_with_detail(features, detail),
+        }
+    }
 }

@@ -29,7 +29,8 @@ pub mod vad;
 
 pub use assembly::DirectRecognizer;
 pub use contracts::{
-    Decoded, Encoder, FrameRate, SpeechProbabilityDetector, Token, WindowDecoder, Word,
+    Decoded, DecodedTokensInput, Encoder, FrameRate, ScoreDetail, SpeechProbabilityDetector, Token,
+    WindowDecoder, Word,
 };
 pub use execution::{ExecutionControl, ExecutionState};
 pub use ort_assignment::CudaAssignmentEvidence;

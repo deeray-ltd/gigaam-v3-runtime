@@ -33,11 +33,31 @@ impl FrameRate {
 pub struct Token {
     id: usize,
     frame: usize,
+    log_probability: Option<f64>,
 }
 
 impl Token {
     pub const fn new(id: usize, frame: usize) -> Self {
-        Self { id, frame }
+        Self {
+            id,
+            frame,
+            log_probability: None,
+        }
+    }
+
+    pub fn scored(id: usize, frame: usize, log_probability: f64) -> Result<Self, String> {
+        if !log_probability.is_finite() || log_probability > 0.0 {
+            return Err("token log probability must be finite and nonpositive".into());
+        }
+        Ok(Self {
+            id,
+            frame,
+            log_probability: Some(log_probability),
+        })
+    }
+
+    pub const fn log_probability(&self) -> Option<f64> {
+        self.log_probability
     }
 
     pub const fn id(&self) -> usize {
@@ -117,6 +137,16 @@ pub struct Decoded {
     word_spans: Option<Vec<(usize, usize)>>,
 }
 
+/// Inputs for a decoded window with native token spans.
+pub struct DecodedTokensInput {
+    pub words: Vec<Word>,
+    pub silence: Vec<bool>,
+    pub output_frames: usize,
+    pub encoder_seconds: f64,
+    pub tokens: Vec<Token>,
+    pub word_spans: Vec<(usize, usize)>,
+}
+
 impl Decoded {
     pub fn new(
         words: Vec<Word>,
@@ -157,6 +187,19 @@ impl Decoded {
             Some(labels),
             Some(tokens),
             Some(word_spans),
+        )
+    }
+
+    /// Constructs a window with token occurrences and their native word spans.
+    pub fn new_with_tokens(input: DecodedTokensInput) -> Result<Self, String> {
+        Self::assemble(
+            input.words,
+            input.silence,
+            input.output_frames,
+            input.encoder_seconds,
+            None,
+            Some(input.tokens),
+            Some(input.word_spans),
         )
     }
 
@@ -201,6 +244,9 @@ impl Decoded {
                 Some(tokens) => tokens.len(),
                 None => 0,
             };
+            if word_spans.windows(2).any(|pair| pair[0].1 >= pair[1].0) {
+                return Err("recognition word spans must be ordered and disjoint".into());
+            }
             for &(first, last) in word_spans {
                 if first > last || last >= tokens_len {
                     return Err(format!(
@@ -281,11 +327,45 @@ pub trait Encoder {
     fn forward(&mut self, features: FeatureMatrixView<'_>) -> Result<(Vec<f32>, usize), String>;
 }
 
+/// Requested detail for a decoded window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScoreDetail {
+    None,
+    TokenLogProbabilities,
+}
+
+/// Stable selected-token log probability over a finite score row.
+pub fn selected_log_probability(row: &[f32], selected: usize) -> Result<f64, String> {
+    if row.is_empty() || selected >= row.len() || row.iter().any(|value| !value.is_finite()) {
+        return Err("score row or selected token is invalid".into());
+    }
+    let maximum = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let maximum = f64::from(maximum);
+    let sum: f64 = row
+        .iter()
+        .map(|value| (f64::from(*value) - maximum).exp())
+        .sum();
+    Ok((f64::from(row[selected]) - maximum) - sum.ln())
+}
+
 /// Decodes one validated feature window into a coherent recognition result.
 pub trait WindowDecoder {
     fn frame_rate(&self) -> FrameRate;
 
     fn decode(&mut self, features: FeatureMatrixView<'_>) -> Result<Decoded, String>;
+
+    fn decode_with_detail(
+        &mut self,
+        features: FeatureMatrixView<'_>,
+        detail: ScoreDetail,
+    ) -> Result<Decoded, String> {
+        match detail {
+            ScoreDetail::None => self.decode(features),
+            ScoreDetail::TokenLogProbabilities => {
+                Err("decoder does not support token scores".into())
+            }
+        }
+    }
 }
 
 /// Dynamically dispatched decoder used by the current CLI composition.
@@ -296,6 +376,14 @@ impl WindowDecoder for Box<dyn WindowDecoder> {
 
     fn decode(&mut self, features: FeatureMatrixView<'_>) -> Result<Decoded, String> {
         (**self).decode(features)
+    }
+
+    fn decode_with_detail(
+        &mut self,
+        features: FeatureMatrixView<'_>,
+        detail: ScoreDetail,
+    ) -> Result<Decoded, String> {
+        (**self).decode_with_detail(features, detail)
     }
 }
 
@@ -313,7 +401,7 @@ pub trait SpeechProbabilityDetector {
 
 #[cfg(test)]
 mod tests {
-    use super::{Decoded, Token, Word};
+    use super::{Decoded, DecodedTokensInput, Token, Word};
 
     fn word() -> Word {
         Word::new("word".into(), 0.0, 0.1).expect("test word timestamps are valid")
@@ -408,5 +496,38 @@ mod tests {
             .is_err(),
             "a word span whose end precedes its start must refuse"
         );
+    }
+    #[test]
+    fn token_word_spans_refuse_overlap_and_reversal() -> Result<(), String> {
+        let words = vec![
+            Word::new("a".into(), 0.0, 0.1)?,
+            Word::new("b".into(), 0.2, 0.3)?,
+        ];
+        let tokens = vec![Token::new(1, 0), Token::new(2, 1), Token::new(3, 2)];
+        for spans in [vec![(0, 1), (1, 2)], vec![(2, 2), (0, 0)]] {
+            assert!(
+                Decoded::new_with_tokens(DecodedTokensInput {
+                    words: words.clone(),
+                    silence: vec![false; 3],
+                    output_frames: 3,
+                    encoder_seconds: 0.0,
+                    tokens: tokens.clone(),
+                    word_spans: spans
+                })
+                .is_err()
+            );
+        }
+        assert!(
+            Decoded::new_with_tokens(DecodedTokensInput {
+                words,
+                silence: vec![false; 3],
+                output_frames: 3,
+                encoder_seconds: 0.0,
+                tokens,
+                word_spans: vec![(0, 0), (2, 2)]
+            })
+            .is_ok()
+        );
+        Ok(())
     }
 }
