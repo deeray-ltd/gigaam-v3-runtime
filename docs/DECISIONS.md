@@ -157,3 +157,23 @@ CPU fallback. Service and CLI project unverified evidence to stderr before warmu
 unverified evidence. Real model/GPU acceptance remains external because the fingerprint binds an
 actual ORT placement, not a source-only claim; a model or runtime change refuses only if it
 changes that placement. This adds no Model Package fields and no HTTP/WS schema.
+
+## 12. Batch VAD groups recognition context within the existing window bound
+
+**Context.** Recognizing each short detector span separately can remove useful acoustic
+context. Detector segmentation and recognition windowing serve different purposes.
+
+**Decision.** Greedily group consecutive padded detector spans while the distance from the
+first start to the last end fits the configured recognition window. Keep an oversized span
+separate and use the existing windowing path. Recognize the original contiguous samples in
+each group, including gaps, with the caller's padding policy and source-time origin intact.
+Within-group windows use the existing stitching rules; separate groups are concatenated
+without lexical stitching across their boundaries. An empty detector result does no
+recognition work.
+
+**Consequences.** Detector thresholds, minimum speech and silence durations, and padding
+retain their meanings; detector-rejected content in a retained gap can be recognized.
+Grouping can process more audio than independent spans, and it does not guarantee quality
+for short or quiet speech or correct CTC acoustic timestamps. Revisit the decision if its
+source-time or grouping invariants fail, representative recognition quality regresses, or
+comparable evidence supports a better bounded approach.
