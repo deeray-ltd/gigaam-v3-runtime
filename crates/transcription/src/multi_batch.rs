@@ -210,6 +210,18 @@ impl<D: WindowDecoder> MultiChannelBatchTranscriber<D> {
         })
     }
 
+    /// Transcribes with selected occurrence scores and source-window VAD diagnostics.
+    pub fn transcribe_scored<V: SpeechProbabilityDetector>(
+        self,
+        input: &DecodedAudio,
+        detector: &mut V,
+        policy: Option<VadPolicyConfig>,
+    ) -> Result<MultiChannelBatchResult, MultiChannelBatchError> {
+        self.transcribe_using(input, |batch, channel, original| {
+            batch.transcribe_scored_in_context(channel, detector, policy, Some(original))
+        })
+    }
+
     fn transcribe_using(
         mut self,
         input: &DecodedAudio,

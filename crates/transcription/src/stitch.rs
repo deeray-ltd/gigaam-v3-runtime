@@ -392,4 +392,48 @@ mod tests {
         assert!(windows(1.0, f32::NAN, 0.0).is_err());
         assert!(window_shapes(1.0, 0.0).is_err());
     }
+    #[test]
+    fn discarded_overlap_word_takes_its_own_provenance_with_it() -> Result<(), String> {
+        use crate::contracts::{WindowProvenance, WordProvenance};
+        use gigaam_recognition::Token;
+        use std::sync::Arc;
+        let first = Arc::new(WindowProvenance {
+            origin: 0,
+            end: 16000,
+            sample_rate: 16000,
+            no_speech_probability: 0.2,
+            tokens: vec![Token::scored(11, 0, -0.1)?],
+        });
+        let second = Arc::new(WindowProvenance {
+            origin: 8000,
+            end: 24000,
+            sample_rate: 16000,
+            no_speech_probability: 0.3,
+            tokens: vec![Token::scored(22, 0, -0.2)?],
+        });
+        let mut left = TranscriptWord::new("same".into(), 0.7, 0.8)?;
+        left.provenance = Some(WordProvenance {
+            window: first,
+            first: 0,
+            last: 0,
+        });
+        let mut right = TranscriptWord::new("same".into(), 0.7, 0.8)?;
+        right.provenance = Some(WordProvenance {
+            window: second,
+            first: 0,
+            last: 0,
+        });
+        let windows = vec![
+            WindowWords::new(Window::new(0.0, 1.0)?, vec![left]),
+            WindowWords::new(Window::new(0.5, 1.5)?, vec![right]),
+        ];
+        let words = stitch_aligned(&windows, 0.25)?;
+        assert_eq!(words.len(), 1);
+        let segments = crate::turns::ChannelTranscript::new(0, words)?
+            .scored_segments(crate::turns::TurnGap::new(1.0)?)?;
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0].tokens().len(), 1);
+        assert!([11, 22].contains(&segments[0].tokens()[0].id()));
+        Ok(())
+    }
 }

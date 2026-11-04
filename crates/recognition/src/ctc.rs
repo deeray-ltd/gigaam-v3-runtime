@@ -84,6 +84,17 @@ pub fn greedy_masked(
     blank: usize,
     space: Option<usize>,
 ) -> Result<GreedyMaskedOutput, String> {
+    greedy_masked_with_detail(log_probabilities, frames, vocabulary, blank, space, false)
+}
+
+fn greedy_masked_with_detail(
+    log_probabilities: &[f32],
+    frames: usize,
+    vocabulary: usize,
+    blank: usize,
+    space: Option<usize>,
+    scored: bool,
+) -> Result<GreedyMaskedOutput, String> {
     validate_greedy_input(log_probabilities, frames, vocabulary, blank, space)?;
     let mut out = Vec::new();
     let mut silence = Vec::with_capacity(frames);
@@ -99,7 +110,15 @@ pub fn greedy_masked(
         }
         silence.push(best == blank || Some(best) == space);
         if best != blank && best != previous {
-            out.push(Token::new(best, frame));
+            out.push(if scored {
+                Token::scored(
+                    best,
+                    frame,
+                    crate::contracts::selected_log_probability(row, best)?,
+                )?
+            } else {
+                Token::new(best, frame)
+            });
         }
         labels.push(best);
         previous = best;
@@ -292,15 +311,24 @@ impl<E: Encoder> WindowDecoder for CtcDecoder<E> {
     }
 
     fn decode(&mut self, features: FeatureMatrixView<'_>) -> Result<Decoded, String> {
+        self.decode_with_detail(features, crate::contracts::ScoreDetail::None)
+    }
+
+    fn decode_with_detail(
+        &mut self,
+        features: FeatureMatrixView<'_>,
+        detail: crate::contracts::ScoreDetail,
+    ) -> Result<Decoded, String> {
         let started = Instant::now();
         let (log_probabilities, output_frames) = self.encoder.forward(features)?;
         let encoder_seconds = started.elapsed().as_secs_f64();
-        let (tokens, silence, labels) = greedy_masked(
+        let (tokens, silence, labels) = greedy_masked_with_detail(
             &log_probabilities,
             output_frames,
             self.encoder.out_dim(),
             self.blank,
             self.silence_policy.space_token(),
+            detail == crate::contracts::ScoreDetail::TokenLogProbabilities,
         )?;
         let word_spans = word_token_spans(&tokens, &self.vocabulary);
         let words = tokens_to_words(&tokens, &self.vocabulary, self.frame_rate)?;
@@ -595,5 +623,18 @@ mod tests {
         assert_eq!(decoded.words().len(), 1);
         assert_eq!(decoded.words()[0].text(), "hithere");
         assert_eq!(decoded.silence(), &[false, false, true]);
+    }
+    #[test]
+    fn scored_occurrences_use_first_emission_and_ignore_row_offsets() -> Result<(), String> {
+        let rows = [3.0, 0.0, 4.0, 0.0, 0.0, 5.0, 2.0, 0.0];
+        let shifted: Vec<f32> = rows.iter().map(|value| value + 17.0).collect();
+        let (tokens, _, _) = super::greedy_masked_with_detail(&rows, 4, 2, 1, None, true)?;
+        let (other, _, _) = super::greedy_masked_with_detail(&shifted, 4, 2, 1, None, true)?;
+        assert_eq!(tokens.len(), 2);
+        assert_eq!(tokens[0].frame(), 0);
+        assert_eq!(tokens[1].frame(), 3);
+        assert_eq!(tokens[0].log_probability(), other[0].log_probability());
+        assert_eq!(tokens[1].log_probability(), other[1].log_probability());
+        Ok(())
     }
 }

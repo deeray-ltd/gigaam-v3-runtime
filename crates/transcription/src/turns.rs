@@ -38,8 +38,120 @@ impl ChannelTranscript {
         &self.words
     }
 
+    /// Groups retained words by source window and configured word gap.
+    pub fn scored_segments(&self, gap: TurnGap) -> Result<Vec<ScoredSegment>, String> {
+        let mut segments = Vec::new();
+        let mut first = 0;
+        while first < self.words.len() {
+            let owner = self.words[first]
+                .provenance
+                .as_ref()
+                .ok_or_else(|| "missing word provenance".to_owned())?;
+            let mut end = first + 1;
+            while end < self.words.len() {
+                let next = self.words[end]
+                    .provenance
+                    .as_ref()
+                    .ok_or_else(|| "missing word provenance".to_owned())?;
+                if !std::sync::Arc::ptr_eq(&owner.window, &next.window) {
+                    break;
+                }
+                let previous = self.words[end - 1]
+                    .provenance
+                    .as_ref()
+                    .ok_or_else(|| "missing word provenance".to_owned())?;
+                if previous.last >= next.first {
+                    return Err("overlapping or out-of-order token spans".into());
+                }
+                if self.words[end].start() - self.words[end - 1].end() > gap.seconds() {
+                    break;
+                }
+                end += 1;
+            }
+            let last = self.words[end - 1]
+                .provenance
+                .as_ref()
+                .ok_or_else(|| "missing word provenance".to_owned())?;
+            if owner.first > last.last {
+                return Err("inconsistent token span".into());
+            }
+            let tokens = owner
+                .window
+                .tokens
+                .get(owner.first..=last.last)
+                .ok_or_else(|| "token span outside window".to_owned())?
+                .to_vec();
+            let mut sum = 0.0;
+            for token in &tokens {
+                sum += token
+                    .log_probability()
+                    .ok_or_else(|| "missing token score".to_owned())?;
+            }
+            let count =
+                u32::try_from(tokens.len()).map_err(|_| "token count overflows".to_owned())?;
+            if count == 0 {
+                return Err("empty scored token span".into());
+            }
+            let seek = owner
+                .window
+                .origin
+                .checked_mul(100)
+                .ok_or_else(|| "window seek overflows".to_owned())?
+                / owner.window.sample_rate;
+            segments.push(ScoredSegment {
+                start: self.words[first].start(),
+                end: self.words[first..end]
+                    .iter()
+                    .map(TranscriptWord::end)
+                    .fold(self.words[first].end(), f32::max),
+                text: crate::contracts::words_to_text(&self.words[first..end]),
+                tokens,
+                seek,
+                no_speech_probability: owner.window.no_speech_probability,
+                average_log_probability: sum / f64::from(count),
+            });
+            first = end;
+        }
+        Ok(segments)
+    }
+
     pub fn into_words(self) -> Vec<TranscriptWord> {
         self.words
+    }
+}
+
+/// A retained word group with native occurrence scores and source-window diagnostics.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ScoredSegment {
+    start: f32,
+    end: f32,
+    text: String,
+    tokens: Vec<gigaam_recognition::Token>,
+    seek: usize,
+    no_speech_probability: f64,
+    average_log_probability: f64,
+}
+impl ScoredSegment {
+    pub const fn start(&self) -> f32 {
+        self.start
+    }
+    pub const fn end(&self) -> f32 {
+        self.end
+    }
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+    pub fn tokens(&self) -> &[gigaam_recognition::Token] {
+        &self.tokens
+    }
+    pub const fn seek(&self) -> usize {
+        self.seek
+    }
+    pub const fn no_speech_probability(&self) -> f64 {
+        self.no_speech_probability
+    }
+    pub const fn average_log_probability(&self) -> f64 {
+        self.average_log_probability
     }
 }
 
@@ -273,5 +385,104 @@ mod tests {
         );
         assert!(merge(&[channel(0, vec![]), channel(0, vec![])]).is_err());
         assert!(TurnGap::new(f32::NAN).is_err());
+    }
+    #[test]
+    fn scored_segments_include_internal_boundary_and_split_windows() -> Result<(), String> {
+        use crate::contracts::{WindowProvenance, WordProvenance};
+        use gigaam_recognition::Token;
+        use std::sync::Arc;
+        let owner = Arc::new(WindowProvenance {
+            origin: 1600,
+            end: 3200,
+            sample_rate: 16000,
+            no_speech_probability: 0.2,
+            tokens: vec![
+                Token::scored(1, 0, -0.2)?,
+                Token::scored(2, 1, -0.4)?,
+                Token::scored(3, 2, -0.6)?,
+            ],
+        });
+        let next = Arc::new(WindowProvenance {
+            origin: 3200,
+            end: 4800,
+            sample_rate: 16000,
+            no_speech_probability: 0.3,
+            tokens: vec![Token::scored(4, 0, -0.8)?],
+        });
+        let mut a = TranscriptWord::new("a".into(), 0.1, 0.2)?;
+        a.provenance = Some(WordProvenance {
+            window: Arc::clone(&owner),
+            first: 0,
+            last: 0,
+        });
+        let mut b = TranscriptWord::new("b".into(), 0.2, 0.3)?;
+        b.provenance = Some(WordProvenance {
+            window: owner,
+            first: 2,
+            last: 2,
+        });
+        let mut c = TranscriptWord::new("c".into(), 0.3, 0.4)?;
+        c.provenance = Some(WordProvenance {
+            window: next,
+            first: 0,
+            last: 0,
+        });
+        let segments =
+            ChannelTranscript::new(0, vec![a, b, c])?.scored_segments(TurnGap::new(1.0)?)?;
+        assert_eq!(segments.len(), 2);
+        assert_eq!(
+            segments[0]
+                .tokens()
+                .iter()
+                .map(Token::id)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        assert!((segments[0].average_log_probability() + 0.4).abs() < 1e-12);
+        assert_eq!(segments[0].seek(), 10);
+        assert_eq!(segments[1].seek(), 20);
+        Ok(())
+    }
+    #[test]
+    fn scored_gap_rejects_overlapping_occurrences_and_accepts_disjoint() -> Result<(), String> {
+        use crate::contracts::{WindowProvenance, WordProvenance};
+        use gigaam_recognition::Token;
+        use std::sync::Arc;
+        let owner = Arc::new(WindowProvenance {
+            origin: 0,
+            end: 16000,
+            sample_rate: 16000,
+            no_speech_probability: 0.0,
+            tokens: vec![Token::scored(1, 0, -0.1)?, Token::scored(2, 1, -0.2)?],
+        });
+        let mut a = TranscriptWord::new("a".into(), 0.0, 0.1)?;
+        a.provenance = Some(WordProvenance {
+            window: Arc::clone(&owner),
+            first: 0,
+            last: 0,
+        });
+        let mut b = TranscriptWord::new("b".into(), 0.5, 0.6)?;
+        b.provenance = Some(WordProvenance {
+            window: Arc::clone(&owner),
+            first: 0,
+            last: 0,
+        });
+        assert!(
+            ChannelTranscript::new(0, vec![a.clone(), b.clone()])?
+                .scored_segments(TurnGap::new(0.1)?)
+                .is_err()
+        );
+        b.provenance = Some(WordProvenance {
+            window: owner,
+            first: 1,
+            last: 1,
+        });
+        assert_eq!(
+            ChannelTranscript::new(0, vec![a, b])?
+                .scored_segments(TurnGap::new(0.1)?)?
+                .len(),
+            2
+        );
+        Ok(())
     }
 }
