@@ -31,9 +31,13 @@ unsupported value refuses rather than falling back.
 
 | Variable | Default | Accepted value and effect |
 | --- | --- | --- |
-| ASR_MAX_CONCURRENCY | 8 | Positive integer maximum for admitted HTTP batch requests. |
+| ASR_API_MODE | native | `native` or `openai`; selects exclusive application routes. |
+| ASR_LANGUAGE | ru | Recognition language declaration; currently only `ru` is supported. |
+| ASR_MAX_CONCURRENCY | 8 | Positive integer maximum for admitted HTTP batch processing. |
+| ASR_MAX_UPLOADS | Resolved ASR_MAX_CONCURRENCY | Positive integer maximum for concurrent upload readers. |
+| ASR_UPLOAD_TIMEOUT_SEC | Resolved ASR_REQ_TIMEOUT_SEC | Positive integer deadline for reading and validating an upload. |
 | ASR_MAX_STREAMS | 32 | Positive integer maximum for admitted WebSocket source channels. |
-| ASR_BODY_LIMIT_MB | 64 | Positive integer MiB limit for POST /v1/transcribe. |
+| ASR_BODY_LIMIT_MB | 64 | Positive integer MiB limit for the complete encoded request body, including multipart framing. |
 | ASR_REQ_TIMEOUT_SEC | 120 | Positive integer HTTP processing deadline in seconds. |
 | ASR_DEDUP | true | 1, 0, true, false, on, or off; default streaming channel-dedup choice. |
 | ASR_DEDUP_WINDOW_SEC | 4 | Positive decimal seconds, with one through nine fractional digits when fractional. |
@@ -46,7 +50,7 @@ with nonnegative half-sample rounding upward; it does not rely on a floating-poi
 round trip.
 
 A recognition call waits at most 60 seconds to start once its decoder worker queue accepts
-it, independent of ASR_REQ_TIMEOUT_SEC; that queue-wait expiry returns 503. The whole-request
+it, independent of ASR_REQ_TIMEOUT_SEC; that queue-wait expiry returns 503. The separate
 processing deadline configured by ASR_REQ_TIMEOUT_SEC returns 504 instead.
 
 ## Provider, frontend, and trace environment

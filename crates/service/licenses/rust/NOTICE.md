@@ -14,12 +14,23 @@ locked Cargo metadata and checksum-verified local registry crate archives.
 - Selection: normal non-dev dependency edges only. Packages whose only library target
   is a procedural macro are excluded because their code is executed during compilation,
   not statically linked into `asr-serve`.
-- Registry packages: 101; the three selected closures are identical.
-- Cargo.lock SHA-256: `6da8635180ddf06d3a72b02acfc56aadf3a701b03c9453ccddc078cffdf3647d`.
-- Closure SHA-256: `1fab76abcfb7c7f03ed7344e9ee6cc984429adb8af21090dec99b8e8ab819108`.
+- Registry packages: 108; the three selected closures are identical.
+- Cargo.lock SHA-256: `27261347900777e8a527bea7083e82a1defceb08dbc83a70025c43bd9fe9e37f`.
+- Closure SHA-256: `45d4883852551bf0d0fafd72ca17602147ee0dfea37b6b7afdc1f9d3f907f35e`.
 - Project workspace code is covered by the parent `COPYING` and `COPYING.LESSER` files.
 
 ## Package records
+
+### `adler2` 2.0.1
+- License expression: `0BSD OR MIT OR Apache-2.0`.
+- Locked crate archive SHA-256: `320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa`.
+- Source archive: `https://static.crates.io/crates/adler2/adler2-2.0.1.crate`.
+- Repository declared by package metadata: `https://github.com/oyvindln/adler2`.
+- Authors declared by package metadata: `Jonas Schievink <jonasschievink@gmail.com>`; `oyvindln <oyvindln@users.noreply.github.com>`.
+- Packaged license, permission, and copyright notices:
+  - `LICENSE-0BSD`: `texts/861399f8c21c042b110517e76dc6b63a2b334276c8cf17412fc3c8908ca8dc17.txt` (SHA-256 `861399f8c21c042b110517e76dc6b63a2b334276c8cf17412fc3c8908ca8dc17`).
+  - `LICENSE-APACHE`: `texts/8ada45cd9f843acf64e4722ae262c622a2b3b3007c7310ef36ac1061a30f6adb.txt` (SHA-256 `8ada45cd9f843acf64e4722ae262c622a2b3b3007c7310ef36ac1061a30f6adb`).
+  - `LICENSE-MIT`: `texts/23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3.txt` (SHA-256 `23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3`).
 
 ### `arrayvec` 0.7.8
 - License expression: `MIT OR Apache-2.0`.
@@ -158,6 +169,16 @@ locked Cargo metadata and checksum-verified local registry crate archives.
   - `LICENSE-APACHE`: `texts/a9040321c3712d8fd0b09cf52b17445de04a23a10165049ae187cd39e5c86be5.txt` (SHA-256 `a9040321c3712d8fd0b09cf52b17445de04a23a10165049ae187cd39e5c86be5`).
   - `LICENSE-MIT`: `texts/ae9baa7beea910273c2f384c2a6b721fb7bd02bda3436074a1072e4ee689f985.txt` (SHA-256 `ae9baa7beea910273c2f384c2a6b721fb7bd02bda3436074a1072e4ee689f985`).
 
+### `crc32fast` 1.5.0
+- License expression: `MIT OR Apache-2.0`.
+- Locked crate archive SHA-256: `9481c1c90cbf2ac953f07c8d4a58aa3945c425b7185c9154d67a65e4230da511`.
+- Source archive: `https://static.crates.io/crates/crc32fast/crc32fast-1.5.0.crate`.
+- Repository declared by package metadata: `https://github.com/srijs/rust-crc32fast`.
+- Authors declared by package metadata: `Sam Rijs <srijs@airpost.net>`; `Alex Crichton <alex@alexcrichton.com>`.
+- Packaged license, permission, and copyright notices:
+  - `LICENSE-APACHE`: `texts/c6596eb7be8581c18be736c846fb9173b69eccf6ef94c5135893ec56bd92ba08.txt` (SHA-256 `c6596eb7be8581c18be736c846fb9173b69eccf6ef94c5135893ec56bd92ba08`).
+  - `LICENSE-MIT`: `texts/61d383b05b87d78f94d2937e2580cce47226d17823c0430fbcad09596537efcf.txt` (SHA-256 `61d383b05b87d78f94d2937e2580cce47226d17823c0430fbcad09596537efcf`).
+
 ### `crypto-common` 0.1.7
 - License expression: `MIT OR Apache-2.0`.
 - Locked crate archive SHA-256: `78c8292055d1c1df0cce5d180393dc8cce0abec0a7102adb6c7b1eef6016d60a`.
@@ -236,6 +257,16 @@ locked Cargo metadata and checksum-verified local registry crate archives.
 - Authors declared by package metadata: `Dietrich Epp <depp@zdome.net>`.
 - Packaged license, permission, and copyright notices:
   - `LICENSE.txt`: `texts/25a0874d15e7c834a47c3adc80901edb2219759254992023ef1010c3065413d5.txt` (SHA-256 `25a0874d15e7c834a47c3adc80901edb2219759254992023ef1010c3065413d5`).
+
+### `flate2` 1.1.9
+- License expression: `MIT OR Apache-2.0`.
+- Locked crate archive SHA-256: `843fba2746e448b37e26a819579957415c8cef339bf08564fe8b7ddbd959573c`.
+- Source archive: `https://static.crates.io/crates/flate2/flate2-1.1.9.crate`.
+- Repository declared by package metadata: `https://github.com/rust-lang/flate2-rs`.
+- Authors declared by package metadata: `Alex Crichton <alex@alexcrichton.com>`; `Josh Triplett <josh@joshtriplett.org>`.
+- Packaged license, permission, and copyright notices:
+  - `LICENSE-APACHE`: `texts/a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2.txt` (SHA-256 `a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2`).
+  - `LICENSE-MIT`: `texts/025436edff4cfcdde17a5811fdea78892d8482efd1abdec5a17872d07a4f2112.txt` (SHA-256 `025436edff4cfcdde17a5811fdea78892d8482efd1abdec5a17872d07a4f2112`).
 
 ### `form_urlencoded` 1.2.2
 - License expression: `MIT OR Apache-2.0`.
@@ -475,6 +506,18 @@ locked Cargo metadata and checksum-verified local registry crate archives.
   - `LICENSE-APACHE`: `texts/a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2.txt` (SHA-256 `a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2`).
   - `LICENSE-MIT`: `texts/df9cfd06d8a44d9a671eadd39ffd97f166481da015a30f45dfd27886209c5922.txt` (SHA-256 `df9cfd06d8a44d9a671eadd39ffd97f166481da015a30f45dfd27886209c5922`).
 
+### `miniz_oxide` 0.8.9
+- License expression: `MIT OR Zlib OR Apache-2.0`.
+- Locked crate archive SHA-256: `1fa76a2c86f704bdb222d66965fb3d63269ce38518b83cb0575fca855ebb6316`.
+- Source archive: `https://static.crates.io/crates/miniz_oxide/miniz_oxide-0.8.9.crate`.
+- Repository declared by package metadata: `https://github.com/Frommi/miniz_oxide/tree/master/miniz_oxide`.
+- Authors declared by package metadata: `Frommi <daniil.liferenko@gmail.com>`; `oyvindln <oyvindln@users.noreply.github.com>`; `Rich Geldreich richgel99@gmail.com`.
+- Packaged license, permission, and copyright notices:
+  - `LICENSE`: `texts/4108245a1f2df9d4e94df8abed5b4ba0759bb2f9b40a6b939f1be141077ae50b.txt` (SHA-256 `4108245a1f2df9d4e94df8abed5b4ba0759bb2f9b40a6b939f1be141077ae50b`).
+  - `LICENSE-APACHE.md`: `texts/0d542e0c8804e39aa7f37eb00da5a762149dc682d7829451287e11b938e94594.txt` (SHA-256 `0d542e0c8804e39aa7f37eb00da5a762149dc682d7829451287e11b938e94594`).
+  - `LICENSE-MIT.md`: `texts/799e9ca9d179295ef372f25d3769cdda7d25bb2668add6a6a1e22d1e4c678b8d.txt` (SHA-256 `799e9ca9d179295ef372f25d3769cdda7d25bb2668add6a6a1e22d1e4c678b8d`).
+  - `LICENSE-ZLIB.md`: `texts/0a54e647fe54104658b5e563c04c6f9edf251710e47bce692e0bd990a4ddaa39.txt` (SHA-256 `0a54e647fe54104658b5e563c04c6f9edf251710e47bce692e0bd990a4ddaa39`).
+
 ### `mio` 1.2.2
 - License expression: `MIT`.
 - Locked crate archive SHA-256: `30d65c71f1ce40ab09135ce117d742b9f8a19ff91a41a8b57ed50bc2de59c427`.
@@ -483,6 +526,15 @@ locked Cargo metadata and checksum-verified local registry crate archives.
 - Authors declared by package metadata: `Carl Lerche <me@carllerche.com>`; `Thomas de Zeeuw <thomasdezeeuw@gmail.com>`; `Tokio Contributors <team@tokio.rs>`.
 - Packaged license, permission, and copyright notices:
   - `LICENSE`: `texts/07919255c7e04793d8ea760d6c2ce32d19f9ff02bdbdde3ce90b1e1880929a9b.txt` (SHA-256 `07919255c7e04793d8ea760d6c2ce32d19f9ff02bdbdde3ce90b1e1880929a9b`).
+
+### `multer` 3.1.0
+- License expression: `MIT`.
+- Locked crate archive SHA-256: `83e87776546dc87511aa5ee218730c92b666d7264ab6ed41f9d215af9cd5224b`.
+- Source archive: `https://static.crates.io/crates/multer/multer-3.1.0.crate`.
+- Repository declared by package metadata: `https://github.com/rwf2/multer`.
+- Authors declared by package metadata: `Rousan Ali <hello@rousan.io>`.
+- Packaged license, permission, and copyright notices:
+  - `LICENSE`: `texts/cfb47b4c5832e5a204d86140ba385e683309e3c82f670e65dfaf491b13c5e2c4.txt` (SHA-256 `cfb47b4c5832e5a204d86140ba385e683309e3c82f670e65dfaf491b13c5e2c4`).
 
 ### `ndarray` 0.17.2
 - License expression: `MIT OR Apache-2.0`.
@@ -723,6 +775,15 @@ locked Cargo metadata and checksum-verified local registry crate archives.
   - `LICENSE-APACHE`: `texts/a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2.txt` (SHA-256 `a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2`).
   - `LICENSE-MIT`: `texts/503558bfefe66ca15e4e3f7955b3cb0ec87fd52f29bf24b336af7bd00e946d5c.txt` (SHA-256 `503558bfefe66ca15e4e3f7955b3cb0ec87fd52f29bf24b336af7bd00e946d5c`).
 
+### `simd-adler32` 0.3.9
+- License expression: `MIT`.
+- Locked crate archive SHA-256: `703d5c7ef118737c72f1af64ad2f6f8c5e1921f818cdcb97b8fe6fc69bf66214`.
+- Source archive: `https://static.crates.io/crates/simd-adler32/simd-adler32-0.3.9.crate`.
+- Repository declared by package metadata: `https://github.com/mcountryman/simd-adler32`.
+- Authors declared by package metadata: `Marvin Countryman <me@maar.vin>`.
+- Packaged license, permission, and copyright notices:
+  - `LICENSE.md`: `texts/42a35170233e83e18856792e748de4c1ce4a63b2afce9a370c89ef3fe23f9f2d.txt` (SHA-256 `42a35170233e83e18856792e748de4c1ce4a63b2afce9a370c89ef3fe23f9f2d`).
+
 ### `slab` 0.4.12
 - License expression: `MIT`.
 - Locked crate archive SHA-256: `0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5`.
@@ -751,6 +812,15 @@ locked Cargo metadata and checksum-verified local registry crate archives.
 - Packaged license, permission, and copyright notices:
   - `LICENSE-APACHE`: `texts/a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2.txt` (SHA-256 `a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2`).
   - `LICENSE-MIT`: `texts/378f5840b258e2779c39418f3f2d7b2ba96f1c7917dd6be0713f88305dbda397.txt` (SHA-256 `378f5840b258e2779c39418f3f2d7b2ba96f1c7917dd6be0713f88305dbda397`).
+
+### `spin` 0.9.9
+- License expression: `MIT`.
+- Locked crate archive SHA-256: `3763264f6b73151db08c50ff20d7d8a0b8796e021cdea7ceedad07b80155fa0e`.
+- Source archive: `https://static.crates.io/crates/spin/spin-0.9.9.crate`.
+- Repository declared by package metadata: `https://github.com/mvdnes/spin-rs.git`.
+- Authors declared by package metadata: `Mathijs van de Nes <git@mathijs.vd-nes.nl>`; `John Ericson <git@JohnEricson.me>`; `Joshua Barretto <joshua.s.barretto@gmail.com>`.
+- Packaged license, permission, and copyright notices:
+  - `LICENSE`: `texts/6ac8711fb340c62ce0a4ecd463342d3fa0e8e70de697c863a2e1c0c53006003c.txt` (SHA-256 `6ac8711fb340c62ce0a4ecd463342d3fa0e8e70de697c863a2e1c0c53006003c`).
 
 ### `symphonia` 0.5.5
 - License expression: `MPL-2.0`.

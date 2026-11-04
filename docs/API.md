@@ -1,7 +1,9 @@
 # API reference
 
-asr-serve exposes one HTTP batch endpoint, one WebSocket streaming endpoint, three probes,
-and Prometheus metrics:
+The `ASR_API_MODE` setting selects one batch API. Native mode (the default) exposes the
+following routes. OpenAI mode replaces the native batch and WebSocket routes with the
+OpenAI-compatible batch and model-list routes described below. Probes and metrics remain
+available in both modes:
 
 | Method | Route | Contract |
 | --- | --- | --- |
@@ -21,6 +23,31 @@ For both request types, a nonempty query string is parsed as unique nonempty key
 pairs after plus/percent decoding to UTF-8. Unknown names, duplicate names, empty values,
 malformed percent escapes, non-UTF-8 decoded text, and values outside the stated domain
 refuse rather than selecting a default.
+
+## OpenAI-compatible batch transcription
+
+Set `ASR_API_MODE=openai` to expose `POST /v1/audio/transcriptions` and `GET /v1/models`.
+Native `/v1/transcribe` and `/v1/stream` are unavailable in this mode. The model list
+contains `gigaam-v3` and `gigaam-v3-ctc`, plus `gigaam-v3-rnnt` when RNN-T is loaded.
+`gigaam-v3` selects CTC. These are local model identifiers.
+
+Send multipart form data with `file` and `model`. The optional `response_format` is
+`json` (default), `text`, or `verbose_json`; `language` must be `ru` when supplied and
+`temperature` must be zero. `timestamp_granularities[]` accepts `word` and `segment`
+only with `verbose_json`; absent granularities default to segments. Streaming and prompts
+are not supported. Unknown, repeated, unsupported, or conflicting fields refuse. The
+six VAD fields in the native table below are also accepted as multipart fields with the
+same defaults and constraints; no `response_version` field is used in this API.
+Multichannel files are averaged to mono before recognition.
+
+Verbose language is `russian`, the declared model language rather than a detection.
+Segment tokens and average log probability come from the retained native greedy decoder
+emissions. `seek` identifies the owning recognition window in centiseconds; segment
+compression ratio uses UTF-8 bytes and zlib DEFLATE level 6. `no_speech_prob` is one
+minus the maximum VAD speech observation over the owning window's real source coverage.
+These scores are native estimates and are not calibrated Whisper confidence values.
+Segment output requires a compatible VAD asset; ordinary formats and word-only verbose
+output do not require the diagnostic detector unless VAD is enabled.
 
 ## HTTP batch transcription
 

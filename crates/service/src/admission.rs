@@ -16,12 +16,45 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ApiMode {
+    Native,
+    OpenAi,
+}
+
+impl ApiMode {
+    pub(crate) fn parse(value: Option<&str>) -> Result<Self, String> {
+        match value {
+            None | Some("native") => Ok(Self::Native),
+            Some("openai") => Ok(Self::OpenAi),
+            Some(_) => Err("ASR_API_MODE must be native or openai".into()),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RecognitionLanguage {
+    Russian,
+}
+
+impl RecognitionLanguage {
+    pub(crate) fn parse(value: Option<&str>) -> Result<Self, String> {
+        match value {
+            None | Some("ru") => Ok(Self::Russian),
+            Some(_) => Err("ASR_LANGUAGE must be ru".into()),
+        }
+    }
+}
+
 /// Validated admission capacities and the complete HTTP work deadline.
 #[derive(Debug)]
 pub struct ServiceAdmission {
     max_http: NonZeroUsize,
     max_ws: NonZeroUsize,
     request_timeout: Duration,
+    api_mode: ApiMode,
+    max_uploads: NonZeroUsize,
+    upload_timeout: Duration,
 }
 
 impl ServiceAdmission {
@@ -43,7 +76,43 @@ impl ServiceAdmission {
             max_http,
             max_ws,
             request_timeout,
+            api_mode: ApiMode::Native,
+            max_uploads: max_http,
+            upload_timeout: request_timeout,
         })
+    }
+
+    pub(crate) fn with_api_policy(mut self, mode: ApiMode, language: RecognitionLanguage) -> Self {
+        self.api_mode = mode;
+        match language {
+            RecognitionLanguage::Russian => {}
+        }
+        self
+    }
+
+    pub(crate) const fn api_mode(&self) -> ApiMode {
+        self.api_mode
+    }
+
+    pub(crate) fn with_uploads(
+        mut self,
+        max_uploads: usize,
+        timeout: Duration,
+    ) -> Result<Self, String> {
+        self.max_uploads = NonZeroUsize::new(max_uploads)
+            .ok_or_else(|| "ASR_MAX_UPLOADS must be a positive integer".to_owned())?;
+        if max_uploads > Semaphore::MAX_PERMITS {
+            return Err("ASR_MAX_UPLOADS exceeds the supported semaphore capacity".into());
+        }
+        if timeout.is_zero() {
+            return Err("ASR_UPLOAD_TIMEOUT_SEC must be a positive integer".into());
+        }
+        self.upload_timeout = timeout;
+        Ok(self)
+    }
+
+    pub(crate) const fn upload_timeout(&self) -> Duration {
+        self.upload_timeout
     }
 
     pub(crate) const fn max_http(&self) -> usize {
@@ -98,6 +167,7 @@ pub(crate) enum AdmissionRefusal {
 pub(crate) struct AdmissionState {
     phase_tx: watch::Sender<AdmissionPhase>,
     http: Arc<Semaphore>,
+    uploads: Arc<Semaphore>,
     ws: Arc<Semaphore>,
     max_http: usize,
     max_ws: usize,
@@ -113,6 +183,7 @@ impl AdmissionState {
         Ok(Self {
             phase_tx,
             http,
+            uploads: Arc::new(Semaphore::new(settings.max_uploads.get())),
             ws,
             max_http,
             max_ws,
@@ -137,11 +208,25 @@ impl AdmissionState {
         });
         if changed {
             self.http.close();
+            self.uploads.close();
             self.ws.close();
             DrainTransition::Began
         } else {
             DrainTransition::AlreadyDraining
         }
+    }
+
+    pub(crate) fn admit_upload(&self) -> Result<OwnedSemaphorePermit, AdmissionRefusal> {
+        if self.phase() == AdmissionPhase::Draining {
+            return Err(AdmissionRefusal::Draining);
+        }
+        let permit = Arc::clone(&self.uploads)
+            .try_acquire_owned()
+            .map_err(|_| self.refusal_after_capacity_failure())?;
+        if self.phase() == AdmissionPhase::Draining {
+            return Err(AdmissionRefusal::Draining);
+        }
+        Ok(permit)
     }
 
     /// Commits HTTP admission only after the second lifecycle read while the permit is owned.
@@ -351,6 +436,34 @@ mod tests {
         let settings = ServiceAdmission::new(http, ws, Duration::from_secs(1))
             .expect("positive admission capacities create a test state");
         AdmissionState::new(&settings).expect("validated settings create admission state")
+    }
+
+    #[test]
+    fn upload_capacity_is_independent_and_drains_with_processing() {
+        let settings = ServiceAdmission::new(1, 1, Duration::from_secs(5))
+            .expect("valid processing limits")
+            .with_uploads(2, Duration::from_secs(3))
+            .expect("valid upload limits");
+        let state = AdmissionState::new(&settings).expect("valid admission state");
+        let first = state.admit_upload().expect("first reader");
+        let second = state.admit_upload().expect("second reader");
+        assert!(matches!(
+            state.admit_upload(),
+            Err(AdmissionRefusal::Overloaded)
+        ));
+        let processing = state
+            .admit_http()
+            .expect("slow readers do not consume processing capacity");
+        drop(first);
+        let replacement = state
+            .admit_upload()
+            .expect("released reader capacity is reusable");
+        assert_eq!(state.begin_draining(), DrainTransition::Began);
+        assert!(matches!(
+            state.admit_upload(),
+            Err(AdmissionRefusal::Draining)
+        ));
+        drop((second, replacement, processing));
     }
 
     #[test]

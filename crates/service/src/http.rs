@@ -23,11 +23,13 @@ use crate::response::{
 use crate::telemetry::TelemetryProducer;
 use axum::Router;
 use axum::body::Bytes;
-use axum::extract::{DefaultBodyLimit, RawQuery, State};
+use axum::extract::{DefaultBodyLimit, FromRequest, Multipart, RawQuery, Request, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::Response;
-use axum::routing::post;
-use gigaam_audio::{ChannelAudioView, EncodedAudio, load_bytes, resample_audio};
+use axum::routing::{get, post};
+use gigaam_audio::{
+    ChannelAudio, ChannelAudioView, DecodedAudio, EncodedAudio, load_bytes, resample_audio,
+};
 use gigaam_recognition::{ExecutionControl, ExecutionState, SpeechProbabilityDetector, Vad};
 use gigaam_transcription::{
     BatchChannelPolicy, BatchSetup, MultiChannelBatchError, MultiChannelBatchOptions,
@@ -45,6 +47,7 @@ pub(crate) struct HttpState {
     metrics: Arc<Metrics>,
     telemetry: TelemetryProducer,
     request_timeout: Duration,
+    upload_timeout: Duration,
     request_body_limit: RequestBodyLimit,
 }
 
@@ -55,6 +58,7 @@ pub(crate) struct HttpStateParameters {
     pub(crate) metrics: Arc<Metrics>,
     pub(crate) telemetry: TelemetryProducer,
     pub(crate) request_timeout: Duration,
+    pub(crate) upload_timeout: Duration,
     pub(crate) request_body_limit: RequestBodyLimit,
 }
 
@@ -66,6 +70,7 @@ impl HttpState {
             metrics,
             telemetry,
             request_timeout,
+            upload_timeout,
             request_body_limit,
         } = parameters;
         Self {
@@ -74,6 +79,7 @@ impl HttpState {
             metrics,
             telemetry,
             request_timeout,
+            upload_timeout,
             request_body_limit,
         }
     }
@@ -93,10 +99,237 @@ pub(crate) fn routes(state: HttpState) -> HttpRoutes {
     let limit = state.request_body_limit.bytes();
     body_limited_routes(
         Router::new()
-            .route("/v1/transcribe", post(transcribe))
+            .route("/v1/transcribe", post(upload_transcribe))
             .with_state(state),
         limit,
     )
+}
+
+pub(crate) fn openai_routes(state: HttpState) -> HttpRoutes {
+    let limit = state.request_body_limit.bytes();
+    body_limited_routes(
+        Router::new()
+            .route("/v1/audio/transcriptions", post(openai_transcribe))
+            .route("/v1/models", get(openai_models))
+            .with_state(state),
+        limit,
+    )
+}
+
+async fn openai_models(State(state): State<HttpState>) -> Response {
+    use crate::json::{Json, obj};
+    let mut names = vec!["gigaam-v3", "gigaam-v3-ctc"];
+    if state.context.capabilities.rnnt.is_some() {
+        names.push("gigaam-v3-rnnt");
+    }
+    let data = names
+        .into_iter()
+        .map(|id| {
+            obj(vec![
+                ("id", Json::str(id)),
+                ("object", Json::str("model")),
+                ("created", Json::Int(0)),
+                ("owned_by", Json::str("local")),
+            ])
+        })
+        .collect();
+    json_ok(
+        obj(vec![
+            ("object", Json::str("list")),
+            ("data", Json::Array(data)),
+        ])
+        .to_string(),
+    )
+}
+
+async fn parse_openai_multipart(
+    state: &HttpState,
+    request: Request,
+) -> Result<crate::openai::Input, crate::openai::ApiError> {
+    let mut multipart = Multipart::from_request(request, state)
+        .await
+        .map_err(|error| crate::openai::ApiError::new(error.status(), error.to_string(), None))?;
+    let mut fields = Vec::new();
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|error| crate::openai::ApiError::new(error.status(), error.to_string(), None))?
+    {
+        let name = field
+            .name()
+            .ok_or_else(|| crate::openai::ApiError::bad("field name is required", None))?
+            .to_owned();
+        let filename = field.file_name().map(str::to_owned);
+        let bytes = field.bytes().await.map_err(|error| {
+            crate::openai::ApiError::new(error.status(), error.to_string(), None)
+        })?;
+        fields.push((name, filename, bytes.to_vec()));
+    }
+    crate::openai::parse_fields(fields, state.context.capabilities.rnnt.is_some())
+}
+
+async fn openai_transcribe(State(state): State<HttpState>, request: Request) -> Response {
+    state.metrics.transcribe();
+    let started = Instant::now();
+    let request_id = match RequestId::from_headers(request.headers()) {
+        Ok(id) => id,
+        Err(error) => {
+            state.metrics.transcribe_error();
+            return crate::openai::ApiError::bad(error, None).response();
+        }
+    };
+    let reader = match state.admission.admit_upload() {
+        Ok(reader) => reader,
+        Err(refusal) => {
+            record_openai_refusal(&state.metrics, refusal);
+            return complete_early_response(&state, &request_id, started, openai_refusal(refusal));
+        }
+    };
+    let mut input = match tokio::time::timeout(
+        state.upload_timeout,
+        parse_openai_multipart(&state, request),
+    )
+    .await
+    {
+        Ok(Ok(input)) => input,
+        Ok(Err(error)) => {
+            state.metrics.transcribe_error();
+            return complete_early_response(&state, &request_id, started, error.response());
+        }
+        Err(_) => {
+            state.metrics.timeout();
+            return complete_early_response(
+                &state,
+                &request_id,
+                started,
+                crate::openai::ApiError::new(StatusCode::REQUEST_TIMEOUT, "upload timeout", None)
+                    .response(),
+            );
+        }
+    };
+    let bytes = input.audio.len();
+    let model = match input.engine {
+        crate::openai::Engine::Ctc => "ctc",
+        crate::openai::Engine::Rnnt => "rnnt",
+    };
+    let admission = match state.admission.admit_http() {
+        Ok(admission) => admission,
+        Err(refusal) => {
+            drop(input);
+            drop(reader);
+            record_openai_refusal(&state.metrics, refusal);
+            return complete_early_response(&state, &request_id, started, openai_refusal(refusal));
+        }
+    };
+    drop(reader);
+    let control = ExecutionControl::for_request();
+    let owner = RequestWorkOwner::new(admission, control.clone());
+    let progress = RequestProgress {
+        telemetry: state.telemetry.clone(),
+        request_id: request_id.text.clone(),
+        started,
+    };
+    progress.observe(BatchProgress::Admitted);
+    let context = Arc::clone(&state.context);
+    let metrics = Arc::clone(&state.metrics);
+    let work_progress = progress.clone();
+    let audio = std::mem::take(&mut input.audio);
+    let execution = AdmittedExecution {
+        owner,
+        control,
+        timeout: state.request_timeout,
+        progress,
+    };
+    let result = execute_admitted_work(execution, move |control| {
+        let query = TranscribeQuery {
+            model: match input.engine {
+                crate::openai::Engine::Ctc => BatchModel::Ctc,
+                crate::openai::Engine::Rnnt => BatchModel::Rnnt,
+            },
+            extension: input.extension.clone(),
+            options: Options::default(),
+            response_version: ResponseVersion::V1,
+            vad: input.vad,
+        };
+        let capabilities = &context.capabilities;
+        let (batch, duration, _, _) = run_batch(
+            BatchWork {
+                context: &context,
+                metrics: &metrics,
+                query: &query,
+                bytes: audio,
+                control,
+                progress: &work_progress,
+            },
+            || Vad::from_pack(&capabilities.pack, capabilities.intra_threads),
+            input.segment,
+            true,
+        )?;
+        work_progress.stage(BatchStage::ResponseProjection, || {
+            crate::openai_response::project(crate::openai_response::ProjectionInput {
+                result: &batch,
+                duration,
+                format: input.format,
+                word: input.word,
+                segment: input.segment,
+                gap: TurnGap::new(query.options.turn_gap).map_err(TranscribeError::BadRequest)?,
+            })
+            .map_err(TranscribeError::Unavailable)
+        })
+    })
+    .await;
+    let response = match result {
+        AdmittedWorkResult::Completed(Ok(response)) => response,
+        AdmittedWorkResult::Completed(Err(error)) => {
+            state.metrics.transcribe_error();
+            crate::openai::ApiError::new(error.status(), error.message(), None).response()
+        }
+        AdmittedWorkResult::WorkerFailure => {
+            state.metrics.transcribe_error();
+            crate::openai::ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "internal worker error",
+                None,
+            )
+            .response()
+        }
+        AdmittedWorkResult::TimedOut => {
+            state.metrics.timeout();
+            crate::openai::ApiError::new(StatusCode::GATEWAY_TIMEOUT, "processing timeout", None)
+                .response()
+        }
+    };
+    state
+        .metrics
+        .observe_latency(started.elapsed().as_secs_f64());
+    let status = response.status().as_u16();
+    complete_admitted_response(
+        response,
+        &state.telemetry,
+        &request_id,
+        crate::log::TranscribeAccess {
+            request_id: request_id.text.clone(),
+            status,
+            milliseconds: started.elapsed().as_millis(),
+            bytes,
+            model: model.to_owned(),
+        },
+    )
+}
+
+fn record_openai_refusal(metrics: &Metrics, refusal: AdmissionRefusal) {
+    match refusal {
+        AdmissionRefusal::Overloaded => metrics.overload(),
+        AdmissionRefusal::Draining => metrics.transcribe_error(),
+    }
+}
+
+fn openai_refusal(refusal: AdmissionRefusal) -> Response {
+    let message = match refusal {
+        AdmissionRefusal::Overloaded => "service overloaded, retry later",
+        AdmissionRefusal::Draining => "draining",
+    };
+    crate::openai::ApiError::new(StatusCode::SERVICE_UNAVAILABLE, message, None).response()
 }
 
 fn body_limited_routes(routes: Router, limit: usize) -> HttpRoutes {
@@ -292,7 +525,7 @@ impl TranscribeQuery {
     }
 }
 
-fn bind_vad_policy(
+pub(crate) fn bind_vad_policy(
     parameters: &QueryParameters,
     version: ResponseVersion,
 ) -> Result<Option<VadPolicyConfig>, String> {
@@ -462,6 +695,17 @@ struct AdmittedExecution {
     progress: RequestProgress,
 }
 
+/// Cancels detached native work when its requesting future disappears.
+struct RequestCancellationGuard(Option<ExecutionControl>);
+
+impl Drop for RequestCancellationGuard {
+    fn drop(&mut self) {
+        if let Some(control) = self.0.take() {
+            control.request_cancellation();
+        }
+    }
+}
+
 /// The production execution seam retains the admission owner inside blocking work until it
 /// terminalizes, even after the HTTP deadline has returned a timeout response.
 async fn execute_admitted_work<T, F>(execution: AdmittedExecution, work: F) -> AdmittedWorkResult<T>
@@ -475,6 +719,7 @@ where
         timeout,
         progress,
     } = execution;
+    let mut cancellation_guard = RequestCancellationGuard(Some(control.clone()));
     let work_control = control.clone();
     let work_progress = progress.clone();
     let job = tokio::task::spawn_blocking(move || {
@@ -503,7 +748,7 @@ where
             }
         }
     });
-    match tokio::time::timeout(timeout, job).await {
+    let result = match tokio::time::timeout(timeout, job).await {
         Ok(Ok(result)) => AdmittedWorkResult::Completed(result),
         Ok(Err(_)) => AdmittedWorkResult::WorkerFailure,
         Err(_) => {
@@ -511,7 +756,9 @@ where
             progress.observe(BatchProgress::DeadlineElapsed(state));
             AdmittedWorkResult::TimedOut
         }
-    }
+    };
+    cancellation_guard.0 = None;
+    result
 }
 
 /// Resolves capacity before response projection so no rejected request can start work.
@@ -570,12 +817,118 @@ fn complete_admitted_response(
     with_request_id(response, request_id)
 }
 
+fn complete_early_response(
+    state: &HttpState,
+    request_id: &RequestId,
+    started: Instant,
+    response: Response,
+) -> Response {
+    state
+        .metrics
+        .observe_latency(started.elapsed().as_secs_f64());
+    let status = response.status().as_u16();
+    complete_admitted_response(
+        response,
+        &state.telemetry,
+        request_id,
+        crate::log::TranscribeAccess {
+            request_id: request_id.text.clone(),
+            status,
+            milliseconds: started.elapsed().as_millis(),
+            bytes: 0,
+            model: "unknown".into(),
+        },
+    )
+}
+
+async fn upload_transcribe(State(state): State<HttpState>, request: Request) -> Response {
+    let started = Instant::now();
+    let request_id = match RequestId::from_headers(request.headers()) {
+        Ok(id) => id,
+        Err(error) => {
+            state.metrics.transcribe();
+            state.metrics.transcribe_error();
+            return json_err(StatusCode::BAD_REQUEST, error);
+        }
+    };
+    let query = match TranscribeQuery::parse(request.uri().query()) {
+        Ok(query) => query,
+        Err(error) => {
+            state.metrics.transcribe();
+            state.metrics.transcribe_error();
+            return complete_early_response(
+                &state,
+                &request_id,
+                started,
+                json_err(StatusCode::BAD_REQUEST, error),
+            );
+        }
+    };
+    let reader = match state.admission.admit_upload() {
+        Ok(reader) => reader,
+        Err(refusal) => {
+            state.metrics.transcribe();
+            let response = http_admission_refusal(
+                refusal,
+                &state.metrics,
+                &request_id,
+                query.response_version,
+            );
+            return complete_early_response(&state, &request_id, started, response);
+        }
+    };
+    let (parts, body) = request.into_parts();
+    let headers = parts.headers.clone();
+    let query = parts.uri.query().map(str::to_owned);
+    let request = Request::from_parts(parts, body);
+    let body = match tokio::time::timeout(
+        state.upload_timeout,
+        Bytes::from_request(request, &state),
+    )
+    .await
+    {
+        Ok(Ok(body)) => body,
+        Ok(Err(rejection)) => {
+            state.metrics.transcribe();
+            state.metrics.transcribe_error();
+            return complete_early_response(
+                &state,
+                &request_id,
+                started,
+                axum::response::IntoResponse::into_response(rejection),
+            );
+        }
+        Err(_) => {
+            state.metrics.transcribe();
+            state.metrics.timeout();
+            return complete_early_response(
+                &state,
+                &request_id,
+                started,
+                json_err(StatusCode::REQUEST_TIMEOUT, "upload timeout"),
+            );
+        }
+    };
+    transcribe_inner(State(state), headers, RawQuery(query), body, Some(reader)).await
+}
+
 /// Adapts a validated batch request while the admission owner retains capacity through completion.
+#[cfg(test)]
 pub(crate) async fn transcribe(
     State(state): State<HttpState>,
     headers: HeaderMap,
     RawQuery(query_text): RawQuery,
     body: Bytes,
+) -> Response {
+    transcribe_inner(State(state), headers, RawQuery(query_text), body, None).await
+}
+
+async fn transcribe_inner(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    RawQuery(query_text): RawQuery,
+    body: Bytes,
+    reader: Option<tokio::sync::OwnedSemaphorePermit>,
 ) -> Response {
     state.metrics.transcribe();
     let started = Instant::now();
@@ -585,11 +938,15 @@ pub(crate) async fn transcribe(
         Ok(request_id) => request_id,
         Err(error) => {
             metrics.transcribe_error();
+            drop(body);
+            drop(reader);
             return json_err(StatusCode::BAD_REQUEST, error);
         }
     };
     if body.is_empty() {
         metrics.transcribe_error();
+        drop(body);
+        drop(reader);
         return with_request_id(
             json_err(StatusCode::BAD_REQUEST, "empty body: audio expected"),
             &request_id,
@@ -599,6 +956,8 @@ pub(crate) async fn transcribe(
         Ok(query) => query,
         Err(error) => {
             metrics.transcribe_error();
+            drop(body);
+            drop(reader);
             return with_request_id(json_err(StatusCode::BAD_REQUEST, error), &request_id);
         }
     };
@@ -607,6 +966,8 @@ pub(crate) async fn transcribe(
     let admission = match resolve_http_admission(state.admission.as_ref()) {
         HttpAdmissionDecision::Admitted(admission) => admission,
         HttpAdmissionDecision::Refused(refusal) => {
+            drop(body);
+            drop(reader);
             return http_admission_refusal(
                 refusal,
                 metrics.as_ref(),
@@ -615,6 +976,7 @@ pub(crate) async fn transcribe(
             );
         }
     };
+    drop(reader);
     let control = ExecutionControl::for_request();
     let owner = RequestWorkOwner::new(admission, control.clone());
     let progress = RequestProgress {
@@ -708,6 +1070,37 @@ fn do_transcribe_with_vad_factory<D: SpeechProbabilityDetector>(
     work: BatchWork<'_>,
     factory: impl FnOnce() -> Result<D, String>,
 ) -> Result<String, TranscribeError> {
+    let query = work.query;
+    let progress = work.progress;
+    let (result, duration, source_rate, rtf) = run_batch(work, factory, false, false)?;
+    let options = query.options;
+    progress.stage(BatchStage::ResponseProjection, || {
+        let response = transcribe_response(ResponseInput {
+            contract: ResponseContract {
+                version: query.response_version,
+                vad: query.vad,
+            },
+            channels: result.channels(),
+            segments: result.segments(),
+            turns: result.turns(),
+            options,
+            duration_sec: duration,
+            sample_rate_in: source_rate,
+            source_channels: result.source_channels(),
+            duplicate: result.duplicate(),
+            model: query.model.as_str(),
+            rtf,
+        });
+        Ok(response.to_string())
+    })
+}
+
+fn run_batch<D: SpeechProbabilityDetector>(
+    work: BatchWork<'_>,
+    factory: impl FnOnce() -> Result<D, String>,
+    scored: bool,
+    downmix: bool,
+) -> Result<(MultiChannelBatchResult, f32, u32, f32), TranscribeError> {
     let BatchWork {
         context,
         metrics,
@@ -722,7 +1115,7 @@ fn do_transcribe_with_vad_factory<D: SpeechProbabilityDetector>(
             TranscribeError::UnsupportedCapability("rnnt model is not loaded".into())
         })?,
     };
-    if query.vad.is_some() {
+    if query.vad.is_some() || scored {
         if context
             .capabilities
             .frontend
@@ -761,6 +1154,7 @@ fn do_transcribe_with_vad_factory<D: SpeechProbabilityDetector>(
         resample_audio(loaded, context.capabilities.frontend.sample_rate())
             .map_err(TranscribeError::BadRequest)
     })?;
+    let audio = if downmix { mono_downmix(audio)? } else { audio };
     let options = query.options;
     let channel_policy = http_batch_channel_policy(options);
     let turn_gap = TurnGap::new(options.turn_gap).map_err(TranscribeError::BadRequest)?;
@@ -777,11 +1171,21 @@ fn do_transcribe_with_vad_factory<D: SpeechProbabilityDetector>(
     ))
     .map_err(TranscribeError::Unavailable)?;
     let started = Instant::now();
-    let result = match query.vad {
-        None => progress.stage(BatchStage::BatchTranscription, || {
+    let result = match (query.vad, scored) {
+        (policy, true) => {
+            let mut detector = request_vad(factory, control, progress)?;
+            let result = progress.stage(BatchStage::BatchTranscription, || {
+                complete_multi_channel_batch(metrics, || {
+                    transcriber.transcribe_scored(&audio, &mut detector, policy)
+                })
+            })?;
+            metrics.observe_vad(result.timings().vad_seconds());
+            result
+        }
+        (None, false) => progress.stage(BatchStage::BatchTranscription, || {
             complete_multi_channel_batch(metrics, || transcriber.transcribe(&audio))
         })?,
-        Some(policy) => {
+        (Some(policy), false) => {
             let mut detector = request_vad(factory, control, progress)?;
             let result = progress.stage(BatchStage::BatchTranscription, || {
                 complete_multi_channel_batch(metrics, || {
@@ -794,25 +1198,24 @@ fn do_transcribe_with_vad_factory<D: SpeechProbabilityDetector>(
     };
     let duration = audio.duration_seconds();
     let rtf = started.elapsed().as_secs_f32() / duration.max(1e-6);
-    progress.stage(BatchStage::ResponseProjection, || {
-        let response = transcribe_response(ResponseInput {
-            contract: ResponseContract {
-                version: query.response_version,
-                vad: query.vad,
-            },
-            channels: result.channels(),
-            segments: result.segments(),
-            turns: result.turns(),
-            options,
-            duration_sec: duration,
-            sample_rate_in: source_rate,
-            source_channels: result.source_channels(),
-            duplicate: result.duplicate(),
-            model: query.model.as_str(),
-            rtf,
-        });
-        Ok(response.to_string())
-    })
+    Ok((result, duration, source_rate, rtf))
+}
+
+fn mono_downmix(audio: DecodedAudio) -> Result<DecodedAudio, TranscribeError> {
+    if audio.channels().len() == 1 {
+        return Ok(audio);
+    }
+    let count = u16::try_from(audio.channels().len())
+        .map_err(|_| TranscribeError::BadRequest("too many source channels".into()))?;
+    let divisor = f32::from(count);
+    let mut samples = vec![0.0; audio.frames()];
+    for channel in audio.channels() {
+        for (mixed, sample) in samples.iter_mut().zip(channel.samples()) {
+            *mixed += *sample / divisor;
+        }
+    }
+    let mono = ChannelAudio::new(samples).map_err(TranscribeError::BadRequest)?;
+    DecodedAudio::new(audio.sample_rate(), vec![mono]).map_err(TranscribeError::BadRequest)
 }
 
 fn vad_checkpoint(control: &ExecutionControl) -> Result<(), TranscribeError> {
@@ -1419,6 +1822,7 @@ mod tests {
             metrics,
             telemetry,
             request_timeout: Duration::from_secs(1),
+            upload_timeout: Duration::from_secs(1),
             request_body_limit: RequestBodyLimit::new(8_192)?,
         }))
     }
@@ -2006,6 +2410,346 @@ mod tests {
         assert_eq!(lines.len(), 1);
         assert_phase(&lines[0], "work", "terminal");
         assert!(lines[0].contains("\"execution_state\":\"cancelled\""));
+    }
+
+    #[tokio::test]
+    async fn openai_processing_timeout_returns_504_and_counts_once() -> Result<(), String> {
+        let fixture = crate::tests::assembly_fixture()?;
+        let telemetry = test_support::prepare(32, 1)?;
+        let admission = Arc::new(AdmissionState::new(&ServiceAdmission::new(
+            1,
+            1,
+            Duration::from_secs(5),
+        )?)?);
+        let metrics = telemetry.metrics_arc();
+        let mut state = state_with_telemetry(
+            &fixture,
+            Arc::clone(&admission),
+            Arc::clone(&metrics),
+            telemetry.producer(),
+        )?;
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+        let context = Arc::get_mut(&mut state.context).ok_or("test context has an extra owner")?;
+        context.capabilities.ctc = Arc::new(ExecutionScheduler::spawn(ControlledDecoder {
+            started: Some(started_tx),
+            release: release_rx,
+        }));
+        state.request_timeout = Duration::from_millis(100);
+        let mut multipart = b"--boundary\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\ngigaam-v3\r\n--boundary\r\nContent-Disposition: form-data; name=\"file\"; filename=\"silence.wav\"\r\n\r\n".to_vec();
+        multipart.extend(crate::tests::pcm16_wav_silence(8000, 640)?);
+        multipart.extend(b"\r\n--boundary--\r\n");
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/audio/transcriptions")
+            .header("content-type", "multipart/form-data; boundary=boundary")
+            .body(axum::body::Body::from(multipart))
+            .map_err(|e| e.to_string())?;
+        let task = tokio::spawn(openai_transcribe(State(state), request));
+        started_rx.await.map_err(|e| e.to_string())?;
+        let response = task.await.map_err(|e| e.to_string())?;
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(metric_counter(&metrics, "asr_timeout_total"), 1);
+        assert_eq!(admission.available_http(), 0);
+        release_tx.send(()).map_err(|e| e.to_string())?;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while admission.available_http() != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn openai_multipart_runs_through_shared_batch_executor() -> Result<(), String> {
+        let fixture = crate::tests::assembly_fixture()?;
+        let telemetry = test_support::prepare(32, 1)?;
+        let settings = ServiceAdmission::new(1, 1, Duration::from_secs(5))?;
+        let admission = Arc::new(AdmissionState::new(&settings)?);
+        let state = state_with_telemetry(
+            &fixture,
+            admission,
+            telemetry.metrics_arc(),
+            telemetry.producer(),
+        )?;
+        let mut multipart = b"--boundary\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\ngigaam-v3\r\n--boundary\r\nContent-Disposition: form-data; name=\"file\"; filename=\"silence.wav\"\r\nContent-Type: audio/wav\r\n\r\n".to_vec();
+        multipart.extend(crate::tests::pcm16_wav_silence(8000, 640)?);
+        multipart.extend(b"\r\n--boundary--\r\n");
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/audio/transcriptions")
+            .header("content-type", "multipart/form-data; boundary=boundary")
+            .body(axum::body::Body::from(multipart))
+            .map_err(|e| e.to_string())?;
+        let response = openai_transcribe(State(state), request).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 8192)
+            .await
+            .map_err(|e| e.to_string())?;
+        assert_eq!(&bytes[..], b"{\"text\":\"\"}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn early_protocol_failures_count_requests_and_errors_once() -> Result<(), String> {
+        let fixture = crate::tests::assembly_fixture()?;
+        let telemetry = test_support::prepare(32, 1)?;
+        let admission = Arc::new(AdmissionState::new(&ServiceAdmission::new(
+            1,
+            1,
+            Duration::from_secs(5),
+        )?)?);
+        let metrics = telemetry.metrics_arc();
+        let state = state_with_telemetry(
+            &fixture,
+            admission,
+            Arc::clone(&metrics),
+            telemetry.producer(),
+        )?;
+        let native = Request::builder()
+            .uri("/v1/transcribe?unknown=x")
+            .body(axum::body::Body::empty())
+            .map_err(|e| e.to_string())?;
+        assert_eq!(
+            upload_transcribe(State(state.clone()), native)
+                .await
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+        let openai = Request::builder()
+            .uri("/v1/audio/transcriptions")
+            .body(axum::body::Body::empty())
+            .map_err(|e| e.to_string())?;
+        assert_eq!(
+            openai_transcribe(State(state), openai).await.status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(metric_counter(&metrics, "asr_transcribe_requests_total"), 2);
+        assert_eq!(metric_counter(&metrics, "asr_transcribe_errors_total"), 2);
+        assert_eq!(
+            histogram_count(&metrics, "asr_transcribe_latency_seconds"),
+            2
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn multipart_body_limits_preserve_413_for_headers_and_file() -> Result<(), String> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let fixture = crate::tests::assembly_fixture()?;
+        let telemetry = test_support::prepare(32, 1)?;
+        let admission = Arc::new(AdmissionState::new(&ServiceAdmission::new(
+            1,
+            1,
+            Duration::from_secs(5),
+        )?)?);
+        let mut state = state_with_telemetry(
+            &fixture,
+            admission,
+            telemetry.metrics_arc(),
+            telemetry.producer(),
+        )?;
+        state.request_body_limit = RequestBodyLimit::new(128)?;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .map_err(|e| e.to_string())?;
+        let address = listener.local_addr().map_err(|e| e.to_string())?;
+        let server =
+            tokio::spawn(
+                async move { axum::serve(listener, openai_routes(state).into_router()).await },
+            );
+        async fn send(address: std::net::SocketAddr, body: &[u8]) -> Result<String, String> {
+            let mut stream = tokio::net::TcpStream::connect(address)
+                .await
+                .map_err(|e| e.to_string())?;
+            let header = format!(
+                "POST /v1/audio/transcriptions HTTP/1.1\r\nHost: {address}\r\nContent-Type: multipart/form-data; boundary=b\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream
+                .write_all(header.as_bytes())
+                .await
+                .map_err(|e| e.to_string())?;
+            stream.write_all(body).await.map_err(|e| e.to_string())?;
+            let mut response = Vec::new();
+            stream
+                .read_to_end(&mut response)
+                .await
+                .map_err(|e| e.to_string())?;
+            String::from_utf8(response).map_err(|e| e.to_string())
+        }
+        let header_limit = format!("--b\r\nX-Long: {}\r\n\r\n", "x".repeat(180));
+        let file_limit = format!(
+            "--b\r\nContent-Disposition: form-data; name=\"file\"; filename=\"x.wav\"\r\n\r\n{}\r\n--b--\r\n",
+            "x".repeat(180)
+        );
+        for body in [header_limit.as_bytes(), file_limit.as_bytes()] {
+            let response = send(address, body).await?;
+            assert!(response.starts_with("HTTP/1.1 413"), "{response}");
+        }
+        let malformed = send(address, b"--b\r\nmalformed\r\n\r\n").await?;
+        assert!(malformed.starts_with("HTTP/1.1 400"), "{malformed}");
+        server.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn full_upload_capacity_refuses_v2_without_reading_body() -> Result<(), String> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let fixture = crate::tests::assembly_fixture()?;
+        let telemetry = test_support::prepare(16, 1)?;
+        let settings = ServiceAdmission::new(1, 1, Duration::from_secs(5))?;
+        let admission = Arc::new(AdmissionState::new(&settings)?);
+        let reader = admission.admit_upload().map_err(|_| "reader capacity")?;
+        let mut state = state_with_telemetry(
+            &fixture,
+            Arc::clone(&admission),
+            telemetry.metrics_arc(),
+            telemetry.producer(),
+        )?;
+        state.upload_timeout = Duration::from_millis(100);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .map_err(|e| e.to_string())?;
+        let address = listener.local_addr().map_err(|e| e.to_string())?;
+        let server =
+            tokio::spawn(async move { axum::serve(listener, routes(state).into_router()).await });
+        let mut stream = tokio::net::TcpStream::connect(address)
+            .await
+            .map_err(|e| e.to_string())?;
+        stream.write_all(format!("POST /v1/transcribe?response_version=2 HTTP/1.1\r\nHost: {address}\r\nContent-Length: 100\r\nConnection: close\r\n\r\n").as_bytes()).await.map_err(|e| e.to_string())?;
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(2), stream.read_to_end(&mut response))
+            .await
+            .map_err(|e| e.to_string())?
+            .map_err(|e| e.to_string())?;
+        let text = String::from_utf8(response).map_err(|e| e.to_string())?;
+        assert!(text.starts_with("HTTP/1.1 503"), "{text}");
+        assert!(text.contains("\"code\":\"overloaded\""), "{text}");
+        let mut invalid = tokio::net::TcpStream::connect(address)
+            .await
+            .map_err(|e| e.to_string())?;
+        invalid.write_all(format!("POST /v1/transcribe?response_version=2&unknown=x HTTP/1.1\r\nHost: {address}\r\nContent-Length: 100\r\nConnection: close\r\n\r\n").as_bytes()).await.map_err(|e| e.to_string())?;
+        let mut invalid_response = Vec::new();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            invalid.read_to_end(&mut invalid_response),
+        )
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())?;
+        let invalid_text = String::from_utf8(invalid_response).map_err(|e| e.to_string())?;
+        assert!(invalid_text.starts_with("HTTP/1.1 400"), "{invalid_text}");
+        assert!(!invalid_text.contains("\"code\""), "{invalid_text}");
+        drop(reader);
+        let mut slow = tokio::net::TcpStream::connect(address)
+            .await
+            .map_err(|e| e.to_string())?;
+        slow.write_all(format!("POST /v1/transcribe HTTP/1.1\r\nHost: {address}\r\nContent-Length: 100\r\nConnection: close\r\n\r\n").as_bytes()).await.map_err(|e| e.to_string())?;
+        let mut timeout_response = Vec::new();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            slow.read_to_end(&mut timeout_response),
+        )
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())?;
+        let timeout_text = String::from_utf8(timeout_response).map_err(|e| e.to_string())?;
+        assert!(timeout_text.starts_with("HTTP/1.1 408"), "{timeout_text}");
+        let mut next = tokio::net::TcpStream::connect(address)
+            .await
+            .map_err(|e| e.to_string())?;
+        next.write_all(format!("POST /v1/transcribe HTTP/1.1\r\nHost: {address}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes()).await.map_err(|e| e.to_string())?;
+        let mut next_response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(2), next.read_to_end(&mut next_response))
+            .await
+            .map_err(|e| e.to_string())?
+            .map_err(|e| e.to_string())?;
+        let next_text = String::from_utf8(next_response).map_err(|e| e.to_string())?;
+        assert!(
+            next_text.starts_with("HTTP/1.1 400"),
+            "reader released after timeout: {next_text}"
+        );
+        let mut disconnected = tokio::net::TcpStream::connect(address)
+            .await
+            .map_err(|e| e.to_string())?;
+        disconnected.write_all(format!("POST /v1/transcribe HTTP/1.1\r\nHost: {address}\r\nContent-Length: 100\r\n\r\nx").as_bytes()).await.map_err(|e| e.to_string())?;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match admission.admit_upload() {
+                    Ok(reader) => drop(reader),
+                    Err(_) => break,
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+        drop(disconnected);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Ok(reader) = admission.admit_upload() {
+                    drop(reader);
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+        server.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dropped_request_cancels_work_but_retains_capacity_until_acknowledged()
+    -> Result<(), String> {
+        let settings = ServiceAdmission::new(1, 1, Duration::from_secs(5))?;
+        let admission = Arc::new(AdmissionState::new(&settings)?);
+        let control = ExecutionControl::for_request();
+        let owner = RequestWorkOwner::new(
+            admission.admit_http().map_err(|_| "admit work")?,
+            control.clone(),
+        );
+        let telemetry = test_support::prepare(16, 1)?;
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+        let execution = AdmittedExecution {
+            owner,
+            control: control.clone(),
+            timeout: Duration::from_secs(5),
+            progress: RequestProgress {
+                telemetry: telemetry.producer(),
+                request_id: "dropped-request".into(),
+                started: Instant::now(),
+            },
+        };
+        let task = tokio::spawn(execute_admitted_work(execution, move |_| {
+            started_tx
+                .send(())
+                .map_err(|_| TranscribeError::Unavailable("start observer dropped".into()))?;
+            release_rx
+                .recv()
+                .map_err(|_| TranscribeError::Unavailable("release dropped".into()))?;
+            Ok::<_, TranscribeError>(())
+        }));
+        started_rx.await.map_err(|error| error.to_string())?;
+        task.abort();
+        let _ = task.await;
+        assert_eq!(control.state(), ExecutionState::CancelRequested);
+        assert_eq!(admission.available_http(), 0);
+        release_tx.send(()).map_err(|error| error.to_string())?;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while admission.available_http() != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+        assert_eq!(control.state(), ExecutionState::Cancelled);
+        Ok(())
     }
 
     fn metric_counter(metrics: &Metrics, name: &str) -> u64 {
