@@ -22,6 +22,8 @@ pub struct ServiceAdmission {
     max_http: NonZeroUsize,
     max_ws: NonZeroUsize,
     request_timeout: Duration,
+    max_uploads: NonZeroUsize,
+    upload_timeout: Duration,
 }
 
 impl ServiceAdmission {
@@ -43,7 +45,13 @@ impl ServiceAdmission {
             max_http,
             max_ws,
             request_timeout,
+            max_uploads: max_http,
+            upload_timeout: request_timeout,
         })
+    }
+
+    pub(crate) const fn upload_timeout(&self) -> Duration {
+        self.upload_timeout
     }
 
     pub(crate) const fn max_http(&self) -> usize {
@@ -98,6 +106,7 @@ pub(crate) enum AdmissionRefusal {
 pub(crate) struct AdmissionState {
     phase_tx: watch::Sender<AdmissionPhase>,
     http: Arc<Semaphore>,
+    uploads: Arc<Semaphore>,
     ws: Arc<Semaphore>,
     max_http: usize,
     max_ws: usize,
@@ -113,6 +122,7 @@ impl AdmissionState {
         Ok(Self {
             phase_tx,
             http,
+            uploads: Arc::new(Semaphore::new(settings.max_uploads.get())),
             ws,
             max_http,
             max_ws,
@@ -137,11 +147,25 @@ impl AdmissionState {
         });
         if changed {
             self.http.close();
+            self.uploads.close();
             self.ws.close();
             DrainTransition::Began
         } else {
             DrainTransition::AlreadyDraining
         }
+    }
+
+    pub(crate) fn admit_upload(&self) -> Result<OwnedSemaphorePermit, AdmissionRefusal> {
+        if self.phase() == AdmissionPhase::Draining {
+            return Err(AdmissionRefusal::Draining);
+        }
+        let permit = Arc::clone(&self.uploads)
+            .try_acquire_owned()
+            .map_err(|_| self.refusal_after_capacity_failure())?;
+        if self.phase() == AdmissionPhase::Draining {
+            return Err(AdmissionRefusal::Draining);
+        }
+        Ok(permit)
     }
 
     /// Commits HTTP admission only after the second lifecycle read while the permit is owned.

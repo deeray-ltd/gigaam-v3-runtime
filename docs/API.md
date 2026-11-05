@@ -22,6 +22,15 @@ pairs after plus/percent decoding to UTF-8. Unknown names, duplicate names, empt
 malformed percent escapes, non-UTF-8 decoded text, and values outside the stated domain
 refuse rather than selecting a default.
 
+## OpenAI-compatible batch transcription
+
+`POST /v1/audio/transcriptions` accepts multipart form data with `file` and `model`.
+`gigaam-v3` and `gigaam-v3-ctc` select CTC; `gigaam-v3-rnnt` selects a loaded RNN-T
+model. `GET /v1/models` lists available local models. Supported response formats are
+`json`, `text`, and `verbose_json`; word and segment timestamps can be requested for
+verbose output. Language, when supplied, must be `ru`, and temperature must be zero.
+Streaming and nonempty prompts are unsupported. Native endpoints remain available.
+
 ## HTTP batch transcription
 
 ### POST /v1/transcribe

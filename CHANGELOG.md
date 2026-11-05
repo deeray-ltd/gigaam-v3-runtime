@@ -6,6 +6,10 @@ All notable changes are recorded here. Pre-1.0 releases do not promise a stable 
 
 ### Added
 
+- OpenAI-compatible multipart batch transcription and model-list routes alongside
+  the existing native API, with JSON, text, and verbose responses.
+
+
 - Complete existing WebSocket stream-policy controls, bound before upgrade at the model
   rate. Optional `applied_config` adds a versioned bound-policy event before transcript
   events while preserving default output, active shutdown precedence, and session ownership.

@@ -25,7 +25,7 @@ gigaam-primitives = { path = "../primitives" }
 gigaam-audio = { path = "../audio", features = ["decoders"] }
 gigaam-recognition = { path = "../recognition", default-features = false }
 gigaam-transcription = { path = "../transcription" }
-axum = { version = "0.8.9", features = ["ws"] }
+axum = { version = "0.8.9", features = ["ws", "multipart"] }
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "net", "io-util", "signal", "sync", "time"] }
 tungstenite = { version = "0.29.0", default-features = false }
 # Axum provides the HTTP/WebSocket routes, while Tokio owns the asynchronous runtime, networking, and graceful shutdown.

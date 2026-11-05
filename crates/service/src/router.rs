@@ -30,7 +30,8 @@ pub(crate) fn router(parameters: RouterParameters) -> Router {
         metrics,
     } = parameters;
     Router::new()
-        .merge(http::routes(http).into_router())
+        .merge(http::routes(http.clone()).into_router())
+        .merge(http::openai_routes(http).into_router())
         .route("/v1/stream", get(ws::stream).with_state(ws))
         .route("/health", get(health::health).with_state(health.clone()))
         .route("/livez", get(health::livez))

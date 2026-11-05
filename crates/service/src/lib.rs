@@ -18,6 +18,8 @@ mod json;
 mod lifecycle;
 mod log;
 mod metrics;
+mod openai;
+mod openai_response;
 mod protocol;
 mod response;
 mod router;
@@ -78,6 +80,7 @@ struct StartedAssembly {
     metrics: Arc<metrics::Metrics>,
     producer: telemetry::TelemetryProducer,
     request_timeout: Duration,
+    upload_timeout: Duration,
     request_body_limit: RequestBodyLimit,
 }
 
@@ -165,6 +168,7 @@ impl ServiceApplication {
             telemetry,
         } = unstarted;
         let request_timeout = admission_settings.request_timeout();
+        let upload_timeout = admission_settings.upload_timeout();
         let admission = Arc::new(AdmissionState::new(&admission_settings)?);
         let context = Arc::new(ApplicationContext::new(capabilities, policy)?);
         if !telemetry.matches_admission(&admission_settings, admission.as_ref()) {
@@ -177,6 +181,7 @@ impl ServiceApplication {
             metrics,
             producer,
             request_timeout,
+            upload_timeout,
             request_body_limit,
         })
     }
@@ -189,6 +194,7 @@ impl ServiceApplication {
             metrics,
             producer,
             request_timeout,
+            upload_timeout,
             request_body_limit,
         } = started;
         let gauges: Arc<dyn RuntimeGaugeSource> = Arc::new(ServiceRuntimeGaugeSource {
@@ -212,6 +218,7 @@ impl ServiceApplication {
                 metrics: Arc::clone(&metrics),
                 telemetry: producer.clone(),
                 request_timeout,
+                upload_timeout,
                 request_body_limit,
             }),
             ws: ws::WsState::new(

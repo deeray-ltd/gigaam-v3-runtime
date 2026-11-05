@@ -12,7 +12,7 @@ explicit shared-library path.
 
 ## What it provides
 
-- HTTP batch transcription through asr-serve.
+- HTTP batch transcription through asr-serve, including an OpenAI-compatible transcription/model-list subset.
 - WebSocket CTC streaming with tail revisions, stable/final frontiers, and multichannel
   dialog turn patches.
 - Offline commands through asr: transcribe, bench, stream, vad, and dialog.
@@ -64,6 +64,8 @@ curl --data-binary @audio.wav \
   'http://127.0.0.1:8080/v1/transcribe?model=ctc&words=true'
 ~~~
 
+The service also accepts OpenAI Python SDK transcription requests at `/v1/audio/transcriptions` (supported model IDs and fields are documented in [docs/API.md](docs/API.md)). The SDK bearer token is not authenticated; bind locally or place the service behind a trusted ingress.
+
 This quick start is CPU-only. Default-feature Service and CLI builds select CUDA and require
 role-specific verified CTC/RNN-T assignment fingerprints. Explicit
 `ASR_CUDA_ASSIGNMENT_POLICY=allow-unverified` is only for collecting initial assignment evidence;
@@ -86,7 +88,7 @@ They contain no model; mount a version-1 model package read-only at /app/model:
 ~~~sh
 docker pull deerayltd/asr:0.1.0-cpu
 
-docker run --rm -p 8080:8080 \
+docker run --rm -p 127.0.0.1:8080:8080 \
   --mount type=bind,src="$PWD/model",dst=/app/model,readonly \
   deerayltd/asr:0.1.0-cpu
 ~~~
@@ -105,7 +107,7 @@ read-only model mount at /app/model.
 docker buildx build --load --platform linux/amd64 \
   -f Dockerfile.cpu -t gigaam-v3-runtime:cpu .
 
-docker run --rm -p 8080:8080 \
+docker run --rm -p 127.0.0.1:8080:8080 \
   --mount type=bind,src="$PWD/model",dst=/app/model,readonly \
   gigaam-v3-runtime:cpu
 ~~~

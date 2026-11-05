@@ -5,7 +5,7 @@
 asr-serve loads ONNX Runtime dynamically. Supply one regular ONNX Runtime library through
 --ort-dylib or ORT_DYLIB_PATH; at least one is required, and both must name the same path
 when present. The process validates the selected file before model/session construction.
-LD_LIBRARY_PATH must make its selected sibling provider libraries visible.
+LD_LIBRARY_PATH must make its selected sibling provider libraries visible. The service has no built-in authentication; the OpenAI-compatible SDK bearer token is ignored. Prefer binding Docker to `127.0.0.1:8080:8080` and do not expose the service publicly without an authenticated, TLS-protected ingress covering every route.
 
 The model package is external. Its directory must contain a valid version-1 config.kv and
 the artifacts selected by the process configuration. A missing or invalid package refuses
