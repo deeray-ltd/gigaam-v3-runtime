@@ -27,7 +27,7 @@ mod vad_policy;
 #[cfg(test)]
 mod test_support;
 
-pub use batch::{BatchSetup, BatchTranscriber};
+pub use batch::{BatchSetup, BatchTranscriber, subsampling_factor};
 pub use channel_selection::{
     BatchChannelPolicy, BatchChannelSelection, ChannelSelection, CorrelationThreshold,
     DuplicateClassification, OriginalChannel, PairwiseChannelPolicy, SelectionWindowSamples,
@@ -53,7 +53,10 @@ pub use multi_stream::{
     OfflineDialogSetupInput, StreamChannelFactory, TranscriptionObservation,
     transcribe_offline_dialog,
 };
-pub use observations::{ObservationMode, WindowTiming, WindowTimingObserver};
+pub use observations::{
+    ObservationMode, WindowEvidence, WindowEvidenceObserver, WindowKind, WindowTiming,
+    WindowTimingObserver,
+};
 pub use stitch::{
     Seam, Window, WindowWords, seam, stitch_aligned, window_shapes, windows, windows_bucketed,
     words_to_text,

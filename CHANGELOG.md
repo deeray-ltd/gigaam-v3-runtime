@@ -8,6 +8,12 @@ All notable changes are recorded here. Pre-1.0 releases do not promise a stable 
 
 - OCI image labels (title, description, source, url, documentation, vendor, licenses, version)
   on the CPU, CUDA, and TensorRT image definitions.
+- `transcribe --evidence PATH`, an opt-in per-window decode-evidence file (raw CTC labels,
+  non-emission mask, and collapsed tokens alongside each window's geometry) for CTC
+  transcription; the transcript is unchanged whether or not it is used.
+- A `words` line in `transcribe --evidence` output, recording the token-index span the decoder's
+  own word rule assigned to each decoded word, so an external reader can check its word grouping
+  against the decoder's without re-implementing the rule.
 
 ## 0.1.0 - 2026-09-03
 

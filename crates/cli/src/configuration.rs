@@ -109,6 +109,30 @@ fn trace_mode_from(value: Option<&str>) -> Result<TraceMode, String> {
     }
 }
 
+/// Validates an optional `--evidence` path once, before runtime or model construction: its
+/// parent directory must already exist, and the path itself must not already be a directory.
+/// `None` (the option absent) always validates to `None`.
+pub(crate) fn evidence_path(path: Option<PathBuf>) -> Result<Option<PathBuf>, String> {
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    if path.is_dir() {
+        return Err(format!("--evidence {} is a directory", path.display()));
+    }
+    let parent_exists = match path.parent() {
+        None => true,
+        Some(parent) if parent.as_os_str().is_empty() => true,
+        Some(parent) => parent.is_dir(),
+    };
+    if !parent_exists {
+        return Err(format!(
+            "--evidence {} has no existing parent directory",
+            path.display()
+        ));
+    }
+    Ok(Some(path))
+}
+
 fn process_env(key: &str) -> Result<Option<String>, String> {
     match std::env::var_os(key) {
         None => Ok(None),
@@ -150,8 +174,9 @@ fn configured_path(
 
 #[cfg(test)]
 mod tests {
-    use super::{TraceMode, frontend_mode_from, trace_mode_from};
+    use super::{TraceMode, evidence_path, frontend_mode_from, trace_mode_from};
     use gigaam_audio::FrontendMode;
+    use std::path::PathBuf;
 
     #[test]
     fn frontend_and_trace_process_values_are_parsed_at_the_cli_boundary() {
@@ -164,5 +189,44 @@ mod tests {
         assert!(frontend_mode_from(Some("scalar ")).is_err());
         assert_eq!(trace_mode_from(None), Ok(TraceMode::Disabled));
         assert!(trace_mode_from(Some("")).is_err());
+    }
+
+    #[test]
+    fn evidence_path_is_absent_by_default_and_validates_a_present_value() {
+        assert_eq!(evidence_path(None), Ok(None));
+
+        let directory = std::env::temp_dir().join(format!(
+            "gigaam-cli-evidence-path-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&directory)
+            .expect("test evidence-path directory creation must succeed");
+
+        let bare_name = PathBuf::from("evidence.txt");
+        assert_eq!(
+            evidence_path(Some(bare_name.clone())),
+            Ok(Some(bare_name)),
+            "a bare filename has an implicit, always-present current-directory parent"
+        );
+
+        let inside_existing_directory = directory.join("evidence.txt");
+        assert_eq!(
+            evidence_path(Some(inside_existing_directory.clone())),
+            Ok(Some(inside_existing_directory))
+        );
+
+        assert!(
+            evidence_path(Some(directory.clone())).is_err(),
+            "a path that is itself an existing directory must refuse"
+        );
+
+        let missing_parent = directory.join("missing-child").join("evidence.txt");
+        assert!(
+            evidence_path(Some(missing_parent)).is_err(),
+            "a path whose parent directory does not exist must refuse"
+        );
+
+        std::fs::remove_dir_all(&directory)
+            .expect("test evidence-path directory cleanup must succeed");
     }
 }

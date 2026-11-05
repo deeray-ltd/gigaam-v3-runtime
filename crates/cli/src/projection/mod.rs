@@ -4,7 +4,12 @@
 
 //! Process-stream, diagnostic, trace, and exit-code projection for the offline CLI.
 
+mod evidence;
 pub(crate) mod stream;
+
+pub(crate) use evidence::{
+    EvidenceAudioHeader, EvidenceModelHeader, EvidenceWriter, evidence_token,
+};
 
 use crate::configuration::TraceMode;
 use crate::grammar::{GrammarFailure, TranscribeOutput, TurnOutput, WordOutput};
