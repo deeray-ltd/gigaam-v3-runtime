@@ -32,6 +32,7 @@ unsupported value refuses rather than falling back.
 | Variable | Default | Accepted value and effect |
 | --- | --- | --- |
 | ASR_API_MODE | native | `native` or `openai`; selects exclusive application routes. |
+| ASR_LANGUAGE | ru | Recognition language declaration; currently only `ru` is supported. |
 | ASR_MAX_CONCURRENCY | 8 | Positive integer maximum for admitted HTTP batch processing. |
 | ASR_MAX_UPLOADS | Resolved ASR_MAX_CONCURRENCY | Positive integer maximum for concurrent upload readers. |
 | ASR_UPLOAD_TIMEOUT_SEC | Resolved ASR_REQ_TIMEOUT_SEC | Positive integer deadline for reading and validating an upload. |

@@ -27,7 +27,9 @@ use axum::extract::{DefaultBodyLimit, FromRequest, Multipart, RawQuery, Request,
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::Response;
 use axum::routing::{get, post};
-use gigaam_audio::{ChannelAudioView, EncodedAudio, load_bytes, resample_audio};
+use gigaam_audio::{
+    ChannelAudio, ChannelAudioView, DecodedAudio, EncodedAudio, load_bytes, resample_audio,
+};
 use gigaam_recognition::{ExecutionControl, ExecutionState, SpeechProbabilityDetector, Vad};
 use gigaam_transcription::{
     BatchChannelPolicy, BatchSetup, MultiChannelBatchError, MultiChannelBatchOptions,
@@ -275,6 +277,8 @@ async fn openai_transcribe(State(state): State<HttpState>, request: Request) -> 
                 progress: &work_progress,
             },
             || Vad::from_pack(&capabilities.pack, capabilities.intra_threads),
+            input.segment,
+            true,
         )?;
         work_progress.stage(BatchStage::ResponseProjection, || {
             crate::openai_response::project(crate::openai_response::ProjectionInput {
@@ -1083,7 +1087,7 @@ fn do_transcribe_with_vad_factory<D: SpeechProbabilityDetector>(
 ) -> Result<String, TranscribeError> {
     let query = work.query;
     let progress = work.progress;
-    let (result, duration, source_rate, rtf) = run_batch(work, factory)?;
+    let (result, duration, source_rate, rtf) = run_batch(work, factory, false, false)?;
     let options = query.options;
     progress.stage(BatchStage::ResponseProjection, || {
         let response = transcribe_response(ResponseInput {
@@ -1109,6 +1113,8 @@ fn do_transcribe_with_vad_factory<D: SpeechProbabilityDetector>(
 fn run_batch<D: SpeechProbabilityDetector>(
     work: BatchWork<'_>,
     factory: impl FnOnce() -> Result<D, String>,
+    scored: bool,
+    downmix: bool,
 ) -> Result<(MultiChannelBatchResult, f32, u32, f32), TranscribeError> {
     let BatchWork {
         context,
@@ -1124,7 +1130,7 @@ fn run_batch<D: SpeechProbabilityDetector>(
             TranscribeError::UnsupportedCapability("rnnt model is not loaded".into())
         })?,
     };
-    if query.vad.is_some() {
+    if query.vad.is_some() || scored {
         if context
             .capabilities
             .frontend
@@ -1163,6 +1169,7 @@ fn run_batch<D: SpeechProbabilityDetector>(
         resample_audio(loaded, context.capabilities.frontend.sample_rate())
             .map_err(TranscribeError::BadRequest)
     })?;
+    let audio = if downmix { mono_downmix(audio)? } else { audio };
     let options = query.options;
     let channel_policy = http_batch_channel_policy(options);
     let turn_gap = TurnGap::new(options.turn_gap).map_err(TranscribeError::BadRequest)?;
@@ -1179,11 +1186,21 @@ fn run_batch<D: SpeechProbabilityDetector>(
     ))
     .map_err(TranscribeError::Unavailable)?;
     let started = Instant::now();
-    let result = match query.vad {
-        None => progress.stage(BatchStage::BatchTranscription, || {
+    let result = match (query.vad, scored) {
+        (policy, true) => {
+            let mut detector = request_vad(factory, control, progress)?;
+            let result = progress.stage(BatchStage::BatchTranscription, || {
+                complete_multi_channel_batch(metrics, || {
+                    transcriber.transcribe_scored(&audio, &mut detector, policy)
+                })
+            })?;
+            metrics.observe_vad(result.timings().vad_seconds());
+            result
+        }
+        (None, false) => progress.stage(BatchStage::BatchTranscription, || {
             complete_multi_channel_batch(metrics, || transcriber.transcribe(&audio))
         })?,
-        Some(policy) => {
+        (Some(policy), false) => {
             let mut detector = request_vad(factory, control, progress)?;
             let result = progress.stage(BatchStage::BatchTranscription, || {
                 complete_multi_channel_batch(metrics, || {
@@ -1197,6 +1214,23 @@ fn run_batch<D: SpeechProbabilityDetector>(
     let duration = audio.duration_seconds();
     let rtf = started.elapsed().as_secs_f32() / duration.max(1e-6);
     Ok((result, duration, source_rate, rtf))
+}
+
+fn mono_downmix(audio: DecodedAudio) -> Result<DecodedAudio, TranscribeError> {
+    if audio.channels().len() == 1 {
+        return Ok(audio);
+    }
+    let count = u16::try_from(audio.channels().len())
+        .map_err(|_| TranscribeError::BadRequest("too many source channels".into()))?;
+    let divisor = f32::from(count);
+    let mut samples = vec![0.0; audio.frames()];
+    for channel in audio.channels() {
+        for (mixed, sample) in samples.iter_mut().zip(channel.samples()) {
+            *mixed += *sample / divisor;
+        }
+    }
+    let mono = ChannelAudio::new(samples).map_err(TranscribeError::BadRequest)?;
+    DecodedAudio::new(audio.sample_rate(), vec![mono]).map_err(TranscribeError::BadRequest)
 }
 
 fn vad_checkpoint(control: &ExecutionControl) -> Result<(), TranscribeError> {

@@ -32,6 +32,20 @@ impl ApiMode {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RecognitionLanguage {
+    Russian,
+}
+
+impl RecognitionLanguage {
+    pub(crate) fn parse(value: Option<&str>) -> Result<Self, String> {
+        match value {
+            None | Some("ru") => Ok(Self::Russian),
+            Some(_) => Err("ASR_LANGUAGE must be ru".into()),
+        }
+    }
+}
+
 /// Validated admission capacities and the complete HTTP work deadline.
 #[derive(Debug)]
 pub struct ServiceAdmission {
@@ -68,8 +82,11 @@ impl ServiceAdmission {
         })
     }
 
-    pub(crate) fn with_api_mode(mut self, mode: ApiMode) -> Self {
+    pub(crate) fn with_api_policy(mut self, mode: ApiMode, language: RecognitionLanguage) -> Self {
         self.api_mode = mode;
+        match language {
+            RecognitionLanguage::Russian => {}
+        }
         self
     }
 

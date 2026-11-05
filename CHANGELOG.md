@@ -9,7 +9,9 @@ All notable changes are recorded here. Pre-1.0 releases do not promise a stable 
 - Separate upload reader capacity and timeout settings bound body ingestion independently
   from batch processing capacity and its deadline.
 
-- Select either native or OpenAI-compatible batch routes with `ASR_API_MODE`.
+- Optional OpenAI-compatible batch transcription and model-list routes with JSON, text,
+  and verbose output, local model identifiers, and Russian language declaration.
+  `ASR_API_MODE` selects the native or OpenAI API.
 
 - Optional native token emission scores and source-window provenance for scored batch
   segments, while ordinary transcript words and timing remain unchanged.
