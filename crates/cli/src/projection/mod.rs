@@ -12,7 +12,9 @@ pub(crate) use evidence::{
 };
 
 use crate::configuration::TraceMode;
-use crate::grammar::{GrammarFailure, TranscribeOutput, TurnOutput, WordOutput};
+use crate::grammar::{
+    AppliedConfigOutput, GrammarFailure, TranscribeOutput, TurnOutput, WordOutput,
+};
 use crate::numeric::count_to_f32;
 use gigaam_audio::DecodedAudio;
 use gigaam_model_package::EncoderPrecision;
@@ -20,10 +22,18 @@ use gigaam_recognition::{CudaAssignmentEvidence, DirectRecognizer, EncoderRole, 
 use gigaam_transcription::{
     BackchannelMark, BatchConfig, DuplicateClassification, MultiChannelBatchResult,
     ObservationMode, OfflineDialogFailure, OfflineDialogFailureOrigin, OfflineDialogResult,
-    SpeechSegment, VadPolicyConfig, WindowTiming, WindowTimingObserver, words_to_text,
+    SpeechSegment, StreamConfig, VadPolicyConfig, WindowTiming, WindowTimingObserver,
+    words_to_text,
 };
 use std::sync::Arc;
 use std::time::Duration;
+
+/// Emits optional applied policy after the command's established success projection.
+pub(crate) fn applied_stream_config(output: AppliedConfigOutput, config: &StreamConfig) {
+    if let Some(record) = stream::applied_config_record(output, config) {
+        eprintln!("{record}");
+    }
+}
 
 /// A terminal CLI error with its externally visible status class.
 #[derive(Debug)]

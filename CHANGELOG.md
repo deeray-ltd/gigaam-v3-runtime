@@ -6,6 +6,13 @@ All notable changes are recorded here. Pre-1.0 releases do not promise a stable 
 
 ### Added
 
+- Complete existing WebSocket stream-policy controls, bound before upgrade at the model
+  rate. Optional `applied_config` adds a versioned bound-policy event before transcript
+  events while preserving default output, active shutdown precedence, and session ownership.
+- Complete existing stream-policy controls in CLI `stream` and `dialog`, including the
+  detector threshold, both silence rules, window cadence, horizon/locking, seam delay,
+  and retained silence. Optional `--applied-config` reports the bound policy after successful
+  execution. Existing defaults, channel behavior, and output without the flag are preserved.
 - Opt-in HTTP batch VAD through explicit response version 2, with the same validated
   threshold, duration, and padding controls as the CLI, original-clock speech spans, and
   an applied-policy response. Version 1 bodies and VAD-off asset independence are preserved.

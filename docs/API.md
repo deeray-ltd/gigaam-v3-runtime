@@ -181,8 +181,17 @@ validates this query:
 | channels | integer 1 through 8 | 1 |
 | emit | turns, words, both | turns |
 | endpoint | blank, vad | blank |
+| vad_threshold | Finite probability in [0, 1]; requires endpoint=vad | 0.5 |
+| silence_ms | Finite nonnegative after-speech silence, milliseconds | 1200 |
+| no_speech_ms | Finite nonnegative silence without recognized speech, milliseconds | 2400 |
+| window | Finite positive seconds | 30 |
+| overlap | Finite nonnegative seconds, shorter than window | 6 |
+| step_ms | Finite positive milliseconds | 500 |
 | horizon | finite seconds greater than zero | 5.0 |
 | lock | 1, 0, true, false | false |
+| seam_after | Finite nonnegative seam delay, seconds | 2 |
+| keep_silence | Finite nonnegative retained silence, seconds | 0.5 |
+| applied_config | 1, 0, true, false | false |
 | turn_gap | finite seconds greater than zero | 0.8 |
 | dedup | 1, 0, true, false | ASR_DEDUP for multichannel input; disabled for mono input |
 | backchannel_max_ms | finite milliseconds greater than or equal to zero | ASR_BACKCHANNEL_MAX_MS |
@@ -190,6 +199,15 @@ validates this query:
 Within the accepted range, rate is admitted only when its ratio to the model rate, reduced
 to lowest terms, stays within 1000 on both sides; other rates refuse with an explicit
 message.
+
+Streaming timing controls bind together at the selected model rate before upgrade or native
+session construction. Fractions and zero are accepted where stated; window and step must
+truncate to at least one model-rate sample, and all derived counts must be representable.
+Overlap and retained silence may truncate to zero. Both blank and VAD endpointing use the
+silence rules, seam delay, and retained silence. Only an explicit `vad_threshold` requires
+`endpoint=vad`. Enabled VAD requires a 16000 Hz model/frontend; `rate` still describes the
+source audio, which is resampled normally. These controls preserve the existing endpoint
+algorithm and do not enable batch segmentation or skip recognition on silence.
 
 The connection reserves one streaming admission permit per requested source channel, not
 per socket. It cannot reserve more than the configured streaming limit even though the
@@ -232,12 +250,24 @@ The server sends JSON text frames:
 
 | Type | Fields | Meaning |
 | --- | --- | --- |
+| applied_stream_config | type, schema_version, model_sample_rate, endpoint, window_sec, overlap_sec, step_sec, horizon_sec, lock, seam_after_sec, keep_silence_sec, endpoint_rules, vad | Opt-in confirmation of the immutable policy bound to the active session. |
 | words | type, at, revise_from, words | Replace the channel word tail at revise_from. Each word has start, end, text, stable. |
 | stable | type, at, upto | Word order is settled through upto. |
 | final | type, at, upto, endpoint | Output is immutable through upto; endpoint indicates endpoint-caused finality. |
 | turns | type, revise_from, frontier, turns | Replace the dialogue tail from revise_from. Each turn has channel, k, start, end, text, stable, final, backchannel. |
 | error | type, message | Terminal diagnostic before server close for an in-band application failure. |
 | end | type | Successful terminal event. |
+
+`applied_config=1` or `true` requests one `applied_stream_config` event after successful
+active-session construction and before transcript events. Its version-1 object has the same
+fields and numeric semantics as the CLI applied-policy record below; the WebSocket horizon
+default remains 5 seconds. Values come from the setup bound to the actual session. The event
+does not assert completed inference or selected physical-channel identities: deduplication
+may defer channel activation until enough input arrives. No record is sent after failed
+construction or shutdown before opening. An already-ready active shutdown takes precedence
+over pending metadata. A metadata delivery failure terminates through the existing event
+delivery failure path without recursive error delivery. Omitted, `0`, or `false` preserves
+the existing event stream; new control keys do not require opting into this event.
 
 Channel is omitted from words, stable, and final in mono sessions and present in
 multichannel sessions. In every emission group, channel events appear in ascending original
@@ -272,23 +302,72 @@ asr bench [--audio FILE] [--model DIR] [--ep cpu|cuda|tensorrt] [--ort-dylib PAT
 asr stream FILE [--model DIR] [--ep cpu|cuda|tensorrt] [--ort-dylib PATH]
               [--fp16] [--chunk-ms N] [--step-ms N] [--horizon S]
               [--window S] [--overlap S] [--endpoint blank|vad] [--silence-ms N]
-              [--ref FILE] [--lock] [--events]
+              [--no-speech-ms N] [--vad-threshold F] [--seam-after S] [--keep-silence S]
+              [--ref FILE] [--lock] [--events] [--applied-config]
 
 asr vad FILE [--model DIR] [--ort-dylib PATH] [--threshold F] [--neg-threshold F]
            [--min-speech-ms N] [--min-silence-ms N] [--speech-pad-ms N] [--channels all|0,2]
 
 asr dialog FILE [--model DIR] [--ep cpu|cuda|tensorrt] [--ort-dylib PATH]
               [--turn-gap S] [--endpoint blank|vad] [--no-dedup]
-              [--backchannel-max-ms N]
+              [--backchannel-max-ms N] [--window S] [--overlap S] [--step-ms N]
+              [--horizon S] [--silence-ms N] [--no-speech-ms N] [--vad-threshold F]
+              [--seam-after S] [--keep-silence S] [--lock] [--applied-config]
 ~~~
 
 | Command | Defaults and constraints |
 | --- | --- |
 | transcribe | model is model; CTC is selected unless --rnnt; --window is 30 seconds; --overlap is 6 seconds and must be shorter than window; --turn-gap is 1 second; --words conflicts with --turns; --pad selects fixed-window padding; --evidence is optional and requires CTC. --vad enables batch speech segmentation; VAD tuning flags require it. |
 | bench | audio defaults to fixtures/long_example.wav, a path not bundled by the repository; window is 30 seconds; iters is 20 and positive; gap-ms is 0 and nonnegative; alt-window is optional and positive. |
-| stream | chunk-ms is 100 and positive; step-ms is 500 and positive; horizon is 4 seconds and positive; window/overlap default to 30/6 seconds with overlap shorter than window; endpoint defaults to blank; silence-ms is optional and nonnegative; --lock selects committed-stable locking; --events prints event projections. |
+| stream | chunk-ms is 100 and positive; horizon is 4 seconds; --events prints event projections. All streaming policy controls below are supported. |
 | vad | threshold is 0.5; neg-threshold is 0.35; both are finite in 0 through 1 and neg-threshold cannot exceed threshold; min-speech-ms and min-silence-ms default to 250 and 100; speech-pad-ms defaults to 30. All durations accept finite nonnegative fractional milliseconds, including zero. Without --channels only physical channel 0 is processed; explicit selection accepts all or unique comma-separated zero-based physical indices. |
-| dialog | turn-gap is 0.8 seconds and positive; endpoint defaults to blank; --no-dedup disables offline dialog deduplication; backchannel-max-ms defaults to 0 and is nonnegative. |
+| dialog | turn-gap is 0.8 seconds and positive; horizon is 5 seconds; --no-dedup disables offline dialog deduplication; backchannel-max-ms defaults to 0 and is nonnegative. All streaming policy controls below are supported. |
+
+### Streaming CLI policy
+
+Both `stream` and `dialog` bind these controls to the selected package's model sample rate
+before initializing the native runtime. `stream` still processes only the first physical
+channel and runs its batch reference pass; `dialog` retains its multichannel selection and
+deduplication behavior.
+
+| Option | Accepted values and units | Default |
+| --- | --- | --- |
+| --endpoint | blank or vad | blank |
+| --vad-threshold | Finite probability in [0, 1]; requires explicit --endpoint vad | 0.5 |
+| --silence-ms | Finite nonnegative after-speech silence, milliseconds | 1200 |
+| --no-speech-ms | Finite nonnegative silence without recognized speech, milliseconds | 2400 |
+| --window | Finite positive seconds | 30 |
+| --overlap | Finite nonnegative seconds, shorter than window | 6 |
+| --step-ms | Finite positive milliseconds | 500 |
+| --horizon | Finite positive seconds | 4 for stream; 5 for dialog |
+| --lock | Flag selecting committed-stable locking | Advisory locking |
+| --seam-after | Finite nonnegative seam delay, seconds | 2 |
+| --keep-silence | Finite nonnegative retained silence, seconds | 0.5 |
+| --applied-config | Flag adding a versioned applied-policy record to stderr | Omitted |
+
+Silence rules, seam delay, and retained silence apply to both blank and VAD endpointing.
+Only the detector threshold requires VAD; explicitly supplying it with blank endpointing
+refuses. These are existing streaming endpoint controls, not the batch segmentation
+hysteresis, minimum-speech, or padding controls. They do not skip ASR on silent input.
+
+Durations accept fractions and zero where stated. Window and step must truncate to at least
+one model-rate sample; overlap and retained silence may truncate to zero. Unrepresentable
+sample counts refuse. Coupled window/overlap changes bind together. VAD endpointing requires
+a 16000 Hz model/frontend before native work; accepted source audio is resampled normally.
+
+After successful transcription and its existing terminal projection, `--applied-config`
+writes one JSON line to stderr. Existing stdout remains unchanged. The record describes the
+validated configuration used by the command, not the original argument text:
+
+~~~json
+{"type":"applied_stream_config","schema_version":1,"model_sample_rate":16000,"endpoint":"vad","window_sec":30,"overlap_sec":6,"step_sec":0.5,"horizon_sec":4,"lock":"advisory","seam_after_sec":2,"keep_silence_sec":0.5,"endpoint_rules":{"after_speech_sec":1.2000000476837158,"without_speech_sec":2.4000000953674316},"vad":{"enabled":true,"threshold":0.5}}
+~~~
+
+With blank endpointing, `endpoint` is `blank` and `vad` is exactly `{"enabled":false}`.
+Lock values are `advisory` and `commit_stable`. Values preserve the bound 32-bit floats,
+without word-timestamp rounding. A prior command failure emits no applied-policy record;
+the record does not promise atomic or durable terminal output. Omitting the flag preserves
+the existing terminal projection.
 
 `bench` opens the selected package before native runtime initialization. Its --window and
 --alt-window values are durations at that package's validated sample rate: each becomes a
