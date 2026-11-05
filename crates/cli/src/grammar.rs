@@ -5,7 +5,10 @@
 //! UTF-8 command-line grammar and validated invocation values for the offline CLI.
 
 use gigaam_model_package::EncoderPrecision;
-use gigaam_transcription::{EndpointSource, OfflineChannelPolicy, PadPolicy, StreamLockPolicy};
+use gigaam_transcription::{
+    EndpointSource, OfflineChannelPolicy, PadPolicy, StreamLockPolicy, VadDurations, VadPadding,
+    VadPolicyConfig, VadProbability, VadThresholds,
+};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -79,6 +82,8 @@ pub(crate) struct TranscribeInvocation {
     pub(crate) output: TranscribeOutput,
     pub(crate) turn_gap_seconds: f32,
     pub(crate) evidence: Option<PathBuf>,
+    pub(crate) evidence_version: EvidenceVersion,
+    pub(crate) vad: Option<VadPolicyArguments>,
 }
 
 /// The exact decoder family selected for offline batch transcription.
@@ -86,6 +91,13 @@ pub(crate) struct TranscribeInvocation {
 pub(crate) enum DecoderChoice {
     Ctc,
     Rnnt,
+}
+
+/// Explicit evidence-file schema; v1 remains the default for existing callers.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum EvidenceVersion {
+    V1,
+    V2,
 }
 
 /// Validated encoder benchmark input and command choices.
@@ -133,11 +145,72 @@ pub(crate) struct VadInvocation {
     pub(crate) input: PathBuf,
     pub(crate) model: PathBuf,
     pub(crate) runtime: RuntimeRequest,
-    pub(crate) speech_threshold: f32,
-    pub(crate) silence_threshold: f32,
-    pub(crate) minimum_speech_milliseconds: usize,
-    pub(crate) minimum_silence_milliseconds: usize,
-    pub(crate) speech_padding_milliseconds: usize,
+    pub(crate) policy: VadPolicyArguments,
+    pub(crate) channels: VadChannels,
+}
+
+/// Scalar-validated VAD policy, bound to the library's checked fixed-rate counts before native work.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct VadPolicyArguments {
+    speech_threshold: f32,
+    silence_threshold: f32,
+    minimum_speech_milliseconds: f32,
+    minimum_silence_milliseconds: f32,
+    speech_padding_milliseconds: f32,
+}
+
+impl VadPolicyArguments {
+    pub(crate) fn bind(self) -> Result<VadPolicyConfig, String> {
+        let thresholds = VadThresholds::new(
+            VadProbability::new(self.speech_threshold)?,
+            VadProbability::new(self.silence_threshold)?,
+        )
+        .map_err(|error| format!("VAD thresholds: {error}"))?;
+        let durations = VadDurations::new(
+            self.minimum_speech_milliseconds,
+            self.minimum_silence_milliseconds,
+        )
+        .map_err(|error| format!("VAD durations: {error}"))?;
+        let padding = VadPadding::new(self.speech_padding_milliseconds)
+            .map_err(|error| format!("VAD padding: {error}"))?;
+        Ok(VadPolicyConfig::new(thresholds, durations, padding))
+    }
+}
+
+/// Standalone VAD selects physical channels without batch correlation or deduplication.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum VadChannels {
+    First,
+    All,
+    Selected(Vec<usize>),
+}
+
+impl VadChannels {
+    pub(crate) fn is_explicit(&self) -> bool {
+        !matches!(self, Self::First)
+    }
+
+    pub(crate) fn resolve(&self, source_channels: usize) -> Result<Vec<usize>, String> {
+        if source_channels == 0 {
+            return Err("VAD audio must contain at least one channel".into());
+        }
+        let selected = match self {
+            Self::First => vec![0],
+            Self::All => (0..source_channels).collect(),
+            Self::Selected(indices) => indices.clone(),
+        };
+        if selected.is_empty() || selected.windows(2).any(|pair| pair[0] >= pair[1]) {
+            return Err("--channels must select unique physical indices in ascending order".into());
+        }
+        for index in &selected {
+            if *index >= source_channels {
+                return Err(format!(
+                    "--channels index {index} is outside source channel count {source_channels}"
+                ));
+            }
+        }
+        Ok(selected)
+    }
 }
 
 /// Validated offline-dialog input and command choices.
@@ -188,6 +261,12 @@ impl Command {
                     | "--overlap"
                     | "--turn-gap"
                     | "--evidence"
+                    | "--evidence-version"
+                    | "--vad-threshold"
+                    | "--vad-neg-threshold"
+                    | "--vad-min-speech-ms"
+                    | "--vad-min-silence-ms"
+                    | "--vad-speech-pad-ms"
             ),
             Self::Bench => matches!(
                 option,
@@ -223,6 +302,7 @@ impl Command {
                     | "--min-speech-ms"
                     | "--min-silence-ms"
                     | "--speech-pad-ms"
+                    | "--channels"
             ),
             Self::Dialog => matches!(
                 option,
@@ -240,7 +320,13 @@ impl Command {
         match self {
             Self::Transcribe => matches!(
                 option,
-                "--fp16" | "--rnnt" | "--pad" | "--words" | "--split-channels" | "--turns"
+                "--fp16"
+                    | "--rnnt"
+                    | "--pad"
+                    | "--words"
+                    | "--split-channels"
+                    | "--turns"
+                    | "--vad"
             ),
             Self::Bench => option == "--fp16",
             Self::Stream => matches!(option, "--fp16" | "--lock" | "--events"),
@@ -409,6 +495,25 @@ fn transcribe(parsed: ParsedArguments) -> Result<Invocation, String> {
         false => DecoderChoice::Ctc,
     };
     let evidence = parsed.value("--evidence").map(PathBuf::from);
+    let evidence_version = match parsed.value("--evidence-version") {
+        None => EvidenceVersion::V1,
+        Some(_) if evidence.is_none() => {
+            return Err("--evidence-version requires --evidence".into());
+        }
+        Some("1") => EvidenceVersion::V1,
+        Some("2") => EvidenceVersion::V2,
+        Some(_) => return Err("--evidence-version must be 1 or 2".into()),
+    };
+    let vad = if parsed.has_flag("--vad") {
+        Some(vad_policy(&parsed, VadOptionNames::BATCH)?)
+    } else {
+        for option in VadOptionNames::BATCH.all() {
+            if parsed.value(option).is_some() {
+                return Err(format!("{option} requires --vad"));
+            }
+        }
+        None
+    };
     Ok(Invocation::Transcribe(TranscribeInvocation {
         input: parsed.required_input("transcribe")?,
         model: parsed.model(),
@@ -425,6 +530,8 @@ fn transcribe(parsed: ParsedArguments) -> Result<Invocation, String> {
         },
         turn_gap_seconds,
         evidence,
+        evidence_version,
+        vad,
     }))
 }
 
@@ -486,21 +593,118 @@ fn stream(parsed: ParsedArguments) -> Result<Invocation, String> {
 }
 
 fn vad(parsed: ParsedArguments) -> Result<Invocation, String> {
-    let speech_threshold = bounded_f32(&parsed, "--threshold", 0.5, 0.0, 1.0)?;
-    let silence_threshold = bounded_f32(&parsed, "--neg-threshold", 0.35, 0.0, 1.0)?;
-    if silence_threshold > speech_threshold {
-        return Err("--neg-threshold must not exceed --threshold".into());
-    }
     Ok(Invocation::Vad(VadInvocation {
         input: parsed.required_input("vad")?,
         model: parsed.model(),
         runtime: parsed.runtime(),
+        policy: vad_policy(&parsed, VadOptionNames::STANDALONE)?,
+        channels: vad_channels(parsed.value("--channels"))?,
+    }))
+}
+
+struct VadOptionNames {
+    speech: &'static str,
+    silence: &'static str,
+    minimum_speech: &'static str,
+    minimum_silence: &'static str,
+    padding: &'static str,
+}
+
+impl VadOptionNames {
+    const BATCH: Self = Self {
+        speech: "--vad-threshold",
+        silence: "--vad-neg-threshold",
+        minimum_speech: "--vad-min-speech-ms",
+        minimum_silence: "--vad-min-silence-ms",
+        padding: "--vad-speech-pad-ms",
+    };
+    const STANDALONE: Self = Self {
+        speech: "--threshold",
+        silence: "--neg-threshold",
+        minimum_speech: "--min-speech-ms",
+        minimum_silence: "--min-silence-ms",
+        padding: "--speech-pad-ms",
+    };
+
+    const fn all(&self) -> [&'static str; 5] {
+        [
+            self.speech,
+            self.silence,
+            self.minimum_speech,
+            self.minimum_silence,
+            self.padding,
+        ]
+    }
+}
+
+fn vad_policy(
+    parsed: &ParsedArguments,
+    names: VadOptionNames,
+) -> Result<VadPolicyArguments, String> {
+    let defaults = VadPolicyConfig::default();
+    let speech_threshold = bounded_f32(
+        parsed,
+        names.speech,
+        defaults.thresholds().speech().get(),
+        0.0,
+        1.0,
+    )?;
+    let silence_threshold = bounded_f32(
+        parsed,
+        names.silence,
+        defaults.thresholds().silence().get(),
+        0.0,
+        1.0,
+    )?;
+    if silence_threshold > speech_threshold {
+        return Err(format!(
+            "{} must not exceed {}",
+            names.silence, names.speech
+        ));
+    }
+    Ok(VadPolicyArguments {
         speech_threshold,
         silence_threshold,
-        minimum_speech_milliseconds: positive_usize(&parsed, "--min-speech-ms", 250)?,
-        minimum_silence_milliseconds: positive_usize(&parsed, "--min-silence-ms", 100)?,
-        speech_padding_milliseconds: nonnegative_usize(&parsed, "--speech-pad-ms", 30)?,
-    }))
+        minimum_speech_milliseconds: nonnegative_f32(
+            parsed,
+            names.minimum_speech,
+            defaults.durations().minimum_speech_milliseconds(),
+        )?,
+        minimum_silence_milliseconds: nonnegative_f32(
+            parsed,
+            names.minimum_silence,
+            defaults.durations().minimum_silence_milliseconds(),
+        )?,
+        speech_padding_milliseconds: nonnegative_f32(
+            parsed,
+            names.padding,
+            defaults.padding().milliseconds(),
+        )?,
+    })
+}
+
+fn vad_channels(value: Option<&str>) -> Result<VadChannels, String> {
+    let Some(value) = value else {
+        return Ok(VadChannels::First);
+    };
+    if value == "all" {
+        return Ok(VadChannels::All);
+    }
+    let mut selected = BTreeSet::new();
+    for value in value.split(',') {
+        if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err(
+                "--channels must be all or comma-separated physical channel indices".into(),
+            );
+        }
+        let index = value
+            .parse::<usize>()
+            .map_err(|_| format!("--channels: invalid channel index {value:?}"))?;
+        if !selected.insert(index) {
+            return Err(format!("--channels repeats physical channel index {index}"));
+        }
+    }
+    Ok(VadChannels::Selected(selected.into_iter().collect()))
 }
 
 fn dialog(parsed: ParsedArguments) -> Result<Invocation, String> {
@@ -599,19 +803,6 @@ fn positive_usize(parsed: &ParsedArguments, option: &str, default: usize) -> Res
     }
 }
 
-fn nonnegative_usize(
-    parsed: &ParsedArguments,
-    option: &str,
-    default: usize,
-) -> Result<usize, String> {
-    match parsed.value(option) {
-        Some(value) => value
-            .parse::<usize>()
-            .map_err(|_| format!("{option}: invalid value {value:?}")),
-        None => Ok(default),
-    }
-}
-
 fn nonnegative_u64(parsed: &ParsedArguments, option: &str, default: u64) -> Result<u64, String> {
     match parsed.value(option) {
         Some(value) => value
@@ -630,6 +821,95 @@ mod tests {
 
     fn arguments(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_owned()).collect()
+    }
+
+    #[test]
+    fn batch_vad_is_opt_in_and_matches_standalone_policy_defaults() {
+        let batch = match parse_text(&arguments(&["transcribe", "audio.wav", "--vad"])) {
+            Ok(Invocation::Transcribe(value)) => value,
+            other => panic!("valid batch VAD must parse: {other:?}"),
+        };
+        let standalone = match parse_text(&arguments(&["vad", "audio.wav"])) {
+            Ok(Invocation::Vad(value)) => value,
+            other => panic!("valid standalone VAD must parse: {other:?}"),
+        };
+        let expected = gigaam_transcription::VadPolicyConfig::default();
+        assert_eq!(
+            batch.vad.expect("--vad enables a policy").bind(),
+            Ok(expected)
+        );
+        assert_eq!(standalone.policy.bind(), Ok(expected));
+        match parse_text(&arguments(&["transcribe", "audio.wav"])) {
+            Ok(Invocation::Transcribe(value)) => assert!(value.vad.is_none()),
+            other => panic!("default batch command must parse: {other:?}"),
+        }
+        for option in super::VadOptionNames::BATCH.all() {
+            assert!(parse_text(&arguments(&["transcribe", "audio.wav", option, "0.5"])).is_err());
+        }
+    }
+
+    #[test]
+    fn vad_durations_accept_zero_and_fractions_but_refuse_invalid_domains_and_overflow() {
+        let parsed = parse_text(&arguments(&[
+            "vad",
+            "audio.wav",
+            "--min-speech-ms",
+            "0",
+            "--min-silence-ms",
+            "0.0625",
+            "--speech-pad-ms",
+            "0.125",
+        ]));
+        match parsed {
+            Ok(Invocation::Vad(value)) => {
+                let policy = value
+                    .policy
+                    .bind()
+                    .expect("finite tiny nonnegative durations are representable");
+                assert_eq!(policy.durations().minimum_speech_milliseconds(), 0.0);
+                assert_eq!(policy.durations().minimum_silence_milliseconds(), 0.0625);
+                assert_eq!(policy.padding().milliseconds(), 0.125);
+            }
+            other => panic!("zero and fractional milliseconds must parse: {other:?}"),
+        }
+        for (option, value) in [
+            ("--threshold", "NaN"),
+            ("--threshold", "1.1"),
+            ("--neg-threshold", "0.6"),
+            ("--min-speech-ms", "-1"),
+            ("--min-silence-ms", "inf"),
+            ("--speech-pad-ms", "-0.1"),
+        ] {
+            assert!(parse_text(&arguments(&["vad", "audio.wav", option, value])).is_err());
+        }
+        for option in ["--min-speech-ms", "--min-silence-ms", "--speech-pad-ms"] {
+            match parse_text(&arguments(&[
+                "vad",
+                "audio.wav",
+                option,
+                &f32::MAX.to_string(),
+            ])) {
+                Ok(Invocation::Vad(value)) => assert!(value.policy.bind().is_err()),
+                other => {
+                    panic!("finite scalar validation precedes checked sample binding: {other:?}")
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn physical_vad_selection_is_unique_sorted_and_source_validated() {
+        use super::{VadChannels, vad_channels};
+        assert_eq!(vad_channels(None), Ok(VadChannels::First));
+        assert_eq!(vad_channels(Some("all")), Ok(VadChannels::All));
+        let selection = vad_channels(Some("2,0")).expect("distinct physical indices are valid");
+        assert_eq!(selection.resolve(3), Ok(vec![0, 2]));
+        assert!(selection.resolve(2).is_err());
+        assert_eq!(VadChannels::All.resolve(3), Ok(vec![0, 1, 2]));
+        assert_eq!(VadChannels::First.resolve(3), Ok(vec![0]));
+        for value in ["", "0,0", "0,00", "0,", "-1", "+1", "0, 1", "all,1", "1.0"] {
+            assert!(vad_channels(Some(value)).is_err(), "{value:?} must refuse");
+        }
     }
 
     #[test]
@@ -747,6 +1027,35 @@ mod tests {
             }
             Ok(_) => panic!("transcribe grammar must produce a transcribe invocation"),
             Err(error) => panic!("valid transcribe grammar must succeed: {error}"),
+        }
+    }
+
+    #[test]
+    fn evidence_version_is_explicit_strict_and_requires_a_destination() {
+        for (suffix, expected) in [
+            (vec![], super::EvidenceVersion::V1),
+            (vec!["--evidence-version", "1"], super::EvidenceVersion::V1),
+            (vec!["--evidence-version", "2"], super::EvidenceVersion::V2),
+        ] {
+            let mut values = vec!["transcribe", "audio.wav", "--evidence", "out.txt"];
+            values.extend(suffix);
+            match parse_text(&arguments(&values)) {
+                Ok(Invocation::Transcribe(value)) => assert_eq!(value.evidence_version, expected),
+                other => panic!("supported evidence schema must parse: {other:?}"),
+            }
+        }
+        for values in [
+            vec!["transcribe", "audio.wav", "--evidence-version", "2"],
+            vec![
+                "transcribe",
+                "audio.wav",
+                "--evidence",
+                "out.txt",
+                "--evidence-version",
+                "3",
+            ],
+        ] {
+            assert!(parse_text(&arguments(&values)).is_err());
         }
     }
 

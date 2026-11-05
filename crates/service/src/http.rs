@@ -16,7 +16,10 @@ use crate::context::ApplicationContext;
 use crate::log::{BatchProgress, BatchStage, BatchStageOutcome, TranscribeProgress};
 use crate::metrics::Metrics;
 use crate::protocol::{QueryParameters, query_bool, query_finite_f32};
-use crate::response::{Options, ResponseInput, json_err, json_ok, transcribe_response};
+use crate::response::{
+    Options, ResponseContract, ResponseInput, ResponseVersion, TranscribeErrorCode, json_err,
+    json_ok, transcribe_error_response, transcribe_response,
+};
 use crate::telemetry::TelemetryProducer;
 use axum::Router;
 use axum::body::Bytes;
@@ -24,11 +27,12 @@ use axum::extract::{DefaultBodyLimit, RawQuery, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::Response;
 use axum::routing::post;
-use gigaam_audio::{EncodedAudio, load_bytes, resample_audio};
-use gigaam_recognition::{ExecutionControl, ExecutionState};
+use gigaam_audio::{ChannelAudioView, EncodedAudio, load_bytes, resample_audio};
+use gigaam_recognition::{ExecutionControl, ExecutionState, SpeechProbabilityDetector, Vad};
 use gigaam_transcription::{
     BatchChannelPolicy, BatchSetup, MultiChannelBatchError, MultiChannelBatchOptions,
     MultiChannelBatchResult, MultiChannelBatchSetup, MultiChannelBatchTranscriber, TurnGap,
+    VadDurations, VadPadding, VadPolicyConfig, VadProbability, VadThresholds,
 };
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -106,20 +110,31 @@ pub(crate) fn body_limited_test_routes(routes: Router, limit: RequestBodyLimit) 
 
 enum TranscribeError {
     BadRequest(String),
+    UnsupportedCapability(String),
     Unavailable(String),
 }
 
 impl TranscribeError {
     fn status(&self) -> StatusCode {
         match self {
-            Self::BadRequest(_) => StatusCode::BAD_REQUEST,
+            Self::BadRequest(_) | Self::UnsupportedCapability(_) => StatusCode::BAD_REQUEST,
             Self::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
         }
     }
 
     fn message(self) -> String {
         match self {
-            Self::BadRequest(message) | Self::Unavailable(message) => message,
+            Self::BadRequest(message)
+            | Self::UnsupportedCapability(message)
+            | Self::Unavailable(message) => message,
+        }
+    }
+
+    fn code(&self) -> TranscribeErrorCode {
+        match self {
+            Self::BadRequest(_) => TranscribeErrorCode::InvalidRequest,
+            Self::UnsupportedCapability(_) => TranscribeErrorCode::UnsupportedCapability,
+            Self::Unavailable(_) => TranscribeErrorCode::Unavailable,
         }
     }
 }
@@ -217,14 +232,35 @@ struct TranscribeQuery {
     model: BatchModel,
     extension: Option<String>,
     options: Options,
+    response_version: ResponseVersion,
+    vad: Option<VadPolicyConfig>,
 }
 
 impl TranscribeQuery {
     fn parse(raw: Option<&str>) -> Result<Self, String> {
         let parameters = QueryParameters::parse(raw)?;
         parameters.reject_unknown(&[
-            "model", "ext", "words", "segments", "turns", "turn_gap", "channels",
+            "model",
+            "ext",
+            "words",
+            "segments",
+            "turns",
+            "turn_gap",
+            "channels",
+            "response_version",
+            "vad",
+            "vad_threshold",
+            "vad_neg_threshold",
+            "vad_min_speech_ms",
+            "vad_min_silence_ms",
+            "vad_speech_pad_ms",
         ])?;
+        let response_version = match parameters.get("response_version") {
+            None | Some("1") => ResponseVersion::V1,
+            Some("2") => ResponseVersion::V2,
+            Some(value) => return Err(format!("response_version must be 1 or 2, got {value:?}")),
+        };
+        let vad = bind_vad_policy(&parameters, response_version)?;
         let model = BatchModel::parse(parameters.get("model"))?;
         let extension = match parameters.get("ext") {
             None => None,
@@ -250,8 +286,70 @@ impl TranscribeQuery {
             model,
             extension,
             options,
+            response_version,
+            vad,
         })
     }
+}
+
+fn bind_vad_policy(
+    parameters: &QueryParameters,
+    version: ResponseVersion,
+) -> Result<Option<VadPolicyConfig>, String> {
+    let tuning = [
+        "vad_threshold",
+        "vad_neg_threshold",
+        "vad_min_speech_ms",
+        "vad_min_silence_ms",
+        "vad_speech_pad_ms",
+    ];
+    let has_tuning = tuning.iter().any(|key| parameters.get(key).is_some());
+    if version != ResponseVersion::V2 && (parameters.get("vad").is_some() || has_tuning) {
+        return Err("VAD parameters require explicit response_version=2".into());
+    }
+    let enabled = match parameters.get("vad") {
+        None | Some("false") => false,
+        Some("true") => true,
+        Some(value) => return Err(format!("vad must be true or false, got {value:?}")),
+    };
+    if !enabled {
+        if has_tuning {
+            return Err("VAD tuning parameters require vad=true".into());
+        }
+        return Ok(None);
+    }
+    let defaults = VadPolicyConfig::default();
+    Ok(Some(VadPolicyConfig::new(
+        VadThresholds::new(
+            VadProbability::new(query_finite_f32(
+                parameters,
+                "vad_threshold",
+                defaults.thresholds().speech().get(),
+            )?)?,
+            VadProbability::new(query_finite_f32(
+                parameters,
+                "vad_neg_threshold",
+                defaults.thresholds().silence().get(),
+            )?)?,
+        )?,
+        VadDurations::new(
+            query_finite_f32(
+                parameters,
+                "vad_min_speech_ms",
+                defaults.durations().minimum_speech_milliseconds(),
+            )?,
+            query_finite_f32(
+                parameters,
+                "vad_min_silence_ms",
+                defaults.durations().minimum_silence_milliseconds(),
+            )?,
+        )?,
+        VadPadding::new(query_finite_f32(
+            parameters,
+            "vad_speech_pad_ms",
+            defaults.padding().milliseconds(),
+        )?)?,
+    )))
 }
 
 fn valid_extension(value: &str) -> bool {
@@ -429,13 +527,16 @@ fn http_admission_refusal(
     refusal: AdmissionRefusal,
     metrics: &Metrics,
     request_id: &RequestId,
+    version: ResponseVersion,
 ) -> Response {
     match refusal {
         AdmissionRefusal::Overloaded => {
             metrics.overload();
             with_request_id(
-                json_err(
+                transcribe_error_response(
+                    version,
                     StatusCode::SERVICE_UNAVAILABLE,
+                    TranscribeErrorCode::Overloaded,
                     "service overloaded, retry later",
                 ),
                 request_id,
@@ -444,7 +545,12 @@ fn http_admission_refusal(
         AdmissionRefusal::Draining => {
             metrics.transcribe_error();
             with_request_id(
-                json_err(StatusCode::SERVICE_UNAVAILABLE, "draining"),
+                transcribe_error_response(
+                    version,
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    TranscribeErrorCode::Draining,
+                    "draining",
+                ),
                 request_id,
             )
         }
@@ -497,10 +603,16 @@ pub(crate) async fn transcribe(
         }
     };
     let model = query.model.as_str().to_owned();
+    let response_version = query.response_version;
     let admission = match resolve_http_admission(state.admission.as_ref()) {
         HttpAdmissionDecision::Admitted(admission) => admission,
         HttpAdmissionDecision::Refused(refusal) => {
-            return http_admission_refusal(refusal, metrics.as_ref(), &request_id);
+            return http_admission_refusal(
+                refusal,
+                metrics.as_ref(),
+                &request_id,
+                response_version,
+            );
         }
     };
     let control = ExecutionControl::for_request();
@@ -536,15 +648,25 @@ pub(crate) async fn transcribe(
         AdmittedWorkResult::Completed(Err(error)) => {
             metrics.transcribe_error();
             let status = error.status();
-            json_err(status, error.message())
+            transcribe_error_response(response_version, status, error.code(), error.message())
         }
         AdmittedWorkResult::WorkerFailure => {
             metrics.transcribe_error();
-            json_err(StatusCode::SERVICE_UNAVAILABLE, "internal worker error")
+            transcribe_error_response(
+                response_version,
+                StatusCode::SERVICE_UNAVAILABLE,
+                TranscribeErrorCode::Unavailable,
+                "internal worker error",
+            )
         }
         AdmittedWorkResult::TimedOut => {
             metrics.timeout();
-            json_err(StatusCode::GATEWAY_TIMEOUT, "processing timeout")
+            transcribe_error_response(
+                response_version,
+                StatusCode::GATEWAY_TIMEOUT,
+                TranscribeErrorCode::Timeout,
+                "processing timeout",
+            )
         }
     };
     metrics.observe_latency(started.elapsed().as_secs_f64());
@@ -574,6 +696,18 @@ struct BatchWork<'a> {
 }
 
 fn do_transcribe(work: BatchWork<'_>) -> Result<String, TranscribeError> {
+    let capabilities = &work.context.capabilities;
+    do_transcribe_with_vad_factory(work, || {
+        Vad::from_pack(&capabilities.pack, capabilities.intra_threads)
+    })
+}
+
+/// The factory is request-local and invoked only inside admitted blocking work when enabled.
+/// Tests replace native construction without adding a process-owned factory or session pool.
+fn do_transcribe_with_vad_factory<D: SpeechProbabilityDetector>(
+    work: BatchWork<'_>,
+    factory: impl FnOnce() -> Result<D, String>,
+) -> Result<String, TranscribeError> {
     let BatchWork {
         context,
         metrics,
@@ -584,12 +718,29 @@ fn do_transcribe(work: BatchWork<'_>) -> Result<String, TranscribeError> {
     } = work;
     let scheduler = match query.model {
         BatchModel::Ctc => &context.capabilities.ctc,
-        BatchModel::Rnnt => context
-            .capabilities
-            .rnnt
-            .as_ref()
-            .ok_or_else(|| TranscribeError::BadRequest("rnnt model is not loaded".into()))?,
+        BatchModel::Rnnt => context.capabilities.rnnt.as_ref().ok_or_else(|| {
+            TranscribeError::UnsupportedCapability("rnnt model is not loaded".into())
+        })?,
     };
+    if query.vad.is_some() {
+        if context
+            .capabilities
+            .frontend
+            .sample_rate()
+            .as_usize()
+            .map_err(TranscribeError::UnsupportedCapability)?
+            != gigaam_recognition::vad::VAD_SR
+        {
+            return Err(TranscribeError::UnsupportedCapability(
+                "batch VAD requires a 16000 Hz model sample rate".into(),
+            ));
+        }
+        context
+            .capabilities
+            .pack
+            .vad_model()
+            .map_err(|error| TranscribeError::UnsupportedCapability(error.to_string()))?;
+    }
     let loaded = progress.stage(BatchStage::AudioDecode, || {
         let encoded = EncodedAudio::new(bytes, query.extension.clone())
             .map_err(TranscribeError::BadRequest)?;
@@ -626,13 +777,29 @@ fn do_transcribe(work: BatchWork<'_>) -> Result<String, TranscribeError> {
     ))
     .map_err(TranscribeError::Unavailable)?;
     let started = Instant::now();
-    let result = progress.stage(BatchStage::BatchTranscription, || {
-        complete_multi_channel_batch(metrics, || transcriber.transcribe(&audio))
-    })?;
+    let result = match query.vad {
+        None => progress.stage(BatchStage::BatchTranscription, || {
+            complete_multi_channel_batch(metrics, || transcriber.transcribe(&audio))
+        })?,
+        Some(policy) => {
+            let mut detector = request_vad(factory, control, progress)?;
+            let result = progress.stage(BatchStage::BatchTranscription, || {
+                complete_multi_channel_batch(metrics, || {
+                    transcriber.transcribe_with_vad(&audio, &mut detector, policy)
+                })
+            })?;
+            metrics.observe_vad(result.timings().vad_seconds());
+            result
+        }
+    };
     let duration = audio.duration_seconds();
     let rtf = started.elapsed().as_secs_f32() / duration.max(1e-6);
     progress.stage(BatchStage::ResponseProjection, || {
         let response = transcribe_response(ResponseInput {
+            contract: ResponseContract {
+                version: query.response_version,
+                vad: query.vad,
+            },
             channels: result.channels(),
             segments: result.segments(),
             turns: result.turns(),
@@ -646,6 +813,58 @@ fn do_transcribe(work: BatchWork<'_>) -> Result<String, TranscribeError> {
         });
         Ok(response.to_string())
     })
+}
+
+fn vad_checkpoint(control: &ExecutionControl) -> Result<(), TranscribeError> {
+    match control.state() {
+        ExecutionState::Ready | ExecutionState::Queued | ExecutionState::Running => Ok(()),
+        ExecutionState::CancelRequested | ExecutionState::Cancelled => {
+            Err(TranscribeError::Unavailable("request cancelled".into()))
+        }
+        ExecutionState::Completed | ExecutionState::Failed => Err(TranscribeError::Unavailable(
+            "request is already terminal".into(),
+        )),
+    }
+}
+
+struct ObservedVad<'a, D> {
+    detector: D,
+    control: &'a ExecutionControl,
+    progress: &'a RequestProgress,
+}
+
+fn request_vad<'a, D: SpeechProbabilityDetector>(
+    factory: impl FnOnce() -> Result<D, String>,
+    control: &'a ExecutionControl,
+    progress: &'a RequestProgress,
+) -> Result<ObservedVad<'a, D>, TranscribeError> {
+    vad_checkpoint(control)?;
+    let detector = progress.stage(BatchStage::VadInitialization, || {
+        let detector = factory().map_err(TranscribeError::Unavailable)?;
+        vad_checkpoint(control)?;
+        Ok(detector)
+    })?;
+    Ok(ObservedVad {
+        detector,
+        control,
+        progress,
+    })
+}
+
+impl<D: SpeechProbabilityDetector> SpeechProbabilityDetector for ObservedVad<'_, D> {
+    fn probabilities(&mut self, samples: ChannelAudioView<'_>) -> Result<Vec<f32>, String> {
+        vad_checkpoint(self.control).map_err(TranscribeError::message)?;
+        self.progress
+            .stage(BatchStage::VadDetection, || {
+                let probabilities = self
+                    .detector
+                    .probabilities(samples)
+                    .map_err(TranscribeError::Unavailable)?;
+                vad_checkpoint(self.control)?;
+                Ok(probabilities)
+            })
+            .map_err(TranscribeError::message)
+    }
 }
 
 #[cfg(test)]
@@ -665,6 +884,470 @@ mod tests {
     use std::cell::Cell;
     use std::sync::Arc;
     use std::time::Duration;
+
+    struct SilentVad;
+
+    impl SpeechProbabilityDetector for SilentVad {
+        fn probabilities(&mut self, samples: ChannelAudioView<'_>) -> Result<Vec<f32>, String> {
+            Ok(vec![0.0; samples.samples().len().div_ceil(512)])
+        }
+    }
+
+    #[test]
+    fn vad_query_is_versioned_strict_and_bound_to_the_shared_policy() {
+        let legacy = TranscribeQuery::parse(None).expect("the legacy default query is valid");
+        assert_eq!(legacy.response_version, ResponseVersion::V1);
+        assert!(legacy.vad.is_none());
+        for raw in ["response_version=2", "response_version=2&vad=false"] {
+            let query =
+                TranscribeQuery::parse(Some(raw)).expect("explicit v2 without VAD is valid");
+            assert_eq!(query.response_version, ResponseVersion::V2);
+            assert!(query.vad.is_none());
+        }
+        let defaults = TranscribeQuery::parse(Some("response_version=2&vad=true"))
+            .expect("enabled VAD uses the shared defaults");
+        assert_eq!(defaults.vad, Some(VadPolicyConfig::default()));
+        let custom = TranscribeQuery::parse(Some("response_version=2&vad=true&vad_threshold=0.1234567&vad_neg_threshold=0&vad_min_speech_ms=0&vad_min_silence_ms=0.03125&vad_speech_pad_ms=0.0625"))
+            .expect("finite zero and fractional policy values are valid");
+        let policy = custom.vad.expect("the query enabled VAD");
+        assert_eq!(policy.thresholds().speech().get(), 0.1234567);
+        assert_eq!(policy.durations().minimum_speech_milliseconds(), 0.0);
+        assert_eq!(policy.durations().minimum_silence_milliseconds(), 0.03125);
+        assert_eq!(policy.padding().milliseconds(), 0.0625);
+        for raw in [
+            "response_version=0",
+            "response_version=02",
+            "response_version=3",
+            "response_version=2&response_version=2",
+            "vad=false",
+            "vad=true",
+            "vad_threshold=0.5",
+            "response_version=1&vad=false",
+            "response_version=2&vad=1",
+            "response_version=2&vad=True",
+            "response_version=2&vad=true&vad=true",
+            "response_version=2&vad_threshold=0.5",
+            "response_version=2&vad=false&vad_speech_pad_ms=0",
+            "response_version=2&vad=true&vad_threshold=NaN",
+            "response_version=2&vad=true&vad_threshold=1.1",
+            "response_version=2&vad=true&vad_neg_threshold=-0.1",
+            "response_version=2&vad=true&vad_neg_threshold=0.6",
+            "response_version=2&vad=true&vad_min_speech_ms=-1",
+            "response_version=2&vad=true&vad_min_silence_ms=inf",
+            "response_version=2&vad=true&vad_speech_pad_ms=3e38",
+        ] {
+            assert!(
+                TranscribeQuery::parse(Some(raw)).is_err(),
+                "must refuse {raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn injected_batch_vad_uses_bound_policy_resampling_and_no_off_asset() -> Result<(), String> {
+        let fixture = crate::tests::assembly_fixture()?;
+        let telemetry = test_support::prepare(64, 1)?;
+        let admission = Arc::new(AdmissionState::new(&ServiceAdmission::new(
+            1,
+            1,
+            Duration::from_secs(5),
+        )?)?);
+        let state = state_with_telemetry(
+            &fixture,
+            admission,
+            telemetry.metrics_arc(),
+            telemetry.producer(),
+        )?;
+        let progress = RequestProgress {
+            telemetry: telemetry.producer(),
+            request_id: "injected-vad".into(),
+            started: Instant::now(),
+        };
+        let calls = Cell::new(0);
+        let run = |raw: &str| {
+            let query = TranscribeQuery::parse(Some(raw))?;
+            do_transcribe_with_vad_factory(
+                BatchWork {
+                    context: &state.context,
+                    metrics: &state.metrics,
+                    query: &query,
+                    bytes: crate::tests::pcm16_wav_silence(8000, 640)?,
+                    control: &ExecutionControl::for_request(),
+                    progress: &progress,
+                },
+                || {
+                    calls.set(calls.get() + 1);
+                    Ok(SilentVad)
+                },
+            )
+            .map_err(TranscribeError::message)
+        };
+        assert!(!run("ext=wav")?.contains("schema_version"));
+        assert!(
+            run("ext=wav&response_version=2&vad=false")?
+                .contains("\"applied\":{\"vad\":{\"enabled\":false}}")
+        );
+        assert_eq!(calls.get(), 0);
+        assert!(
+            run("ext=wav&response_version=2&vad=true").is_err(),
+            "selected missing asset must refuse before factory"
+        );
+        assert_eq!(calls.get(), 0);
+        fixture.write_injected_vad_asset()?;
+        let result = run(
+            "ext=wav&response_version=2&vad=true&vad_threshold=0.1234567&vad_neg_threshold=0&vad_min_speech_ms=0&vad_speech_pad_ms=0.0625",
+        )?;
+        assert_eq!(calls.get(), 1);
+        assert!(result.contains("\"sample_rate_in\":8000"));
+        assert!(result.contains("\"sample_rate\":16000"));
+        assert!(result.contains(&format!("\"threshold\":{}", f64::from(0.1234567_f32))));
+        assert!(result.contains("\"speech_pad_ms\":0.0625"));
+        assert!(result.contains("\"text\":\"\""));
+        assert_eq!(histogram_count(&state.metrics, "asr_vad_seconds"), 1);
+        let lines = telemetry.drain_lines();
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("\"phase\":\"vad_initialization\"")
+                    && line.contains("\"state\":\"completed\""))
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("\"phase\":\"vad_detection\"")
+                    && line.contains("\"state\":\"completed\""))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn unsupported_vad_model_rate_refuses_before_audio_and_factory_but_off_works()
+    -> Result<(), String> {
+        let fixture = crate::tests::assembly_fixture_at_rate(8000)?;
+        let telemetry = test_support::prepare(32, 1)?;
+        let admission = Arc::new(AdmissionState::new(&ServiceAdmission::new(
+            1,
+            1,
+            Duration::from_secs(5),
+        )?)?);
+        let state = state_with_telemetry(
+            &fixture,
+            admission,
+            telemetry.metrics_arc(),
+            telemetry.producer(),
+        )?;
+        let progress = RequestProgress {
+            telemetry: telemetry.producer(),
+            request_id: "rate-vad".into(),
+            started: Instant::now(),
+        };
+        let query = TranscribeQuery::parse(Some("response_version=2&vad=true"))?;
+        let result = do_transcribe_with_vad_factory(
+            BatchWork {
+                context: &state.context,
+                metrics: &state.metrics,
+                query: &query,
+                bytes: vec![0],
+                control: &ExecutionControl::for_request(),
+                progress: &progress,
+            },
+            || -> Result<SilentVad, String> {
+                panic!("unsupported model rate must not construct a detector")
+            },
+        );
+        assert!(matches!(
+            result,
+            Err(TranscribeError::UnsupportedCapability(_))
+        ));
+        assert!(
+            telemetry.drain_lines().is_empty(),
+            "pure rate refusal precedes audio decoding"
+        );
+        let query = TranscribeQuery::parse(Some("ext=wav"))?;
+        do_transcribe_with_vad_factory(
+            BatchWork {
+                context: &state.context,
+                metrics: &state.metrics,
+                query: &query,
+                bytes: crate::tests::pcm16_wav_silence(8000, 640)?,
+                control: &ExecutionControl::for_request(),
+                progress: &progress,
+            },
+            || -> Result<SilentVad, String> { panic!("VAD-off must not construct a detector") },
+        )
+        .map_err(TranscribeError::message)?;
+        Ok(())
+    }
+
+    struct BlockingVad {
+        started: Option<tokio::sync::oneshot::Sender<()>>,
+        release: Option<std::sync::mpsc::Receiver<()>>,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        dropped: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl SpeechProbabilityDetector for BlockingVad {
+        fn probabilities(&mut self, samples: ChannelAudioView<'_>) -> Result<Vec<f32>, String> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if let Some(started) = self.started.take() {
+                started
+                    .send(())
+                    .map_err(|_| "detection start observer closed")?;
+            }
+            if let Some(release) = self.release.take() {
+                release.recv().map_err(|_| "detection release closed")?;
+            }
+            Ok(vec![0.0; samples.samples().len().div_ceil(512)])
+        }
+    }
+
+    impl Drop for BlockingVad {
+        fn drop(&mut self) {
+            self.dropped
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn vad_constructor_and_detection_retain_admission_until_cancelled_native_work_drops()
+    -> Result<(), String> {
+        for block_constructor in [true, false] {
+            let fixture = crate::tests::assembly_fixture()?;
+            fixture.write_injected_vad_asset()?;
+            let telemetry = test_support::prepare(32, 1)?;
+            let admission = Arc::new(AdmissionState::new(&ServiceAdmission::new(
+                1,
+                1,
+                Duration::from_secs(5),
+            )?)?);
+            let state = state_with_telemetry(
+                &fixture,
+                Arc::clone(&admission),
+                telemetry.metrics_arc(),
+                telemetry.producer(),
+            )?;
+            let control = ExecutionControl::for_request();
+            let owner = RequestWorkOwner::new(
+                admission
+                    .admit_http()
+                    .expect("fresh admission owns one permit"),
+                control.clone(),
+            );
+            let progress = RequestProgress {
+                telemetry: telemetry.producer(),
+                request_id: "blocked-vad".into(),
+                started: Instant::now(),
+            };
+            let execution = AdmittedExecution {
+                owner,
+                control: control.clone(),
+                timeout: Duration::from_millis(100),
+                progress: progress.clone(),
+            };
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let work_calls = Arc::clone(&calls);
+            let work_dropped = Arc::clone(&dropped);
+            let metrics = Arc::clone(&state.metrics);
+            let query = TranscribeQuery::parse(Some("ext=wav&response_version=2&vad=true"))?;
+            let audio = crate::tests::pcm16_wav_silence(16000, 640)?;
+            let task = tokio::spawn(execute_admitted_work(execution, move |control| {
+                do_transcribe_with_vad_factory(
+                    BatchWork {
+                        context: &state.context,
+                        metrics: &state.metrics,
+                        query: &query,
+                        bytes: audio,
+                        control,
+                        progress: &progress,
+                    },
+                    move || {
+                        if block_constructor {
+                            started_tx
+                                .send(())
+                                .map_err(|_| "construction start observer closed")?;
+                            release_rx
+                                .recv()
+                                .map_err(|_| "construction release closed")?;
+                            Ok(BlockingVad {
+                                started: None,
+                                release: None,
+                                calls: work_calls,
+                                dropped: work_dropped,
+                            })
+                        } else {
+                            Ok(BlockingVad {
+                                started: Some(started_tx),
+                                release: Some(release_rx),
+                                calls: work_calls,
+                                dropped: work_dropped,
+                            })
+                        }
+                    },
+                )
+            }));
+            tokio::time::timeout(Duration::from_secs(5), started_rx)
+                .await
+                .expect("the admitted VAD operation starts")
+                .expect("the VAD start sender remains live");
+            assert!(matches!(
+                task.await.expect("controlled VAD work does not panic"),
+                AdmittedWorkResult::TimedOut
+            ));
+            assert_eq!(admission.available_http(), 0);
+            assert!(matches!(
+                admission.admit_http(),
+                Err(AdmissionRefusal::Overloaded)
+            ));
+            assert!(!dropped.load(std::sync::atomic::Ordering::SeqCst));
+            release_tx
+                .send(())
+                .expect("the blocked VAD operation waits for release");
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while admission.available_http() == 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("native completion eventually releases the request permit");
+            assert_eq!(control.state(), ExecutionState::Cancelled);
+            assert!(
+                dropped.load(std::sync::atomic::Ordering::SeqCst),
+                "the session drops before permit release"
+            );
+            assert_eq!(
+                calls.load(std::sync::atomic::Ordering::SeqCst),
+                usize::from(!block_constructor)
+            );
+            assert_eq!(histogram_count(&metrics, "asr_frontend_seconds"), 0);
+            assert_eq!(histogram_count(&metrics, "asr_vad_seconds"), 0);
+            let lines = telemetry.drain_lines();
+            let phase = if block_constructor {
+                "vad_initialization"
+            } else {
+                "vad_detection"
+            };
+            assert!(
+                lines
+                    .iter()
+                    .any(|line| line.contains(&format!("\"phase\":\"{phase}\""))
+                        && line.contains("\"state\":\"failed\""))
+            );
+            assert!(
+                lines
+                    .iter()
+                    .all(|line| !line.contains("response_projection"))
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn cancellation_before_vad_construction_prevents_initialization() -> Result<(), String> {
+        let telemetry = test_support::prepare(16, 1)?;
+        let control = ExecutionControl::for_request();
+        control.request_cancellation();
+        let progress = RequestProgress {
+            telemetry: telemetry.producer(),
+            request_id: "cancel-before-vad".into(),
+            started: Instant::now(),
+        };
+        let refused = request_vad(
+            || -> Result<SilentVad, String> { panic!("a cancelled request cannot initialize VAD") },
+            &control,
+            &progress,
+        );
+        assert!(matches!(refused, Err(TranscribeError::Unavailable(_))));
+        assert!(telemetry.drain_lines().is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn v2_errors_begin_only_after_complete_binding_and_keep_request_id() -> Result<(), String>
+    {
+        let fixture = crate::tests::assembly_fixture()?;
+        let telemetry = test_support::prepare(64, 1)?;
+        let admission = Arc::new(AdmissionState::new(&ServiceAdmission::new(
+            1,
+            1,
+            Duration::from_secs(5),
+        )?)?);
+        let state = state_with_telemetry(
+            &fixture,
+            Arc::clone(&admission),
+            telemetry.metrics_arc(),
+            telemetry.producer(),
+        )?;
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-request-id",
+            HeaderValue::from_static("versioned-refusal"),
+        );
+        for (raw, code) in [
+            ("response_version=2&ext=wav", Some("invalid_request")),
+            (
+                "response_version=2&model=rnnt",
+                Some("unsupported_capability"),
+            ),
+            (
+                "response_version=2&vad=true",
+                Some("unsupported_capability"),
+            ),
+            ("response_version=2&vad=true&vad_threshold=NaN", None),
+            ("response_version=3", None),
+            ("response_version=2&response_version=2", None),
+        ] {
+            let response = project(
+                transcribe(
+                    State(state.clone()),
+                    headers.clone(),
+                    RawQuery(Some(raw.into())),
+                    Bytes::from_static(b"invalid audio"),
+                )
+                .await,
+            )
+            .await;
+            assert_eq!(response.status, StatusCode::BAD_REQUEST);
+            assert_eq!(
+                response.request_id,
+                Some(HeaderValue::from_static("versioned-refusal"))
+            );
+            let body =
+                std::str::from_utf8(&response.body).expect("all error responses are UTF-8 JSON");
+            match code {
+                Some(code) => assert!(
+                    body.starts_with(&format!(
+                        "{{\"schema_version\":2,\"error\":{{\"code\":\"{code}\",\"message\":"
+                    )),
+                    "{body}"
+                ),
+                None => assert!(body.starts_with("{\"error\":\""), "{body}"),
+            }
+        }
+        for refusal in [AdmissionRefusal::Overloaded, AdmissionRefusal::Draining] {
+            let code = match refusal {
+                AdmissionRefusal::Overloaded => "overloaded",
+                AdmissionRefusal::Draining => "draining",
+            };
+            let request_id = RequestId::from_headers(&headers)?;
+            let response = project(http_admission_refusal(
+                refusal,
+                &state.metrics,
+                &request_id,
+                ResponseVersion::V2,
+            ))
+            .await;
+            assert_eq!(response.status, StatusCode::SERVICE_UNAVAILABLE);
+            assert!(
+                std::str::from_utf8(&response.body)
+                    .expect("refusals are UTF-8 JSON")
+                    .contains(&format!("\"code\":\"{code}\""))
+            );
+        }
+        Ok(())
+    }
 
     fn histogram_count(metrics: &Metrics, name: &str) -> u64 {
         let rendered = metrics.render(0, 0, 0, None);
@@ -1369,7 +2052,7 @@ mod tests {
                 json_ok("{}".to_owned())
             }
             HttpAdmissionDecision::Refused(refusal) => {
-                http_admission_refusal(refusal, &metrics, &request_id)
+                http_admission_refusal(refusal, &metrics, &request_id, ResponseVersion::V1)
             }
         };
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);

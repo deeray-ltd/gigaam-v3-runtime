@@ -202,7 +202,7 @@ worker="rnnt", and asr_build_info with version. asr_active_streams measures rese
 WebSocket channel capacity, not an exact socket count.
 
 The histograms are asr_transcribe_latency_seconds, asr_frontend_seconds,
-asr_encoder_seconds, and asr_decode_seconds. Each has cumulative buckets at 0.01, 0.025,
+asr_encoder_seconds, asr_decode_seconds, and asr_vad_seconds. Each has cumulative buckets at 0.01, 0.025,
 0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, and +Inf; plus _sum, _count, and
 _rejected_total with reason="non_finite" or reason="negative". Histograms accept only
 finite nonnegative observations. A finite aggregate that overflows is exposed as +Inf,
@@ -226,6 +226,8 @@ entry, and typed `phase` and `state` values:
 | `work` | `started`, `terminal` | The blocking work starts, then actually finishes or unwinds. |
 | `audio_decode` | `started`, `completed`, `failed`, `interrupted` | Encoded-audio validation and file decoding. |
 | `resample` | `started`, `completed`, `failed`, `interrupted` | Conversion of decoded audio to the model sample rate. |
+| `vad_initialization` | `started`, `completed`, `failed`, `interrupted` | Enabled request-owned native VAD session construction and the following cancellation checkpoint. |
+| `vad_detection` | `started`, `completed`, `failed`, `interrupted` | One actual detector call for a selected physical channel and the following cancellation checkpoint. |
 | `batch_transcription` | `started`, `completed`, `failed`, `interrupted` | The aggregate batch workflow, including frontend work, scheduler waiting, native recognition and stitching. |
 | `response_projection` | `started`, `completed`, `failed`, `interrupted` | Transcript response construction and serialization. |
 | `deadline` | `elapsed` | The HTTP deadline requests cancellation; this is not work completion. |
@@ -235,13 +237,21 @@ returning a result. Work-terminal and deadline records include the actually obse
 `execution_state`; a deadline racing with completion may observe a terminal state already.
 The terminal work record is emitted after the request owner acknowledges completion,
 failure or cancellation and releases admission. The established `transcribe` access record
-and public transcript response remain unchanged. A 504 access record can precede the actual
+and version 1 transcript response remain unchanged. A 504 access record can precede the actual
 work-terminal record while blocking/native work still owns admission.
 
 These phases start after the body has been fully buffered and admission has succeeded.
 They do not measure upload/body waiting, pre-admission refusals, or an individual native
 queue wait. `batch_transcription` does not distinguish queue waiting from native execution;
 the worker-pending gauge and aggregate timing histograms remain additional observations.
+Enabled batch VAD adds initialization before `batch_transcription`, and detection phases
+inside it. These events measure actual calls, not an inferred model-worker queue. The
+`asr_vad_seconds` histogram records completed HTTP batch detection and segmentation time,
+excluding detector construction; failed/cancelled batches publish no aggregate VAD sample.
+No VAD phases or histogram samples are added for disabled requests. Initialization time is
+visible in its phase record and included in enabled request RTF. One session is constructed
+inside each admitted blocking request, reused sequentially, and dropped before admission
+is released, including after the caller has received a timeout.
 An accepted stage-start record can identify unfinished work while no later record is
 available, but a missing finish is not proof of a hang: telemetry is best-effort and records
 can be dropped. Check the telemetry drop and sink-failure counters when interpreting gaps.

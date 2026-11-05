@@ -7,7 +7,8 @@
 use crate::composition;
 use crate::configuration;
 use crate::grammar::{
-    ChannelOutput, DecoderChoice, TranscribeInvocation, TranscribeOutput, TurnOutput,
+    ChannelOutput, DecoderChoice, EvidenceVersion, TranscribeInvocation, TranscribeOutput,
+    TurnOutput,
 };
 use crate::projection::{
     self, EvidenceAudioHeader, EvidenceModelHeader, EvidenceWriter, TranscribeSummary,
@@ -16,7 +17,7 @@ use crate::projection::{
 use gigaam_audio::load;
 use gigaam_model_package::ModelPackage;
 use gigaam_primitives::f64_to_f32;
-use gigaam_recognition::{ExecutionControl, FrameRate, RequiredEncoderRoles};
+use gigaam_recognition::{ExecutionControl, FrameRate, RequiredEncoderRoles, vad::VAD_SR};
 use gigaam_transcription::{
     BatchChannelPolicy, BatchConfig, BatchSetup, MultiChannelBatchOptions, MultiChannelBatchSetup,
     MultiChannelBatchTranscriber, TurnGap, WindowEvidenceObserver, subsampling_factor,
@@ -35,6 +36,13 @@ pub(crate) fn run(invocation: TranscribeInvocation) -> Result<(), String> {
     if evidence_path.is_some() && invocation.decoder == DecoderChoice::Rnnt {
         return Err("--evidence requires CTC; it does not support --rnnt".into());
     }
+    if evidence_path.is_some()
+        && invocation.vad.is_some()
+        && invocation.evidence_version == EvidenceVersion::V1
+    {
+        return Err("--vad requires --evidence-version 2 when --evidence is enabled".into());
+    }
+    let vad_policy = invocation.vad.map(|policy| policy.bind()).transpose()?;
     let runtime = configuration::runtime(&invocation.runtime, required_roles)
         .map_err(|error| format!("runtime configuration: {error}"))?;
     let options = MultiChannelBatchOptions::new(
@@ -49,6 +57,11 @@ pub(crate) fn run(invocation: TranscribeInvocation) -> Result<(), String> {
 
     let package = composition::open_package(&invocation.model)?;
     let sample_rate = composition::package_sample_rate(&package)?;
+    if vad_policy.is_some() && sample_rate.as_usize()? != VAD_SR {
+        return Err(format!(
+            "batch VAD requires a {VAD_SR} Hz model/frontend rate"
+        ));
+    }
     let config = BatchConfig::new(
         sample_rate,
         invocation.window_seconds,
@@ -56,6 +69,13 @@ pub(crate) fn run(invocation: TranscribeInvocation) -> Result<(), String> {
         invocation.padding,
     )?;
     composition::initialize_runtime(&runtime)?;
+    let mut vad = vad_policy
+        .map(|policy| {
+            composition::vad(&package, runtime.plan().intra_threads())
+                .map(|detector| (detector, policy))
+                .map_err(|error| format!("vad: {error}"))
+        })
+        .transpose()?;
     let frontend = composition::frontend_for_package(&package, frontend_mode)
         .map_err(|error| format!("frontend: {error}"))?;
     let decoder = match invocation.decoder {
@@ -87,6 +107,7 @@ pub(crate) fn run(invocation: TranscribeInvocation) -> Result<(), String> {
             path,
             &invocation.model,
             &package,
+            invocation.evidence_version,
         )?)),
         None => None,
     };
@@ -122,14 +143,17 @@ pub(crate) fn run(invocation: TranscribeInvocation) -> Result<(), String> {
             samples: audio.frames(),
             total_seconds: audio.duration_seconds(),
         })?;
+        evidence.write_vad_policy(vad_policy)?;
     }
     let inference_started = Instant::now();
-    let result = transcriber
-        .transcribe(&audio)
-        .map_err(|error| error.to_string())?;
+    let result = match &mut vad {
+        Some((detector, policy)) => transcriber.transcribe_with_vad(&audio, detector, *policy),
+        None => transcriber.transcribe(&audio),
+    }
+    .map_err(|error| error.to_string())?;
     let inference_elapsed = inference_started.elapsed();
     if let Some(evidence) = &evidence {
-        evidence.finish()?;
+        evidence.finish(&result)?;
     }
     projection::transcribe(TranscribeSummary {
         result: &result,
@@ -142,17 +166,19 @@ pub(crate) fn run(invocation: TranscribeInvocation) -> Result<(), String> {
         overlap_seconds: invocation.overlap_seconds,
         loading_elapsed,
         inference_elapsed,
+        vad_policy,
     });
     Ok(())
 }
 
-/// Opens the evidence file and writes its `evidence v1` and `model` header lines from the
+/// Opens the evidence file and writes its selected version and `model` header lines from the
 /// package's own typed frontend and CTC definitions. The subsampling factor is derived, never a
 /// hard-coded constant, through the exact function the batch window loop uses internally.
 fn open_evidence_writer(
     path: &Path,
     model_path: &Path,
     package: &ModelPackage,
+    version: EvidenceVersion,
 ) -> Result<EvidenceWriter, String> {
     let model_id = evidence_token(model_path, "model")?;
     let frame_rate = FrameRate::new(f64_to_f32(package.frontend().frames_per_second()))
@@ -177,6 +203,7 @@ fn open_evidence_writer(
             space,
             subsampling,
         },
+        version,
     )
 }
 

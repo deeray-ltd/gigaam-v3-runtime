@@ -331,6 +331,37 @@ fn transcribe_cli_effect_order() {
 }
 
 #[test]
+fn batch_vad_refuses_rate_and_ambiguous_evidence_before_native_or_file_creation() {
+    let witness = CliWitnessRoot::new();
+    let mut incompatible = witness.command("transcribe", witness.dialog_rate_one_package());
+    incompatible.arg("--vad");
+    assert_exact_failure(
+        run(incompatible),
+        "batch VAD requires a 16000 Hz model/frontend rate",
+        "batch VAD incompatible model rate",
+    );
+
+    let evidence = witness.empty_working_directory.join("segmented.evidence");
+    let mut ambiguous = witness.command("transcribe", witness.valid_package());
+    ambiguous.arg("--vad").arg("--evidence").arg(&evidence);
+    assert_exact_failure(
+        run(ambiguous),
+        "--vad requires --evidence-version 2 when --evidence is enabled",
+        "batch VAD evidence v1 refusal",
+    );
+    assert!(
+        !evidence.exists(),
+        "refused VAD must not create an ambiguous evidence file"
+    );
+
+    assert_ort_sentinel(
+        run(witness.command("transcribe", witness.dialog_rate_one_package())),
+        &witness,
+        "VAD-off retains valid non-16k model behavior",
+    );
+}
+
+#[test]
 fn stream_cli_effect_order_and_checked_chunk_precedence() {
     let witness = CliWitnessRoot::new();
 

@@ -20,7 +20,7 @@ use gigaam_recognition::{CudaAssignmentEvidence, DirectRecognizer, EncoderRole, 
 use gigaam_transcription::{
     BackchannelMark, BatchConfig, DuplicateClassification, MultiChannelBatchResult,
     ObservationMode, OfflineDialogFailure, OfflineDialogFailureOrigin, OfflineDialogResult,
-    SpeechSegment, WindowTiming, WindowTimingObserver, words_to_text,
+    SpeechSegment, VadPolicyConfig, WindowTiming, WindowTimingObserver, words_to_text,
 };
 use std::sync::Arc;
 use std::time::Duration;
@@ -133,6 +133,7 @@ pub(crate) struct TranscribeSummary<'a> {
     pub(crate) overlap_seconds: f32,
     pub(crate) loading_elapsed: Duration,
     pub(crate) inference_elapsed: Duration,
+    pub(crate) vad_policy: Option<VadPolicyConfig>,
 }
 
 /// Emits the exact established transcript and timing projections for batch transcription.
@@ -163,6 +164,10 @@ pub(crate) fn transcribe(summary: TranscribeSummary<'_>) {
     }
     let timings = summary.result.timings();
     let dual_mono = summary.result.duplicate() == DuplicateClassification::DualMono;
+    if let Some(policy) = summary.vad_policy {
+        vad_policy(policy);
+        eprintln!("# VAD: {:.3} s", timings.vad_seconds());
+    }
     eprintln!(
         "# stages: frontend {:.3} s | encoder {:.3} s | decoder+stitching {:.3} s",
         timings.frontend_seconds(),
@@ -222,10 +227,35 @@ pub(crate) struct VadSummary<'a> {
     pub(crate) sample_rate: usize,
     pub(crate) total_samples: usize,
     pub(crate) elapsed: Duration,
+    pub(crate) channel: Option<usize>,
+}
+
+/// Prints the exact validated fixed-domain policy used by an enabled VAD operation.
+pub(crate) fn vad_policy(policy: VadPolicyConfig) {
+    eprintln!(
+        "# VAD policy: sample_rate={} threshold={} neg_threshold={} min_speech_ms={} min_silence_ms={} speech_pad_ms={}",
+        gigaam_recognition::vad::VAD_SR,
+        policy.thresholds().speech().get(),
+        policy.thresholds().silence().get(),
+        policy.durations().minimum_speech_milliseconds(),
+        policy.durations().minimum_silence_milliseconds(),
+        policy.padding().milliseconds(),
+    );
+}
+
+pub(crate) fn vad_selection(source_channels: usize, selected: impl Iterator<Item = usize>) {
+    let selected = selected
+        .map(|index| index.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    eprintln!("# VAD channels: source={source_channels} selected={selected}");
 }
 
 /// Emits VAD segments followed by the established aggregate timing projection.
 pub(crate) fn vad(summary: VadSummary<'_>) -> Result<(), String> {
+    if let Some(channel) = summary.channel {
+        println!("[channel {channel}]");
+    }
     let sample_rate = count_to_f32(summary.sample_rate);
     let mut speech = 0usize;
     for segment in summary.segments {

@@ -336,12 +336,18 @@ impl BatchConfig {
 /// Aggregated successful stage timings for one single-channel batch transcript.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct StageTimings {
+    vad_seconds: f64,
     frontend_seconds: f64,
     encoder_seconds: f64,
     decode_seconds: f64,
 }
 
 impl StageTimings {
+    /// Successful detector execution and speech-segmentation policy time; zero without VAD.
+    pub const fn vad_seconds(&self) -> f64 {
+        self.vad_seconds
+    }
+
     pub const fn frontend_seconds(&self) -> f64 {
         self.frontend_seconds
     }
@@ -358,6 +364,10 @@ impl StageTimings {
         self.frontend_seconds += value;
     }
 
+    pub(crate) fn add_vad(&mut self, value: f64) {
+        self.vad_seconds += value;
+    }
+
     pub(crate) fn add_encoder(&mut self, value: f64) {
         self.encoder_seconds += value;
     }
@@ -368,6 +378,7 @@ impl StageTimings {
 
     pub fn combined(self, other: Self) -> Self {
         Self {
+            vad_seconds: self.vad_seconds + other.vad_seconds,
             frontend_seconds: self.frontend_seconds + other.frontend_seconds,
             encoder_seconds: self.encoder_seconds + other.encoder_seconds,
             decode_seconds: self.decode_seconds + other.decode_seconds,
