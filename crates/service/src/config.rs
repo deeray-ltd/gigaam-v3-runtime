@@ -9,7 +9,7 @@
 
 //! Strict command-line and environment grammar for the service process.
 
-use crate::admission::{RequestBodyLimit, ServiceAdmission};
+use crate::admission::{ApiMode, RequestBodyLimit, ServiceAdmission};
 use gigaam_audio::{FrontendMode, SampleRate};
 use gigaam_model_package::EncoderPrecision;
 use gigaam_recognition::{
@@ -293,6 +293,7 @@ fn configured_path(
 /// Borrowed process limit inputs, separated from process environment access for deterministic tests.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct ServerLimitEnvironment<'a> {
+    pub(crate) api_mode: Option<&'a str>,
     pub(crate) max_http: Option<&'a str>,
     pub(crate) max_ws: Option<&'a str>,
     pub(crate) max_uploads: Option<&'a str>,
@@ -441,6 +442,7 @@ impl SampleCount {
 
 impl ServerLimits {
     pub(crate) fn from_process() -> Result<Self, String> {
+        let api_mode = process_env("ASR_API_MODE")?;
         let max_http = process_env("ASR_MAX_CONCURRENCY")?;
         let max_ws = process_env("ASR_MAX_STREAMS")?;
         let max_uploads = process_env("ASR_MAX_UPLOADS")?;
@@ -452,6 +454,7 @@ impl ServerLimits {
         let dedup_threshold = process_env("ASR_DEDUP_THRESHOLD")?;
         let backchannel_max = process_env("ASR_BACKCHANNEL_MAX_MS")?;
         Self::parse(ServerLimitEnvironment {
+            api_mode: api_mode.as_deref(),
             max_http: max_http.as_deref(),
             max_ws: max_ws.as_deref(),
             max_uploads: max_uploads.as_deref(),
@@ -467,6 +470,7 @@ impl ServerLimits {
 
     pub(crate) fn parse(environment: ServerLimitEnvironment<'_>) -> Result<Self, String> {
         // Parse every raw input before runtime work.
+        let api_mode = ApiMode::parse(environment.api_mode)?;
         let max_http = required_positive_usize(environment.max_http, "ASR_MAX_CONCURRENCY", 8)?;
         let max_ws = required_positive_usize(environment.max_ws, "ASR_MAX_STREAMS", 32)?;
         let body_mb = required_positive_usize(environment.body_mb, "ASR_BODY_LIMIT_MB", 64)?;
@@ -505,7 +509,8 @@ impl ServerLimits {
             .map_err(|_| "ASR_REQ_TIMEOUT_SEC exceeds the supported duration".to_owned())?;
         let admission =
             ServiceAdmission::new(max_http, max_ws, Duration::from_secs(timeout_seconds))?
-                .with_uploads(max_uploads, Duration::from_secs(upload_timeout))?;
+                .with_uploads(max_uploads, Duration::from_secs(upload_timeout))?
+                .with_api_mode(api_mode);
         Ok(Self {
             admission,
             request_body_limit,
@@ -832,6 +837,28 @@ mod tests {
                 "refusal must name ASR_ORT_THREADS: {error}"
             );
         }
+    }
+
+    #[test]
+    fn api_mode_is_validated_before_runtime() {
+        for mode in ["", "both", "OPENAI"] {
+            assert!(
+                ServerLimits::parse(ServerLimitEnvironment {
+                    api_mode: Some(mode),
+                    ..ServerLimitEnvironment::default()
+                })
+                .is_err()
+            );
+        }
+        let openai = ServerLimits::parse(ServerLimitEnvironment {
+            api_mode: Some("openai"),
+            ..ServerLimitEnvironment::default()
+        })
+        .expect("documented mode and language");
+        assert_eq!(
+            openai.admission.api_mode(),
+            crate::admission::ApiMode::OpenAi
+        );
     }
 
     #[test]

@@ -277,6 +277,7 @@ pub(super) fn run_process(
     })
     .unwrap_or_else(|error| fatal(&format!("service capabilities: {error}")));
     let request_body_limit = limits.request_body_limit();
+    let api_mode = limits.admission.api_mode();
     let admission = limits.admission;
     let (app, admission) = assemble(
         ServiceApplicationParameters::new(capabilities, policy, admission, request_body_limit),
@@ -294,7 +295,11 @@ pub(super) fn run_process(
         let listener = tokio::net::TcpListener::bind(&address)
             .await
             .unwrap_or_else(|error| fatal(&format!("bind {address}: {error}")));
-        eprintln!("# asr-serve listening on http://{address}  (POST /v1/transcribe, GET /health, /livez, /readyz)");
+        let api = match api_mode {
+            crate::admission::ApiMode::Native => "POST /v1/transcribe, WS /v1/stream",
+            crate::admission::ApiMode::OpenAi => "POST /v1/audio/transcriptions, GET /v1/models",
+        };
+        eprintln!("# asr-serve listening on http://{address} ({api}; GET /health, /livez, /readyz)");
         let shutdown = async move {
             wait_signal().await.unwrap_or_else(|error| fatal(&error));
             crate::admission::begin_draining_then(admission.as_ref(), || {

@@ -64,7 +64,7 @@ curl --data-binary @audio.wav \
   'http://127.0.0.1:8080/v1/transcribe?model=ctc&words=true'
 ~~~
 
-The service also accepts OpenAI Python SDK transcription requests at `/v1/audio/transcriptions` (supported model IDs and fields are documented in [docs/API.md](docs/API.md)). The SDK bearer token is not authenticated; bind locally or place the service behind a trusted ingress.
+Set `ASR_API_MODE=openai` to accept OpenAI Python SDK transcription requests at `/v1/audio/transcriptions` instead of the native API (supported model IDs and fields are documented in [docs/API.md](docs/API.md)). The SDK bearer token is not authenticated; bind locally or place the service behind a trusted ingress.
 
 This quick start is CPU-only. Default-feature Service and CLI builds select CUDA and require
 role-specific verified CTC/RNN-T assignment fingerprints. Explicit

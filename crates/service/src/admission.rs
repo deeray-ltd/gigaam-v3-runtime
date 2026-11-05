@@ -16,12 +16,29 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ApiMode {
+    Native,
+    OpenAi,
+}
+
+impl ApiMode {
+    pub(crate) fn parse(value: Option<&str>) -> Result<Self, String> {
+        match value {
+            None | Some("native") => Ok(Self::Native),
+            Some("openai") => Ok(Self::OpenAi),
+            Some(_) => Err("ASR_API_MODE must be native or openai".into()),
+        }
+    }
+}
+
 /// Validated admission capacities and the complete HTTP work deadline.
 #[derive(Debug)]
 pub struct ServiceAdmission {
     max_http: NonZeroUsize,
     max_ws: NonZeroUsize,
     request_timeout: Duration,
+    api_mode: ApiMode,
     max_uploads: NonZeroUsize,
     upload_timeout: Duration,
 }
@@ -45,9 +62,19 @@ impl ServiceAdmission {
             max_http,
             max_ws,
             request_timeout,
+            api_mode: ApiMode::Native,
             max_uploads: max_http,
             upload_timeout: request_timeout,
         })
+    }
+
+    pub(crate) fn with_api_mode(mut self, mode: ApiMode) -> Self {
+        self.api_mode = mode;
+        self
+    }
+
+    pub(crate) const fn api_mode(&self) -> ApiMode {
+        self.api_mode
     }
 
     pub(crate) fn with_uploads(

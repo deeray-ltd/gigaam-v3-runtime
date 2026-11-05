@@ -1,7 +1,9 @@
 # API reference
 
-asr-serve exposes one HTTP batch endpoint, one WebSocket streaming endpoint, three probes,
-and Prometheus metrics:
+The `ASR_API_MODE` setting selects one batch API. Native mode (the default) exposes the
+following routes. OpenAI mode replaces the native batch and WebSocket routes with the
+OpenAI-compatible batch and model-list routes described below. Probes and metrics remain
+available in both modes:
 
 | Method | Route | Contract |
 | --- | --- | --- |
@@ -24,12 +26,14 @@ refuse rather than selecting a default.
 
 ## OpenAI-compatible batch transcription
 
+Set `ASR_API_MODE=openai` to expose `POST /v1/audio/transcriptions` and `GET /v1/models`.
+Native `/v1/transcribe` and `/v1/stream` are unavailable in this mode.
 `POST /v1/audio/transcriptions` accepts multipart form data with `file` and `model`.
 `gigaam-v3` and `gigaam-v3-ctc` select CTC; `gigaam-v3-rnnt` selects a loaded RNN-T
 model. `GET /v1/models` lists available local models. Supported response formats are
 `json`, `text`, and `verbose_json`; word and segment timestamps can be requested for
 verbose output. Language, when supplied, must be `ru`, and temperature must be zero.
-Streaming and nonempty prompts are unsupported. Native endpoints remain available.
+Streaming and nonempty prompts are unsupported.
 
 ## HTTP batch transcription
 
