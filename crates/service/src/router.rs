@@ -17,6 +17,7 @@ use axum::routing::get;
 /// application context.
 pub(crate) struct RouterParameters {
     pub(crate) http: http::HttpState,
+    pub(crate) api_mode: crate::admission::ApiMode,
     pub(crate) ws: ws::WsState,
     pub(crate) health: health::HealthState,
     pub(crate) metrics: metrics::MetricsState,
@@ -25,15 +26,18 @@ pub(crate) struct RouterParameters {
 pub(crate) fn router(parameters: RouterParameters) -> Router {
     let RouterParameters {
         http,
+        api_mode,
         ws,
         health,
         metrics,
     } = parameters;
-    Router::new()
-        .merge(http::routes(http.clone()).into_router())
-        .merge(http::openai_routes(http).into_router())
-        .route("/v1/stream", get(ws::stream).with_state(ws))
-        .route("/health", get(health::health).with_state(health.clone()))
+    let api = match api_mode {
+        crate::admission::ApiMode::Native => Router::new()
+            .merge(http::routes(http).into_router())
+            .route("/v1/stream", get(ws::stream).with_state(ws)),
+        crate::admission::ApiMode::OpenAi => http::openai_routes(http).into_router(),
+    };
+    api.route("/health", get(health::health).with_state(health.clone()))
         .route("/livez", get(health::livez))
         .route("/readyz", get(health::readyz).with_state(health))
         .route("/metrics", get(metrics::endpoint).with_state(metrics))

@@ -116,7 +116,12 @@ impl OrtRnntTransition {
         })
     }
 
-    fn joint_argmax(&mut self, frame: &[f32], decoder: &[f32]) -> Result<usize, String> {
+    fn joint_argmax(
+        &mut self,
+        frame: &[f32],
+        decoder: &[f32],
+        scored: bool,
+    ) -> Result<(usize, Option<f64>), String> {
         let encoder = Tensor::from_array(([1_usize, self.encoder_dimension, 1], frame.to_vec()))
             .map_err(|error| error.to_string())?;
         let prediction =
@@ -148,7 +153,12 @@ impl OrtRnntTransition {
                 best = index;
             }
         }
-        Ok(best)
+        let score = if scored {
+            Some(crate::contracts::selected_log_probability(logits, best)?)
+        } else {
+            None
+        };
+        Ok((best, score))
     }
 }
 
@@ -169,7 +179,20 @@ impl RnntTransition for OrtRnntTransition {
     }
 
     fn select(&mut self, frame: &[f32], state: &Self::State) -> Result<usize, String> {
-        self.joint_argmax(frame, &state.decoder)
+        self.joint_argmax(frame, &state.decoder, false)
+            .map(|(token, _)| token)
+    }
+
+    fn select_scored(
+        &mut self,
+        frame: &[f32],
+        state: &Self::State,
+    ) -> Result<(usize, f64), String> {
+        let (token, score) = self.joint_argmax(frame, &state.decoder, true)?;
+        Ok((
+            token,
+            score.ok_or_else(|| "missing RNN-T joint score".to_owned())?,
+        ))
     }
 
     fn advance(&mut self, token: usize, state: &mut Self::State) -> Result<(), String> {
@@ -274,6 +297,14 @@ impl WindowDecoder for RnntDecoder {
     }
 
     fn decode(&mut self, features: FeatureMatrixView<'_>) -> Result<Decoded, String> {
+        self.decode_with_detail(features, crate::contracts::ScoreDetail::None)
+    }
+
+    fn decode_with_detail(
+        &mut self,
+        features: FeatureMatrixView<'_>,
+        detail: crate::contracts::ScoreDetail,
+    ) -> Result<Decoded, String> {
         let started = Instant::now();
         let (encoded, output_frames) = self.encoder.forward(features)?;
         let encoder_seconds = started.elapsed().as_secs_f64();
@@ -282,18 +313,22 @@ impl WindowDecoder for RnntDecoder {
             output_frames,
             encoder_dimension: self.encoder_dimension,
         };
-        let output = rnnt::greedy(
+        let output = rnnt::greedy_with_detail(
             &mut self.transition,
             &frames,
             self.blank,
             self.max_symbols_per_step,
+            detail == crate::contracts::ScoreDetail::TokenLogProbabilities,
         )?;
         let words = ctc::tokens_to_words(output.tokens(), &self.vocabulary, self.frame_rate)?;
-        Decoded::new(
+        let spans = ctc::word_token_spans(output.tokens(), &self.vocabulary);
+        Decoded::new_with_tokens(crate::contracts::DecodedTokensInput {
             words,
-            output.silence().to_vec(),
+            silence: output.silence().to_vec(),
             output_frames,
             encoder_seconds,
-        )
+            tokens: output.tokens().to_vec(),
+            word_spans: spans,
+        })
     }
 }

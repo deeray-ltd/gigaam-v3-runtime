@@ -27,7 +27,9 @@ use axum::extract::{DefaultBodyLimit, FromRequest, Multipart, RawQuery, Request,
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::Response;
 use axum::routing::{get, post};
-use gigaam_audio::{ChannelAudioView, EncodedAudio, load_bytes, resample_audio};
+use gigaam_audio::{
+    ChannelAudio, ChannelAudioView, DecodedAudio, EncodedAudio, load_bytes, resample_audio,
+};
 use gigaam_recognition::{ExecutionControl, ExecutionState, SpeechProbabilityDetector, Vad};
 use gigaam_transcription::{
     BatchChannelPolicy, BatchSetup, MultiChannelBatchError, MultiChannelBatchOptions,
@@ -148,7 +150,7 @@ async fn parse_openai_multipart(
         .await
         .map_err(|error| crate::openai::ApiError::new(error.status(), error.to_string(), None))?;
     let mut fields = Vec::new();
-    while let Some(field) = multipart
+    while let Some(mut field) = multipart
         .next_field()
         .await
         .map_err(|error| crate::openai::ApiError::new(error.status(), error.to_string(), None))?
@@ -164,13 +166,19 @@ async fn parse_openai_multipart(
             .ok_or_else(|| crate::openai::ApiError::bad("field name is required", None))?
             .to_owned();
         let filename = field.file_name().map(str::to_owned);
-        let bytes = field.bytes().await.map_err(|error| {
+        let mut bytes = Vec::new();
+        while let Some(chunk) = field.chunk().await.map_err(|error| {
             crate::openai::ApiError::new(error.status(), error.to_string(), None)
-        })?;
-        if name != "file" && bytes.len() > 16 * 1024 {
-            return Err(crate::openai::ApiError::bad("text field too large", None));
+        })? {
+            if name != "file" && chunk.len() > 16 * 1024 - bytes.len() {
+                return Err(crate::openai::ApiError::bad(
+                    "multipart text field exceeds 16 KiB",
+                    None,
+                ));
+            }
+            bytes.extend_from_slice(&chunk);
         }
-        fields.push((name, filename, bytes.to_vec()));
+        fields.push((name, filename, bytes));
     }
     crate::openai::parse_fields(fields, state.context.capabilities.rnnt.is_some())
 }
@@ -256,7 +264,7 @@ async fn openai_transcribe(State(state): State<HttpState>, request: Request) -> 
             extension: input.extension.clone(),
             options: Options::default(),
             response_version: ResponseVersion::V1,
-            vad: None,
+            vad: input.vad,
         };
         let capabilities = &context.capabilities;
         let (batch, duration, _, _) = run_batch(
@@ -269,6 +277,8 @@ async fn openai_transcribe(State(state): State<HttpState>, request: Request) -> 
                 progress: &work_progress,
             },
             || Vad::from_pack(&capabilities.pack, capabilities.intra_threads),
+            input.segment,
+            true,
         )?;
         work_progress.stage(BatchStage::ResponseProjection, || {
             crate::openai_response::project(crate::openai_response::ProjectionInput {
@@ -700,6 +710,17 @@ struct AdmittedExecution {
     progress: RequestProgress,
 }
 
+/// Cancels detached native work when its requesting future disappears.
+struct RequestCancellationGuard(Option<ExecutionControl>);
+
+impl Drop for RequestCancellationGuard {
+    fn drop(&mut self) {
+        if let Some(control) = self.0.take() {
+            control.request_cancellation();
+        }
+    }
+}
+
 /// The production execution seam retains the admission owner inside blocking work until it
 /// terminalizes, even after the HTTP deadline has returned a timeout response.
 async fn execute_admitted_work<T, F>(execution: AdmittedExecution, work: F) -> AdmittedWorkResult<T>
@@ -713,6 +734,7 @@ where
         timeout,
         progress,
     } = execution;
+    let mut cancellation_guard = RequestCancellationGuard(Some(control.clone()));
     let work_control = control.clone();
     let work_progress = progress.clone();
     let job = tokio::task::spawn_blocking(move || {
@@ -741,7 +763,7 @@ where
             }
         }
     });
-    match tokio::time::timeout(timeout, job).await {
+    let result = match tokio::time::timeout(timeout, job).await {
         Ok(Ok(result)) => AdmittedWorkResult::Completed(result),
         Ok(Err(_)) => AdmittedWorkResult::WorkerFailure,
         Err(_) => {
@@ -749,7 +771,9 @@ where
             progress.observe(BatchProgress::DeadlineElapsed(state));
             AdmittedWorkResult::TimedOut
         }
-    }
+    };
+    cancellation_guard.0 = None;
+    result
 }
 
 /// Resolves capacity before response projection so no rejected request can start work.
@@ -1063,7 +1087,7 @@ fn do_transcribe_with_vad_factory<D: SpeechProbabilityDetector>(
 ) -> Result<String, TranscribeError> {
     let query = work.query;
     let progress = work.progress;
-    let (result, duration, source_rate, rtf) = run_batch(work, factory)?;
+    let (result, duration, source_rate, rtf) = run_batch(work, factory, false, false)?;
     let options = query.options;
     progress.stage(BatchStage::ResponseProjection, || {
         let response = transcribe_response(ResponseInput {
@@ -1089,6 +1113,8 @@ fn do_transcribe_with_vad_factory<D: SpeechProbabilityDetector>(
 fn run_batch<D: SpeechProbabilityDetector>(
     work: BatchWork<'_>,
     factory: impl FnOnce() -> Result<D, String>,
+    scored: bool,
+    downmix: bool,
 ) -> Result<(MultiChannelBatchResult, f32, u32, f32), TranscribeError> {
     let BatchWork {
         context,
@@ -1104,7 +1130,7 @@ fn run_batch<D: SpeechProbabilityDetector>(
             TranscribeError::UnsupportedCapability("rnnt model is not loaded".into())
         })?,
     };
-    if query.vad.is_some() {
+    if query.vad.is_some() || scored {
         if context
             .capabilities
             .frontend
@@ -1143,6 +1169,7 @@ fn run_batch<D: SpeechProbabilityDetector>(
         resample_audio(loaded, context.capabilities.frontend.sample_rate())
             .map_err(TranscribeError::BadRequest)
     })?;
+    let audio = if downmix { mono_downmix(audio)? } else { audio };
     let options = query.options;
     let channel_policy = http_batch_channel_policy(options);
     let turn_gap = TurnGap::new(options.turn_gap).map_err(TranscribeError::BadRequest)?;
@@ -1159,11 +1186,21 @@ fn run_batch<D: SpeechProbabilityDetector>(
     ))
     .map_err(TranscribeError::Unavailable)?;
     let started = Instant::now();
-    let result = match query.vad {
-        None => progress.stage(BatchStage::BatchTranscription, || {
+    let result = match (query.vad, scored) {
+        (policy, true) => {
+            let mut detector = request_vad(factory, control, progress)?;
+            let result = progress.stage(BatchStage::BatchTranscription, || {
+                complete_multi_channel_batch(metrics, || {
+                    transcriber.transcribe_scored(&audio, &mut detector, policy)
+                })
+            })?;
+            metrics.observe_vad(result.timings().vad_seconds());
+            result
+        }
+        (None, false) => progress.stage(BatchStage::BatchTranscription, || {
             complete_multi_channel_batch(metrics, || transcriber.transcribe(&audio))
         })?,
-        Some(policy) => {
+        (Some(policy), false) => {
             let mut detector = request_vad(factory, control, progress)?;
             let result = progress.stage(BatchStage::BatchTranscription, || {
                 complete_multi_channel_batch(metrics, || {
@@ -1177,6 +1214,23 @@ fn run_batch<D: SpeechProbabilityDetector>(
     let duration = audio.duration_seconds();
     let rtf = started.elapsed().as_secs_f32() / duration.max(1e-6);
     Ok((result, duration, source_rate, rtf))
+}
+
+fn mono_downmix(audio: DecodedAudio) -> Result<DecodedAudio, TranscribeError> {
+    if audio.channels().len() == 1 {
+        return Ok(audio);
+    }
+    let count = u16::try_from(audio.channels().len())
+        .map_err(|_| TranscribeError::BadRequest("too many source channels".into()))?;
+    let divisor = f32::from(count);
+    let mut samples = vec![0.0; audio.frames()];
+    for channel in audio.channels() {
+        for (mixed, sample) in samples.iter_mut().zip(channel.samples()) {
+            *mixed += *sample / divisor;
+        }
+    }
+    let mono = ChannelAudio::new(samples).map_err(TranscribeError::BadRequest)?;
+    DecodedAudio::new(audio.sample_rate(), vec![mono]).map_err(TranscribeError::BadRequest)
 }
 
 fn vad_checkpoint(control: &ExecutionControl) -> Result<(), TranscribeError> {
@@ -2424,47 +2478,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn openai_multipart_preserves_field_count_and_text_limits() -> Result<(), String> {
-        let fixture = crate::tests::assembly_fixture()?;
-        let telemetry = test_support::prepare(32, 1)?;
-        let admission = Arc::new(AdmissionState::new(&ServiceAdmission::new(
-            1,
-            1,
-            Duration::from_secs(5),
-        )?)?);
-        let state = state_with_telemetry(
-            &fixture,
-            admission,
-            telemetry.metrics_arc(),
-            telemetry.producer(),
-        )?;
-        let mut many = String::new();
-        for _ in 0..17 {
-            many.push_str("--b\r\nContent-Disposition: form-data; name=\"timestamp_granularities[]\"\r\n\r\nword\r\n");
-        }
-        many.push_str("--b--\r\n");
-        let large = format!(
-            "--b\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\n{}\r\n--b--\r\n",
-            "x".repeat(16 * 1024 + 1)
-        );
-        for body in [many, large] {
-            let request = Request::builder()
-                .method("POST")
-                .uri("/v1/audio/transcriptions")
-                .header("content-type", "multipart/form-data; boundary=b")
-                .body(axum::body::Body::from(body))
-                .map_err(|error| error.to_string())?;
-            assert_eq!(
-                openai_transcribe(State(state.clone()), request)
-                    .await
-                    .status(),
-                StatusCode::BAD_REQUEST
-            );
-        }
-        Ok(())
-    }
-
-    #[tokio::test]
     async fn openai_multipart_runs_through_shared_batch_executor() -> Result<(), String> {
         let fixture = crate::tests::assembly_fixture()?;
         let telemetry = test_support::prepare(32, 1)?;
@@ -2534,6 +2547,161 @@ mod tests {
             histogram_count(&metrics, "asr_transcribe_latency_seconds"),
             2
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn multipart_field_limits_and_full_vad_request() -> Result<(), String> {
+        let fixture = crate::tests::assembly_fixture()?;
+        let telemetry = test_support::prepare(32, 1)?;
+        let admission = Arc::new(AdmissionState::new(&ServiceAdmission::new(
+            1,
+            1,
+            Duration::from_secs(5),
+        )?)?);
+        let metrics = telemetry.metrics_arc();
+        let state = state_with_telemetry(
+            &fixture,
+            admission,
+            Arc::clone(&metrics),
+            telemetry.producer(),
+        )?;
+        fn request(parts: &[(&str, &str)]) -> Result<Request, String> {
+            let mut body = Vec::new();
+            for (name, value) in parts {
+                body.extend(
+                    format!(
+                        "--b\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n"
+                    )
+                    .as_bytes(),
+                );
+            }
+            body.extend(b"--b--\r\n");
+            Request::builder()
+                .header("content-type", "multipart/form-data; boundary=b")
+                .body(axum::body::Body::from(body))
+                .map_err(|e| e.to_string())
+        }
+        async fn error_body(state: &HttpState, request: Request) -> Result<String, String> {
+            let error = parse_openai_multipart(state, request)
+                .await
+                .err()
+                .ok_or("expected refusal")?;
+            let response = error.response();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let bytes = to_bytes(response.into_body(), 4096)
+                .await
+                .map_err(|e| e.to_string())?;
+            String::from_utf8(bytes.to_vec()).map_err(|e| e.to_string())
+        }
+        let valid = [
+            ("model", "gigaam-v3"),
+            ("file", "wave"),
+            ("response_format", "verbose_json"),
+            ("timestamp_granularities[]", "word"),
+            ("timestamp_granularities[]", "segment"),
+            ("language", "ru"),
+            ("temperature", "0"),
+            ("stream", "false"),
+            ("prompt", ""),
+            ("vad", "true"),
+            ("vad_threshold", "0.7"),
+            ("vad_neg_threshold", "0.3"),
+            ("vad_min_speech_ms", "250"),
+            ("vad_min_silence_ms", "100"),
+            ("vad_speech_pad_ms", "30"),
+        ];
+        let input = parse_openai_multipart(&state, request(&valid)?)
+            .await
+            .map_err(|e| format!("{e:?}"))?;
+        assert!(input.vad.is_some());
+        assert!(input.word && input.segment);
+        let mut sixteen = valid.to_vec();
+        sixteen.push(("prompt", ""));
+        assert!(
+            error_body(&state, request(&sixteen)?)
+                .await?
+                .contains("prompt must occur once")
+        );
+        sixteen.push(("prompt", ""));
+        assert!(
+            error_body(&state, request(&sixteen)?)
+                .await?
+                .contains("too many multipart fields")
+        );
+        let exact = "x".repeat(16 * 1024);
+        assert!(
+            error_body(&state, request(&[("prompt", &exact)])?)
+                .await?
+                .contains("prompt is not supported")
+        );
+        let over = "x".repeat(16 * 1024 + 1);
+        let response = openai_transcribe(State(state), request(&[("prompt", &over)])?).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), 4096)
+            .await
+            .map_err(|e| e.to_string())?;
+        assert!(
+            String::from_utf8(body.to_vec())
+                .map_err(|e| e.to_string())?
+                .contains("multipart text field exceeds 16 KiB")
+        );
+        assert_eq!(metric_counter(&metrics, "asr_transcribe_requests_total"), 1);
+        assert_eq!(metric_counter(&metrics, "asr_transcribe_errors_total"), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn oversized_multipart_text_is_rejected_before_body_finishes() -> Result<(), String> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let fixture = crate::tests::assembly_fixture()?;
+        let telemetry = test_support::prepare(32, 1)?;
+        let admission = Arc::new(AdmissionState::new(&ServiceAdmission::new(
+            1,
+            1,
+            Duration::from_secs(5),
+        )?)?);
+        let mut state = state_with_telemetry(
+            &fixture,
+            admission,
+            telemetry.metrics_arc(),
+            telemetry.producer(),
+        )?;
+        state.request_body_limit = RequestBodyLimit::new(128 * 1024)?;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .map_err(|e| e.to_string())?;
+        let address = listener.local_addr().map_err(|e| e.to_string())?;
+        let server =
+            tokio::spawn(
+                async move { axum::serve(listener, openai_routes(state).into_router()).await },
+            );
+        let mut stream = tokio::net::TcpStream::connect(address)
+            .await
+            .map_err(|e| e.to_string())?;
+        let prefix = format!(
+            "--b\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\n{}",
+            "x".repeat(16 * 1024 + 1)
+        );
+        let headers = format!(
+            "POST /v1/audio/transcriptions HTTP/1.1\r\nHost: {address}\r\nContent-Type: multipart/form-data; boundary=b\r\nContent-Length: 100000\r\nConnection: close\r\n\r\n"
+        );
+        stream
+            .write_all(headers.as_bytes())
+            .await
+            .map_err(|e| e.to_string())?;
+        stream
+            .write_all(prefix.as_bytes())
+            .await
+            .map_err(|e| e.to_string())?;
+        let mut buffer = vec![0; 4096];
+        let count = tokio::time::timeout(Duration::from_secs(3), stream.read(&mut buffer))
+            .await
+            .map_err(|e| e.to_string())?
+            .map_err(|e| e.to_string())?;
+        let response = std::str::from_utf8(&buffer[..count]).map_err(|e| e.to_string())?;
+        assert!(response.starts_with("HTTP/1.1 400"), "{response}");
+        server.abort();
         Ok(())
     }
 
@@ -2702,6 +2870,55 @@ mod tests {
         .await
         .map_err(|e| e.to_string())?;
         server.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dropped_request_cancels_work_but_retains_capacity_until_acknowledged()
+    -> Result<(), String> {
+        let settings = ServiceAdmission::new(1, 1, Duration::from_secs(5))?;
+        let admission = Arc::new(AdmissionState::new(&settings)?);
+        let control = ExecutionControl::for_request();
+        let owner = RequestWorkOwner::new(
+            admission.admit_http().map_err(|_| "admit work")?,
+            control.clone(),
+        );
+        let telemetry = test_support::prepare(16, 1)?;
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+        let execution = AdmittedExecution {
+            owner,
+            control: control.clone(),
+            timeout: Duration::from_secs(5),
+            progress: RequestProgress {
+                telemetry: telemetry.producer(),
+                request_id: "dropped-request".into(),
+                started: Instant::now(),
+            },
+        };
+        let task = tokio::spawn(execute_admitted_work(execution, move |_| {
+            started_tx
+                .send(())
+                .map_err(|_| TranscribeError::Unavailable("start observer dropped".into()))?;
+            release_rx
+                .recv()
+                .map_err(|_| TranscribeError::Unavailable("release dropped".into()))?;
+            Ok::<_, TranscribeError>(())
+        }));
+        started_rx.await.map_err(|error| error.to_string())?;
+        task.abort();
+        let _ = task.await;
+        assert_eq!(control.state(), ExecutionState::CancelRequested);
+        assert_eq!(admission.available_http(), 0);
+        release_tx.send(()).map_err(|error| error.to_string())?;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while admission.available_http() != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+        assert_eq!(control.state(), ExecutionState::Cancelled);
         Ok(())
     }
 

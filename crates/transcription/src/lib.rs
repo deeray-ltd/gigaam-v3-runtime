@@ -63,7 +63,7 @@ pub use stitch::{
 };
 pub use stream::{EndpointDetector, StreamSession, StreamSetup};
 pub use text::{normalize_word, word_count, word_edits};
-pub use turns::{ChannelTranscript, TurnGap, dialog_text, merge, turns};
+pub use turns::{ChannelTranscript, ScoredSegment, TurnGap, dialog_text, merge, turns};
 pub use vad_policy::{
     SpeechSegment, VadDurations, VadPadding, VadPolicyConfig, VadThresholds, speech_segments,
 };
