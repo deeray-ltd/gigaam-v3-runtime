@@ -6,6 +6,9 @@ All notable changes are recorded here. Pre-1.0 releases do not promise a stable 
 
 ### Added
 
+- Separate upload reader capacity and timeout settings bound body ingestion independently
+  from batch processing capacity and its deadline.
+
 - OpenAI-compatible multipart batch transcription and model-list routes alongside
   the existing native API, with JSON, text, and verbose responses.
 

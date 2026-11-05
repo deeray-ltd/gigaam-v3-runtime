@@ -295,6 +295,8 @@ fn configured_path(
 pub(crate) struct ServerLimitEnvironment<'a> {
     pub(crate) max_http: Option<&'a str>,
     pub(crate) max_ws: Option<&'a str>,
+    pub(crate) max_uploads: Option<&'a str>,
+    pub(crate) upload_timeout_seconds: Option<&'a str>,
     pub(crate) body_mb: Option<&'a str>,
     pub(crate) timeout_seconds: Option<&'a str>,
     pub(crate) dedup_default: Option<&'a str>,
@@ -441,6 +443,8 @@ impl ServerLimits {
     pub(crate) fn from_process() -> Result<Self, String> {
         let max_http = process_env("ASR_MAX_CONCURRENCY")?;
         let max_ws = process_env("ASR_MAX_STREAMS")?;
+        let max_uploads = process_env("ASR_MAX_UPLOADS")?;
+        let upload_timeout_seconds = process_env("ASR_UPLOAD_TIMEOUT_SEC")?;
         let body_mb = process_env("ASR_BODY_LIMIT_MB")?;
         let timeout_seconds = process_env("ASR_REQ_TIMEOUT_SEC")?;
         let dedup_default = process_env("ASR_DEDUP")?;
@@ -450,6 +454,8 @@ impl ServerLimits {
         Self::parse(ServerLimitEnvironment {
             max_http: max_http.as_deref(),
             max_ws: max_ws.as_deref(),
+            max_uploads: max_uploads.as_deref(),
+            upload_timeout_seconds: upload_timeout_seconds.as_deref(),
             body_mb: body_mb.as_deref(),
             timeout_seconds: timeout_seconds.as_deref(),
             dedup_default: dedup_default.as_deref(),
@@ -460,12 +466,21 @@ impl ServerLimits {
     }
 
     pub(crate) fn parse(environment: ServerLimitEnvironment<'_>) -> Result<Self, String> {
-        // Parse every raw input in the established environment-key order before runtime work.
+        // Parse every raw input before runtime work.
         let max_http = required_positive_usize(environment.max_http, "ASR_MAX_CONCURRENCY", 8)?;
         let max_ws = required_positive_usize(environment.max_ws, "ASR_MAX_STREAMS", 32)?;
         let body_mb = required_positive_usize(environment.body_mb, "ASR_BODY_LIMIT_MB", 64)?;
         let timeout_usize =
             required_positive_usize(environment.timeout_seconds, "ASR_REQ_TIMEOUT_SEC", 120)?;
+        let max_uploads =
+            required_positive_usize(environment.max_uploads, "ASR_MAX_UPLOADS", max_http)?;
+        let upload_timeout = required_positive_usize(
+            environment.upload_timeout_seconds,
+            "ASR_UPLOAD_TIMEOUT_SEC",
+            timeout_usize,
+        )?;
+        let upload_timeout = u64::try_from(upload_timeout)
+            .map_err(|_| "ASR_UPLOAD_TIMEOUT_SEC exceeds the supported duration".to_owned())?;
         let dedup_default = parse_optional_bool(environment.dedup_default, "ASR_DEDUP", true)?;
         let dedup_window = match environment.dedup_window {
             Some(value) => PositiveDuration::parse_seconds(value, "ASR_DEDUP_WINDOW_SEC")?,
@@ -489,7 +504,8 @@ impl ServerLimits {
         let timeout_seconds = u64::try_from(timeout_usize)
             .map_err(|_| "ASR_REQ_TIMEOUT_SEC exceeds the supported duration".to_owned())?;
         let admission =
-            ServiceAdmission::new(max_http, max_ws, Duration::from_secs(timeout_seconds))?;
+            ServiceAdmission::new(max_http, max_ws, Duration::from_secs(timeout_seconds))?
+                .with_uploads(max_uploads, Duration::from_secs(upload_timeout))?;
         Ok(Self {
             admission,
             request_body_limit,
@@ -815,6 +831,38 @@ mod tests {
                 error.contains("ASR_ORT_THREADS"),
                 "refusal must name ASR_ORT_THREADS: {error}"
             );
+        }
+    }
+
+    #[test]
+    fn upload_limits_default_to_resolved_processing_limits_and_validate_independently() {
+        let limits = ServerLimits::parse(ServerLimitEnvironment {
+            max_http: Some("3"),
+            timeout_seconds: Some("7"),
+            ..ServerLimitEnvironment::default()
+        })
+        .expect("resolved processing limits");
+        assert_eq!(
+            limits.admission.upload_timeout(),
+            std::time::Duration::from_secs(7)
+        );
+        let state = crate::admission::AdmissionState::new(&limits.admission).expect("valid limits");
+        let a = state.admit_upload().expect("first reader");
+        let b = state.admit_upload().expect("second reader");
+        let c = state.admit_upload().expect("third reader");
+        assert!(state.admit_upload().is_err());
+        drop((a, b, c));
+        for environment in [
+            ServerLimitEnvironment {
+                max_uploads: Some("0"),
+                ..ServerLimitEnvironment::default()
+            },
+            ServerLimitEnvironment {
+                upload_timeout_seconds: Some("0"),
+                ..ServerLimitEnvironment::default()
+            },
+        ] {
+            assert!(ServerLimits::parse(environment).is_err());
         }
     }
 

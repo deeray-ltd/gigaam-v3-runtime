@@ -148,7 +148,7 @@ async fn parse_openai_multipart(
         .await
         .map_err(|error| crate::openai::ApiError::new(error.status(), error.to_string(), None))?;
     let mut fields = Vec::new();
-    while let Some(field) = multipart
+    while let Some(mut field) = multipart
         .next_field()
         .await
         .map_err(|error| crate::openai::ApiError::new(error.status(), error.to_string(), None))?
@@ -164,13 +164,19 @@ async fn parse_openai_multipart(
             .ok_or_else(|| crate::openai::ApiError::bad("field name is required", None))?
             .to_owned();
         let filename = field.file_name().map(str::to_owned);
-        let bytes = field.bytes().await.map_err(|error| {
+        let mut bytes = Vec::new();
+        while let Some(chunk) = field.chunk().await.map_err(|error| {
             crate::openai::ApiError::new(error.status(), error.to_string(), None)
-        })?;
-        if name != "file" && bytes.len() > 16 * 1024 {
-            return Err(crate::openai::ApiError::bad("text field too large", None));
+        })? {
+            if name != "file" && chunk.len() > 16 * 1024 - bytes.len() {
+                return Err(crate::openai::ApiError::bad(
+                    "multipart text field exceeds 16 KiB",
+                    None,
+                ));
+            }
+            bytes.extend_from_slice(&chunk);
         }
-        fields.push((name, filename, bytes.to_vec()));
+        fields.push((name, filename, bytes));
     }
     crate::openai::parse_fields(fields, state.context.capabilities.rnnt.is_some())
 }
@@ -700,6 +706,17 @@ struct AdmittedExecution {
     progress: RequestProgress,
 }
 
+/// Cancels detached native work when its requesting future disappears.
+struct RequestCancellationGuard(Option<ExecutionControl>);
+
+impl Drop for RequestCancellationGuard {
+    fn drop(&mut self) {
+        if let Some(control) = self.0.take() {
+            control.request_cancellation();
+        }
+    }
+}
+
 /// The production execution seam retains the admission owner inside blocking work until it
 /// terminalizes, even after the HTTP deadline has returned a timeout response.
 async fn execute_admitted_work<T, F>(execution: AdmittedExecution, work: F) -> AdmittedWorkResult<T>
@@ -713,6 +730,7 @@ where
         timeout,
         progress,
     } = execution;
+    let mut cancellation_guard = RequestCancellationGuard(Some(control.clone()));
     let work_control = control.clone();
     let work_progress = progress.clone();
     let job = tokio::task::spawn_blocking(move || {
@@ -741,7 +759,7 @@ where
             }
         }
     });
-    match tokio::time::timeout(timeout, job).await {
+    let result = match tokio::time::timeout(timeout, job).await {
         Ok(Ok(result)) => AdmittedWorkResult::Completed(result),
         Ok(Err(_)) => AdmittedWorkResult::WorkerFailure,
         Err(_) => {
@@ -749,7 +767,9 @@ where
             progress.observe(BatchProgress::DeadlineElapsed(state));
             AdmittedWorkResult::TimedOut
         }
-    }
+    };
+    cancellation_guard.0 = None;
+    result
 }
 
 /// Resolves capacity before response projection so no rejected request can start work.
@@ -2538,6 +2558,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn oversized_multipart_text_is_rejected_before_body_finishes() -> Result<(), String> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let fixture = crate::tests::assembly_fixture()?;
+        let telemetry = test_support::prepare(32, 1)?;
+        let admission = Arc::new(AdmissionState::new(&ServiceAdmission::new(
+            1,
+            1,
+            Duration::from_secs(5),
+        )?)?);
+        let mut state = state_with_telemetry(
+            &fixture,
+            admission,
+            telemetry.metrics_arc(),
+            telemetry.producer(),
+        )?;
+        state.request_body_limit = RequestBodyLimit::new(128 * 1024)?;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .map_err(|e| e.to_string())?;
+        let address = listener.local_addr().map_err(|e| e.to_string())?;
+        let server =
+            tokio::spawn(
+                async move { axum::serve(listener, openai_routes(state).into_router()).await },
+            );
+        let mut stream = tokio::net::TcpStream::connect(address)
+            .await
+            .map_err(|e| e.to_string())?;
+        let prefix = format!(
+            "--b\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\n{}",
+            "x".repeat(16 * 1024 + 1)
+        );
+        let headers = format!(
+            "POST /v1/audio/transcriptions HTTP/1.1\r\nHost: {address}\r\nContent-Type: multipart/form-data; boundary=b\r\nContent-Length: 100000\r\nConnection: close\r\n\r\n"
+        );
+        stream
+            .write_all(headers.as_bytes())
+            .await
+            .map_err(|e| e.to_string())?;
+        stream
+            .write_all(prefix.as_bytes())
+            .await
+            .map_err(|e| e.to_string())?;
+        let mut buffer = vec![0; 4096];
+        let count = tokio::time::timeout(Duration::from_secs(3), stream.read(&mut buffer))
+            .await
+            .map_err(|e| e.to_string())?
+            .map_err(|e| e.to_string())?;
+        let response = std::str::from_utf8(&buffer[..count]).map_err(|e| e.to_string())?;
+        assert!(response.starts_with("HTTP/1.1 400"), "{response}");
+        server.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn multipart_body_limits_preserve_413_for_headers_and_file() -> Result<(), String> {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let fixture = crate::tests::assembly_fixture()?;
@@ -2702,6 +2776,55 @@ mod tests {
         .await
         .map_err(|e| e.to_string())?;
         server.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dropped_request_cancels_work_but_retains_capacity_until_acknowledged()
+    -> Result<(), String> {
+        let settings = ServiceAdmission::new(1, 1, Duration::from_secs(5))?;
+        let admission = Arc::new(AdmissionState::new(&settings)?);
+        let control = ExecutionControl::for_request();
+        let owner = RequestWorkOwner::new(
+            admission.admit_http().map_err(|_| "admit work")?,
+            control.clone(),
+        );
+        let telemetry = test_support::prepare(16, 1)?;
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+        let execution = AdmittedExecution {
+            owner,
+            control: control.clone(),
+            timeout: Duration::from_secs(5),
+            progress: RequestProgress {
+                telemetry: telemetry.producer(),
+                request_id: "dropped-request".into(),
+                started: Instant::now(),
+            },
+        };
+        let task = tokio::spawn(execute_admitted_work(execution, move |_| {
+            started_tx
+                .send(())
+                .map_err(|_| TranscribeError::Unavailable("start observer dropped".into()))?;
+            release_rx
+                .recv()
+                .map_err(|_| TranscribeError::Unavailable("release dropped".into()))?;
+            Ok::<_, TranscribeError>(())
+        }));
+        started_rx.await.map_err(|error| error.to_string())?;
+        task.abort();
+        let _ = task.await;
+        assert_eq!(control.state(), ExecutionState::CancelRequested);
+        assert_eq!(admission.available_http(), 0);
+        release_tx.send(()).map_err(|error| error.to_string())?;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while admission.available_http() != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+        assert_eq!(control.state(), ExecutionState::Cancelled);
         Ok(())
     }
 

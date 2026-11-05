@@ -50,6 +50,23 @@ impl ServiceAdmission {
         })
     }
 
+    pub(crate) fn with_uploads(
+        mut self,
+        max_uploads: usize,
+        timeout: Duration,
+    ) -> Result<Self, String> {
+        self.max_uploads = NonZeroUsize::new(max_uploads)
+            .ok_or_else(|| "ASR_MAX_UPLOADS must be a positive integer".to_owned())?;
+        if max_uploads > Semaphore::MAX_PERMITS {
+            return Err("ASR_MAX_UPLOADS exceeds the supported semaphore capacity".into());
+        }
+        if timeout.is_zero() {
+            return Err("ASR_UPLOAD_TIMEOUT_SEC must be a positive integer".into());
+        }
+        self.upload_timeout = timeout;
+        Ok(self)
+    }
+
     pub(crate) const fn upload_timeout(&self) -> Duration {
         self.upload_timeout
     }
@@ -375,6 +392,34 @@ mod tests {
         let settings = ServiceAdmission::new(http, ws, Duration::from_secs(1))
             .expect("positive admission capacities create a test state");
         AdmissionState::new(&settings).expect("validated settings create admission state")
+    }
+
+    #[test]
+    fn upload_capacity_is_independent_and_drains_with_processing() {
+        let settings = ServiceAdmission::new(1, 1, Duration::from_secs(5))
+            .expect("valid processing limits")
+            .with_uploads(2, Duration::from_secs(3))
+            .expect("valid upload limits");
+        let state = AdmissionState::new(&settings).expect("valid admission state");
+        let first = state.admit_upload().expect("first reader");
+        let second = state.admit_upload().expect("second reader");
+        assert!(matches!(
+            state.admit_upload(),
+            Err(AdmissionRefusal::Overloaded)
+        ));
+        let processing = state
+            .admit_http()
+            .expect("slow readers do not consume processing capacity");
+        drop(first);
+        let replacement = state
+            .admit_upload()
+            .expect("released reader capacity is reusable");
+        assert_eq!(state.begin_draining(), DrainTransition::Began);
+        assert!(matches!(
+            state.admit_upload(),
+            Err(AdmissionRefusal::Draining)
+        ));
+        drop((second, replacement, processing));
     }
 
     #[test]
