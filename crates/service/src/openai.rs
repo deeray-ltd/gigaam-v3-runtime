@@ -25,6 +25,7 @@ pub(crate) struct Input {
     pub(crate) format: Format,
     pub(crate) word: bool,
     pub(crate) segment: bool,
+    pub(crate) vad: Option<gigaam_transcription::VadPolicyConfig>,
 }
 
 #[derive(Debug)]
@@ -112,6 +113,7 @@ pub(crate) fn parse_fields(
     let mut segment = false;
     let mut granularities = Vec::new();
     let mut seen = std::collections::HashSet::new();
+    let mut vad_fields = Vec::new();
     for (name, filename, bytes) in fields.drain(..) {
         if name != "timestamp_granularities[]" && !seen.insert(name.clone()) {
             return Err(ApiError::bad(
@@ -226,11 +228,14 @@ pub(crate) fn parse_fields(
                     return Err(ApiError::bad("streaming is not supported", Some("stream")));
                 }
             }
-            "prompt" => {
-                if !bytes.is_empty() {
-                    return Err(ApiError::bad("prompt is not supported", Some("prompt")));
-                }
+            "vad" | "vad_threshold" | "vad_neg_threshold" | "vad_min_speech_ms"
+            | "vad_min_silence_ms" | "vad_speech_pad_ms" => {
+                let value = String::from_utf8(bytes)
+                    .map_err(|_| ApiError::bad("VAD field must be UTF-8", None))?;
+                vad_fields.push((name, value));
             }
+            "prompt" if bytes.is_empty() => {}
+            "prompt" => return Err(ApiError::bad("prompt is not supported", Some("prompt"))),
             _ => return Err(ApiError::bad(format!("Unsupported field: {name}"), None)),
         }
     }
@@ -245,7 +250,12 @@ pub(crate) fn parse_fields(
     if format == Format::Verbose && granularities.is_empty() {
         segment = true;
     }
+    let vad_parameters = crate::protocol::QueryParameters::from_fields(vad_fields)
+        .map_err(|error| ApiError::bad(error, None))?;
+    let vad = crate::http::bind_vad_policy(&vad_parameters, crate::response::ResponseVersion::V2)
+        .map_err(|error| ApiError::bad(error, None))?;
     Ok(Input {
+        vad,
         audio,
         extension,
         engine,
@@ -258,34 +268,48 @@ pub(crate) fn parse_fields(
 #[cfg(test)]
 mod tests {
     use super::{Format, parse_fields};
+
     fn fields(extra: &[(&str, &str)]) -> Vec<(String, Option<String>, Vec<u8>)> {
-        let mut fields = vec![
+        let mut values = vec![
             ("model".into(), None, b"gigaam-v3".to_vec()),
-            ("file".into(), Some("a.wav".into()), b"wav".to_vec()),
+            ("file".into(), Some("speech.wav".into()), b"wave".to_vec()),
         ];
-        fields.extend(
+        values.extend(
             extra
                 .iter()
                 .map(|(key, value)| (String::from(*key), None, value.as_bytes().to_vec())),
         );
-        fields
+        values
     }
+
     #[test]
-    fn original_multipart_fields_and_refusals_remain_supported() {
+    fn validates_sdk_fields_and_shared_vad_controls() {
         let input = parse_fields(
-            fields(&[("prompt", ""), ("response_format", "verbose_json")]),
+            fields(&[
+                ("response_format", "verbose_json"),
+                ("timestamp_granularities[]", "word"),
+                ("vad", "true"),
+                ("vad_threshold", "0.7"),
+            ]),
             false,
         )
-        .expect("empty prompt and verbose format");
+        .expect("valid multipart fields");
         assert_eq!(input.format, Format::Verbose);
-        assert!(input.segment);
-        for invalid in [
-            vec![("prompt", "text")],
-            vec![("temperature", "1")],
-            vec![("unknown", "value")],
-            vec![("model", "gigaam-v3")],
+        assert!(input.word);
+        assert!(input.vad.is_some());
+        assert!(parse_fields(fields(&[("prompt", "")]), false).is_ok());
+        for extra in [
+            vec![("vad", "false"), ("vad_threshold", "0.7")],
+            vec![("vad", "true"), ("vad_threshold", "NaN")],
+            vec![("vad", "true"), ("vad", "false")],
+            vec![("language", "en")],
+            vec![("temperature", "0.5")],
+            vec![("stream", "true")],
+            vec![("prompt", " ")],
+            vec![("prompt", "speech")],
+            vec![("unknown", "x")],
         ] {
-            assert!(parse_fields(fields(&invalid), false).is_err());
+            assert!(parse_fields(fields(&extra), false).is_err());
         }
     }
 }

@@ -38,8 +38,10 @@ only with `verbose_json`; absent granularities default to segments. Streaming an
 prompts are not supported; an empty `prompt` is accepted. Requests may contain at most
 16 multipart parts, with each non-file field limited to 16 KiB. The configured request
 body limit also applies to the complete encoded multipart body. Unknown, repeated,
-unsupported, or conflicting fields refuse. Multichannel files are averaged to mono before
-recognition.
+unsupported, or conflicting fields refuse. The
+six VAD fields in the native table below are also accepted as multipart fields with the
+same defaults and constraints; no `response_version` field is used in this API.
+Multichannel files are averaged to mono before recognition.
 
 Verbose language is `russian`, the declared model language rather than a detection.
 Segment tokens and average log probability come from the retained native greedy decoder

@@ -50,6 +50,19 @@ impl QueryParameters {
         Ok(Self { values })
     }
 
+    pub(crate) fn from_fields(fields: Vec<(String, String)>) -> Result<Self, String> {
+        let mut values = BTreeMap::new();
+        for (key, value) in fields {
+            if key.is_empty() || value.is_empty() {
+                return Err("parameter name and value must not be empty".into());
+            }
+            if values.insert(key.clone(), value).is_some() {
+                return Err(format!("parameter {key:?} may be specified only once"));
+            }
+        }
+        Ok(Self { values })
+    }
+
     pub(crate) fn get(&self, key: &str) -> Option<&str> {
         self.values.get(key).map(String::as_str)
     }

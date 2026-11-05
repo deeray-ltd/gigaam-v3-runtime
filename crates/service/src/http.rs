@@ -264,7 +264,7 @@ async fn openai_transcribe(State(state): State<HttpState>, request: Request) -> 
             extension: input.extension.clone(),
             options: Options::default(),
             response_version: ResponseVersion::V1,
-            vad: None,
+            vad: input.vad,
         };
         let capabilities = &context.capabilities;
         let (batch, duration, _, _) = run_batch(
@@ -2478,47 +2478,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn openai_multipart_preserves_field_count_and_text_limits() -> Result<(), String> {
-        let fixture = crate::tests::assembly_fixture()?;
-        let telemetry = test_support::prepare(32, 1)?;
-        let admission = Arc::new(AdmissionState::new(&ServiceAdmission::new(
-            1,
-            1,
-            Duration::from_secs(5),
-        )?)?);
-        let state = state_with_telemetry(
-            &fixture,
-            admission,
-            telemetry.metrics_arc(),
-            telemetry.producer(),
-        )?;
-        let mut many = String::new();
-        for _ in 0..17 {
-            many.push_str("--b\r\nContent-Disposition: form-data; name=\"timestamp_granularities[]\"\r\n\r\nword\r\n");
-        }
-        many.push_str("--b--\r\n");
-        let large = format!(
-            "--b\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\n{}\r\n--b--\r\n",
-            "x".repeat(16 * 1024 + 1)
-        );
-        for body in [many, large] {
-            let request = Request::builder()
-                .method("POST")
-                .uri("/v1/audio/transcriptions")
-                .header("content-type", "multipart/form-data; boundary=b")
-                .body(axum::body::Body::from(body))
-                .map_err(|error| error.to_string())?;
-            assert_eq!(
-                openai_transcribe(State(state.clone()), request)
-                    .await
-                    .status(),
-                StatusCode::BAD_REQUEST
-            );
-        }
-        Ok(())
-    }
-
-    #[tokio::test]
     async fn openai_multipart_runs_through_shared_batch_executor() -> Result<(), String> {
         let fixture = crate::tests::assembly_fixture()?;
         let telemetry = test_support::prepare(32, 1)?;
@@ -2588,6 +2547,107 @@ mod tests {
             histogram_count(&metrics, "asr_transcribe_latency_seconds"),
             2
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn multipart_field_limits_and_full_vad_request() -> Result<(), String> {
+        let fixture = crate::tests::assembly_fixture()?;
+        let telemetry = test_support::prepare(32, 1)?;
+        let admission = Arc::new(AdmissionState::new(&ServiceAdmission::new(
+            1,
+            1,
+            Duration::from_secs(5),
+        )?)?);
+        let metrics = telemetry.metrics_arc();
+        let state = state_with_telemetry(
+            &fixture,
+            admission,
+            Arc::clone(&metrics),
+            telemetry.producer(),
+        )?;
+        fn request(parts: &[(&str, &str)]) -> Result<Request, String> {
+            let mut body = Vec::new();
+            for (name, value) in parts {
+                body.extend(
+                    format!(
+                        "--b\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n"
+                    )
+                    .as_bytes(),
+                );
+            }
+            body.extend(b"--b--\r\n");
+            Request::builder()
+                .header("content-type", "multipart/form-data; boundary=b")
+                .body(axum::body::Body::from(body))
+                .map_err(|e| e.to_string())
+        }
+        async fn error_body(state: &HttpState, request: Request) -> Result<String, String> {
+            let error = parse_openai_multipart(state, request)
+                .await
+                .err()
+                .ok_or("expected refusal")?;
+            let response = error.response();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let bytes = to_bytes(response.into_body(), 4096)
+                .await
+                .map_err(|e| e.to_string())?;
+            String::from_utf8(bytes.to_vec()).map_err(|e| e.to_string())
+        }
+        let valid = [
+            ("model", "gigaam-v3"),
+            ("file", "wave"),
+            ("response_format", "verbose_json"),
+            ("timestamp_granularities[]", "word"),
+            ("timestamp_granularities[]", "segment"),
+            ("language", "ru"),
+            ("temperature", "0"),
+            ("stream", "false"),
+            ("prompt", ""),
+            ("vad", "true"),
+            ("vad_threshold", "0.7"),
+            ("vad_neg_threshold", "0.3"),
+            ("vad_min_speech_ms", "250"),
+            ("vad_min_silence_ms", "100"),
+            ("vad_speech_pad_ms", "30"),
+        ];
+        let input = parse_openai_multipart(&state, request(&valid)?)
+            .await
+            .map_err(|e| format!("{e:?}"))?;
+        assert!(input.vad.is_some());
+        assert!(input.word && input.segment);
+        let mut sixteen = valid.to_vec();
+        sixteen.push(("prompt", ""));
+        assert!(
+            error_body(&state, request(&sixteen)?)
+                .await?
+                .contains("prompt must occur once")
+        );
+        sixteen.push(("prompt", ""));
+        assert!(
+            error_body(&state, request(&sixteen)?)
+                .await?
+                .contains("too many multipart fields")
+        );
+        let exact = "x".repeat(16 * 1024);
+        assert!(
+            error_body(&state, request(&[("prompt", &exact)])?)
+                .await?
+                .contains("prompt is not supported")
+        );
+        let over = "x".repeat(16 * 1024 + 1);
+        let response = openai_transcribe(State(state), request(&[("prompt", &over)])?).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), 4096)
+            .await
+            .map_err(|e| e.to_string())?;
+        assert!(
+            String::from_utf8(body.to_vec())
+                .map_err(|e| e.to_string())?
+                .contains("multipart text field exceeds 16 KiB")
+        );
+        assert_eq!(metric_counter(&metrics, "asr_transcribe_requests_total"), 1);
+        assert_eq!(metric_counter(&metrics, "asr_transcribe_errors_total"), 1);
         Ok(())
     }
 
