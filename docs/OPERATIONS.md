@@ -216,6 +216,36 @@ system clock can be represented as a JSON integer; otherwise they carry timestam
 instead of a synthetic timestamp. ASR_TRACE window observations are text records sent to
 stderr through the same runtime telemetry lineage.
 
+Admitted batch HTTP requests also emit `transcribe_phase` JSON Lines through the same
+bounded writer. These records carry the existing `req_id`, `elapsed_ms` since handler
+entry, and typed `phase` and `state` values:
+
+| Phase | States | Observed boundary |
+| --- | --- | --- |
+| `admission` | `admitted` | The request owns HTTP admission capacity. |
+| `work` | `started`, `terminal` | The blocking work starts, then actually finishes or unwinds. |
+| `audio_decode` | `started`, `completed`, `failed`, `interrupted` | Encoded-audio validation and file decoding. |
+| `resample` | `started`, `completed`, `failed`, `interrupted` | Conversion of decoded audio to the model sample rate. |
+| `batch_transcription` | `started`, `completed`, `failed`, `interrupted` | The aggregate batch workflow, including frontend work, scheduler waiting, native recognition and stitching. |
+| `response_projection` | `started`, `completed`, `failed`, `interrupted` | Transcript response construction and serialization. |
+| `deadline` | `elapsed` | The HTTP deadline requests cancellation; this is not work completion. |
+
+Finished stage records include `phase_ms`. `interrupted` means the stage unwound before
+returning a result. Work-terminal and deadline records include the actually observed
+`execution_state`; a deadline racing with completion may observe a terminal state already.
+The terminal work record is emitted after the request owner acknowledges completion,
+failure or cancellation and releases admission. The established `transcribe` access record
+and public transcript response remain unchanged. A 504 access record can precede the actual
+work-terminal record while blocking/native work still owns admission.
+
+These phases start after the body has been fully buffered and admission has succeeded.
+They do not measure upload/body waiting, pre-admission refusals, or an individual native
+queue wait. `batch_transcription` does not distinguish queue waiting from native execution;
+the worker-pending gauge and aggregate timing histograms remain additional observations.
+An accepted stage-start record can identify unfinished work while no later record is
+available, but a missing finish is not proof of a hang: telemetry is best-effort and records
+can be dropped. Check the telemetry drop and sink-failure counters when interpreting gaps.
+
 The runtime writer has checked logical capacity:
 
 ~~~text

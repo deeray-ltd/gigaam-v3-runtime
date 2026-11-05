@@ -460,7 +460,7 @@ pub(crate) mod tests {
         ))
     }
 
-    fn pcm16_wav_silence(sample_rate: u32, frames: usize) -> Result<Vec<u8>, String> {
+    pub(crate) fn pcm16_wav_silence(sample_rate: u32, frames: usize) -> Result<Vec<u8>, String> {
         let data_length = frames
             .checked_mul(2)
             .ok_or_else(|| "test WAV data length overflows usize".to_owned())?;
