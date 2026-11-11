@@ -18,6 +18,13 @@ use crate::provider::ProviderPlan;
 use gigaam_audio::FeatureMatrixView;
 use gigaam_model_package::{EncoderPrecision, ModelPackage};
 
+/// Precision of the complete RNN-T neural pipeline.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RnntPrecisionSelection {
+    Fp32,
+    Fp16,
+}
+
 /// A concrete selected recognizer. Process adapters choose this once and keep its provider plan
 /// outside the decoder interface.
 pub struct DirectRecognizer(Implementation);
@@ -52,8 +59,29 @@ impl DirectRecognizer {
         precision: EncoderPrecision,
     ) -> Result<Self, String> {
         Ok(Self(Implementation::Rnnt(Box::new(
-            RnntDecoder::from_pack(pack, plan, precision)?,
+            RnntDecoder::from_pack(pack, plan, precision, false)?,
         ))))
+    }
+
+    /// Opens a recognizer with the selected precision for all RNN-T neural roles.
+    pub fn rnnt_with_precision(
+        pack: &ModelPackage,
+        plan: &ProviderPlan,
+        selection: RnntPrecisionSelection,
+    ) -> Result<Self, String> {
+        match selection {
+            RnntPrecisionSelection::Fp32 => Self::rnnt(pack, plan, EncoderPrecision::Fp32),
+            RnntPrecisionSelection::Fp16 => {
+                let precision = if pack.schema_version().value() == 1 {
+                    EncoderPrecision::Fp16Io32
+                } else {
+                    EncoderPrecision::Fp16
+                };
+                Ok(Self(Implementation::Rnnt(Box::new(
+                    RnntDecoder::from_pack(pack, plan, precision, true)?,
+                ))))
+            }
+        }
     }
 
     pub const fn encoder_precision(&self) -> EncoderPrecision {

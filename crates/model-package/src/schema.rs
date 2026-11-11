@@ -9,8 +9,8 @@
 
 use crate::assets::RelativeAsset;
 use crate::definition::{
-    CtcDefinition, EncoderTensorContract, FrontendDefinition, OutputLayout, PackageDefinition,
-    RetainedMetadata, RnntDefinition, SchemaVersion, VadDefinition,
+    ArtifactFormat, CtcDefinition, EncoderTensorContract, FrontendDefinition, OutputLayout,
+    PackageDefinition, RetainedMetadata, RnntDefinition, SchemaVersion, VadDefinition,
 };
 use crate::error::PackageError;
 use std::collections::{BTreeMap, BTreeSet};
@@ -116,11 +116,16 @@ pub(crate) fn parse(text: &str) -> Result<PackageDefinition, PackageError> {
             reason: "expected a canonical unsigned integer",
         });
     }
-    if version != SchemaVersion::V1.value().to_string() {
-        return Err(PackageError::UnsupportedFormatVersion { value: version });
-    }
+    let schema_version = match version.as_str() {
+        "1" => SchemaVersion::V1,
+        "2" => SchemaVersion::V2,
+        _ => return Err(PackageError::UnsupportedFormatVersion { value: version }),
+    };
     for key in values.keys() {
-        if !V1_REQUIRED_KEYS.contains(&key.as_str()) && !V1_RETAINED_KEYS.contains(&key.as_str()) {
+        if !V1_REQUIRED_KEYS.contains(&key.as_str())
+            && !V1_RETAINED_KEYS.contains(&key.as_str())
+            && !(schema_version == SchemaVersion::V2 && key == "artifact_format")
+        {
             let line = line_numbers
                 .get(key)
                 .copied()
@@ -141,6 +146,32 @@ pub(crate) fn parse(text: &str) -> Result<PackageDefinition, PackageError> {
     }
 
     let _ = take(&mut values, "format_version")?;
+    let artifact_format = if schema_version == SchemaVersion::V2 {
+        let value = take(&mut values, "artifact_format")?;
+        match value.as_str() {
+            "onnx" => ArtifactFormat::Onnx,
+            "trt_ep_context" => ArtifactFormat::TrtEpContext,
+            _ => {
+                return Err(PackageError::InvalidValue {
+                    key: "artifact_format",
+                    value,
+                    reason: "expected onnx or trt_ep_context",
+                });
+            }
+        }
+    } else {
+        ArtifactFormat::Onnx
+    };
+    let ctc_fp16 = if schema_version == SchemaVersion::V2 {
+        Some(parse_asset(&mut values, "ctc.encoder_fp16")?)
+    } else {
+        None
+    };
+    let rnnt_fp16 = if schema_version == SchemaVersion::V2 {
+        Some(parse_asset(&mut values, "rnnt.encoder_fp16")?)
+    } else {
+        None
+    };
 
     let frontend = FrontendDefinition {
         sample_rate: parse_usize(&mut values, "sample_rate")?,
@@ -158,6 +189,7 @@ pub(crate) fn parse(text: &str) -> Result<PackageDefinition, PackageError> {
         vocabulary: parse_asset(&mut values, "ctc.vocab")?,
         blank_id: parse_usize(&mut values, "ctc.blank_id")?,
         encoder_fp16io32: parse_asset(&mut values, "ctc.encoder_fp16io32")?,
+        encoder_fp16: ctc_fp16,
         encoder_fp32: parse_asset(&mut values, "ctc.encoder_fp32")?,
         tensor_contract: parse_encoder_tensor_contract(
             &mut values,
@@ -173,6 +205,7 @@ pub(crate) fn parse(text: &str) -> Result<PackageDefinition, PackageError> {
         prediction_hidden: parse_usize(&mut values, "rnnt.pred_hidden")?,
         max_symbols_per_step: parse_usize(&mut values, "rnnt.max_symbols_per_step")?,
         encoder_fp16io32: parse_asset(&mut values, "rnnt.encoder_fp16io32")?,
+        encoder_fp16: rnnt_fp16,
         decoder_fp16: parse_asset(&mut values, "rnnt.decoder_fp16")?,
         joint_fp16: parse_asset(&mut values, "rnnt.joint_fp16")?,
         encoder_fp32: parse_asset(&mut values, "rnnt.encoder_fp32")?,
@@ -210,7 +243,8 @@ pub(crate) fn parse(text: &str) -> Result<PackageDefinition, PackageError> {
         });
     }
     Ok(PackageDefinition::new(
-        SchemaVersion::V1,
+        schema_version,
+        artifact_format,
         frontend,
         ctc,
         rnnt,

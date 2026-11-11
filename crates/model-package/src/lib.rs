@@ -25,8 +25,9 @@ use std::path::{Path, PathBuf};
 
 pub use assets::ValidatedArtifact;
 pub use definition::{
-    CtcDefinition, EncoderArtifact, EncoderPrecision, EncoderTensorContract, FrontendDefinition,
-    FrontendWeights, OutputLayout, RnntAssets, RnntDefinition, SchemaVersion, VadDefinition,
+    ArtifactFormat, CtcDefinition, EncoderArtifact, EncoderPrecision, EncoderTensorContract,
+    FrontendDefinition, FrontendWeights, OutputLayout, RnntAssets, RnntDefinition, SchemaVersion,
+    VadDefinition,
 };
 pub use error::PackageError;
 
@@ -67,6 +68,10 @@ impl ModelPackage {
         self.definition.schema_version()
     }
 
+    pub fn artifact_format(&self) -> ArtifactFormat {
+        self.definition.artifact_format()
+    }
+
     pub fn frontend(&self) -> &FrontendDefinition {
         self.definition.frontend()
     }
@@ -105,7 +110,7 @@ impl ModelPackage {
         precision: EncoderPrecision,
     ) -> Result<EncoderArtifact, PackageError> {
         let ctc = self.ctc();
-        let artifact = validate_regular_asset(&self.root, ctc.encoder_asset(precision))?;
+        let artifact = validate_regular_asset(&self.root, ctc.encoder_asset(precision)?)?;
         Ok(EncoderArtifact::new(
             artifact,
             ctc.tensor_contract().clone(),
@@ -121,7 +126,7 @@ impl ModelPackage {
         precision: EncoderPrecision,
     ) -> Result<EncoderArtifact, PackageError> {
         let rnnt = self.rnnt();
-        let artifact = validate_regular_asset(&self.root, rnnt.encoder_asset(precision))?;
+        let artifact = validate_regular_asset(&self.root, rnnt.encoder_asset(precision)?)?;
         Ok(EncoderArtifact::new(
             artifact,
             rnnt.encoder_tensor_contract().clone(),

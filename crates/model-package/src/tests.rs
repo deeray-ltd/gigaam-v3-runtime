@@ -132,11 +132,11 @@ fn retained_fields_are_optional_opaque_and_never_selected() {
 
 #[test]
 fn version_discriminator_precedes_v1_inventory_validation() {
-    let pack = TempPack::new("format_version=2\nfuture.only=value");
+    let pack = TempPack::new("format_version=3\nfuture.only=value");
     match ModelPackage::open(pack.path()) {
-        Err(PackageError::UnsupportedFormatVersion { value }) => assert_eq!(value, "2"),
-        Err(other) => panic!("expected V2 discriminator refusal, got {other}"),
-        Ok(_) => panic!("V2 configuration must not be accepted as V1"),
+        Err(PackageError::UnsupportedFormatVersion { value }) => assert_eq!(value, "3"),
+        Err(other) => panic!("expected unsupported discriminator refusal, got {other}"),
+        Ok(_) => panic!("unsupported configuration must not be accepted"),
     }
 }
 
@@ -157,7 +157,7 @@ fn format_version_refusal_classes_are_distinct() {
         assert_invalid_value(error, "format_version");
     }
 
-    for value in ["2", "256"] {
+    for value in ["3", "256"] {
         let unsupported = TempPack::new(&format!("format_version={value}\nfuture.only=value"));
         assert!(matches!(
             ModelPackage::open(unsupported.path()),
@@ -352,4 +352,31 @@ fn malformed_selected_f32_asset_refuses_after_regular_file_validation() {
             ..
         })
     ));
+}
+
+#[test]
+fn v2_selects_native_fp16_and_format() {
+    let config = format!(
+        "{}\nartifact_format=trt_ep_context\nctc.encoder_fp16=ctc-half.onnx\nrnnt.encoder_fp16=rnnt-half.onnx",
+        valid_v1().replace("format_version=1", "format_version=2")
+    );
+    let pack = TempPack::new(&config);
+    std::fs::write(pack.path().join("rnnt-half.onnx"), b"graph").expect("write selected graph");
+    let opened = ModelPackage::open(pack.path()).expect("V2 must open");
+    assert_eq!(
+        opened.artifact_format(),
+        crate::ArtifactFormat::TrtEpContext
+    );
+    let selected = opened
+        .rnnt_encoder(crate::EncoderPrecision::Fp16)
+        .expect("select native FP16");
+    assert!(selected.artifact().path().ends_with("rnnt-half.onnx"));
+    let v1 = TempPack::new(&valid_v1());
+    let opened_v1 = ModelPackage::open(v1.path()).expect("V1 must open");
+    assert_eq!(opened_v1.artifact_format(), crate::ArtifactFormat::Onnx);
+    assert!(
+        opened_v1
+            .rnnt_encoder(crate::EncoderPrecision::Fp16)
+            .is_err()
+    );
 }

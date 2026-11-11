@@ -10,7 +10,9 @@
 //! ONNX Runtime encoder sessions for the one resolved execution-provider plan.
 
 use crate::contracts::Encoder;
-use crate::native_output::{ExpectedCardinality, NativeOutputRole, validate_f32_output};
+use crate::native_output::{
+    ExpectedCardinality, NativeOutputRole, validate_f16_output, validate_f32_output,
+};
 use crate::ort_assignment::{self, CudaAssignmentEvidence};
 #[cfg(feature = "cuda")]
 use crate::provider::CudaArena;
@@ -43,6 +45,7 @@ impl OrtEncoder {
         plan: &ProviderPlan,
         precision: EncoderPrecision,
     ) -> Result<Self, String> {
+        check_artifact_format(pack, plan)?;
         let artifact = pack
             .ctc_encoder(precision)
             .map_err(|error| error.to_string())?;
@@ -55,6 +58,7 @@ impl OrtEncoder {
         plan: &ProviderPlan,
         precision: EncoderPrecision,
     ) -> Result<Self, String> {
+        check_artifact_format(pack, plan)?;
         let artifact = pack
             .rnnt_encoder(precision)
             .map_err(|error| error.to_string())?;
@@ -116,8 +120,10 @@ impl OrtEncoder {
             Device::Tensorrt => {
                 #[cfg(feature = "tensorrt")]
                 {
-                    let mut tensorrt = ort::ep::TensorRT::default()
-                        .with_fp16(matches!(precision, EncoderPrecision::Fp16Io32));
+                    let mut tensorrt = ort::ep::TensorRT::default().with_fp16(matches!(
+                        precision,
+                        EncoderPrecision::Fp16Io32 | EncoderPrecision::Fp16
+                    ));
                     if let Some(directory) = &plan.config.tensorrt.cache_dir {
                         tensorrt = tensorrt
                             .with_engine_cache(true)
@@ -149,6 +155,10 @@ impl OrtEncoder {
             Device::Cuda => {
                 let evidence = ort_assignment::inspect(&session)?;
                 plan.verify_cuda_assignment(role, evidence.fingerprint())?;
+                eprintln!(
+                    "CUDA encoder {role:?} CPU operator assignments: {:?}",
+                    evidence.cpu_operator_types()
+                );
                 Some(evidence)
             }
             Device::Cpu | Device::Tensorrt => None,
@@ -188,70 +198,120 @@ impl OrtEncoder {
     }
 }
 
-impl Encoder for OrtEncoder {
-    fn out_dim(&self) -> usize {
-        self.out_dim
-    }
+pub(crate) enum EncodedRnntWindow {
+    F32(Vec<f32>, usize),
+    F16(Vec<half::f16>, usize),
+}
 
-    fn forward(&mut self, features: FeatureMatrixView<'_>) -> Result<(Vec<f32>, usize), String> {
+impl OrtEncoder {
+    pub(crate) fn forward_rnnt(
+        &mut self,
+        features: FeatureMatrixView<'_>,
+    ) -> Result<EncodedRnntWindow, String> {
         let mel_bins = features.mel_bins();
         let frames = features.frames();
-        let feature_tensor =
-            Tensor::from_array(([1usize, mel_bins, frames], features.values().to_vec()))
-                .map_err(|error| error.to_string())?;
         let frame_count = i64::try_from(frames)
             .map_err(|_| format!("encoder input length {frames} exceeds i64"))?;
         let length_tensor =
             Tensor::from_array(([1usize], vec![frame_count])).map_err(|error| error.to_string())?;
-        let outputs = self
-            .session
-            .run(ort::inputs![
-                self.in_names[0].as_str() => feature_tensor,
-                self.in_names[1].as_str() => length_tensor,
-            ])
-            .map_err(|error| error.to_string())?;
-        let (shape, data) = outputs[self.out_name.as_str()]
-            .try_extract_tensor::<f32>()
-            .map_err(|error| error.to_string())?;
-        let dimensions: Vec<usize> = shape
-            .iter()
-            .map(|&dimension| {
-                usize::try_from(dimension)
-                    .map_err(|_| format!("encoder output dimension {dimension} is invalid"))
-            })
-            .collect::<Result<_, _>>()?;
-        match (self.dimension_first, dimensions.as_slice()) {
-            (false, [1, output_frames, dimension]) if *dimension == self.out_dim => {
-                validate_f32_output(
-                    NativeOutputRole::Encoder,
-                    shape,
-                    data,
-                    ExpectedCardinality::ShapeDerived,
-                )?;
-                Ok((data.to_vec(), *output_frames))
+        if self.precision == EncoderPrecision::Fp16 {
+            let values: Vec<half::f16> = features
+                .values()
+                .iter()
+                .copied()
+                .map(half::f16::from_f32)
+                .collect();
+            if values.iter().any(|value| !value.is_finite()) {
+                return Err("encoder FP16 input contains non-finite or out-of-range values".into());
             }
-            (true, [1, dimension, output_frames]) if *dimension == self.out_dim => {
-                let (dimension, output_frames) = (*dimension, *output_frames);
-                validate_f32_output(
-                    NativeOutputRole::Encoder,
-                    shape,
-                    data,
-                    ExpectedCardinality::ShapeDerived,
-                )?;
-                let mut values = vec![0.0f32; data.len()];
-                for dimension_index in 0..dimension {
-                    for frame_index in 0..output_frames {
-                        // The validated shape and storage cardinality bound both offsets.
-                        values[frame_index * dimension + dimension_index] =
-                            data[dimension_index * output_frames + frame_index];
-                    }
-                }
-                Ok((values, output_frames))
-            }
-            _ => Err(format!(
-                "encoder: unexpected output shape {dimensions:?}, expected dimension {}",
-                self.out_dim
-            )),
+            let feature_tensor = Tensor::from_array(([1usize, mel_bins, frames], values))
+                .map_err(|error| error.to_string())?;
+            let outputs = self.session.run(ort::inputs![self.in_names[0].as_str() => feature_tensor, self.in_names[1].as_str() => length_tensor]).map_err(|error| error.to_string())?;
+            let (shape, data) = outputs[self.out_name.as_str()]
+                .try_extract_tensor::<half::f16>()
+                .map_err(|error| error.to_string())?;
+            validate_f16_output(
+                NativeOutputRole::Encoder,
+                shape,
+                data,
+                ExpectedCardinality::ShapeDerived,
+            )?;
+            let (values, count) = reorder_encoder(shape, data, self.out_dim, self.dimension_first)?;
+            Ok(EncodedRnntWindow::F16(values, count))
+        } else {
+            let feature_tensor =
+                Tensor::from_array(([1usize, mel_bins, frames], features.values().to_vec()))
+                    .map_err(|error| error.to_string())?;
+            let outputs = self.session.run(ort::inputs![self.in_names[0].as_str() => feature_tensor, self.in_names[1].as_str() => length_tensor]).map_err(|error| error.to_string())?;
+            let (shape, data) = outputs[self.out_name.as_str()]
+                .try_extract_tensor::<f32>()
+                .map_err(|error| error.to_string())?;
+            validate_f32_output(
+                NativeOutputRole::Encoder,
+                shape,
+                data,
+                ExpectedCardinality::ShapeDerived,
+            )?;
+            let (values, count) = reorder_encoder(shape, data, self.out_dim, self.dimension_first)?;
+            Ok(EncodedRnntWindow::F32(values, count))
         }
+    }
+}
+
+fn reorder_encoder<T: Copy>(
+    shape: &[i64],
+    data: &[T],
+    out_dim: usize,
+    dimension_first: bool,
+) -> Result<(Vec<T>, usize), String> {
+    let dimensions: Vec<usize> = shape
+        .iter()
+        .map(|&dimension| {
+            usize::try_from(dimension)
+                .map_err(|_| format!("encoder output dimension {dimension} is invalid"))
+        })
+        .collect::<Result<_, _>>()?;
+    match (dimension_first, dimensions.as_slice()) {
+        (false, [1, output_frames, dimension]) if *dimension == out_dim => {
+            Ok((data.to_vec(), *output_frames))
+        }
+        (true, [1, dimension, output_frames]) if *dimension == out_dim => {
+            let mut values = Vec::with_capacity(data.len());
+            for frame in 0..*output_frames {
+                for dimension_index in 0..*dimension {
+                    values.push(data[dimension_index * output_frames + frame]);
+                }
+            }
+            Ok((values, *output_frames))
+        }
+        _ => Err(format!(
+            "encoder: unexpected output shape {dimensions:?}, expected dimension {out_dim}"
+        )),
+    }
+}
+
+impl Encoder for OrtEncoder {
+    fn out_dim(&self) -> usize {
+        self.out_dim
+    }
+    fn forward(&mut self, features: FeatureMatrixView<'_>) -> Result<(Vec<f32>, usize), String> {
+        match self.forward_rnnt(features)? {
+            EncodedRnntWindow::F32(values, frames) => Ok((values, frames)),
+            EncodedRnntWindow::F16(values, frames) => {
+                Ok((values.into_iter().map(f32::from).collect(), frames))
+            }
+        }
+    }
+}
+
+fn check_artifact_format(pack: &ModelPackage, plan: &ProviderPlan) -> Result<(), String> {
+    use gigaam_model_package::ArtifactFormat;
+    match (plan.device(), pack.artifact_format()) {
+        (Device::Tensorrt, ArtifactFormat::TrtEpContext) => Ok(()),
+        (Device::Tensorrt, _) => Err("TensorRT requires a prepared EP context package".into()),
+        (_, ArtifactFormat::TrtEpContext) => {
+            Err("TensorRT EP context package requires TensorRT".into())
+        }
+        (_, ArtifactFormat::Onnx) => Ok(()),
     }
 }

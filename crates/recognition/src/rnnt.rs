@@ -16,16 +16,20 @@ use crate::contracts::Token;
 /// The execution adapter owns its sessions and state representation. This algorithm controls only
 /// hypothesis transition order: initialize from blank, query one frame, and advance after each
 /// non-blank token.
-pub trait RnntTransition {
+pub trait RnntTransition<T = f32> {
     type State;
 
     fn start(&mut self, blank: usize) -> Result<Self::State, String>;
 
-    fn select(&mut self, encoder_frame: &[f32], state: &Self::State) -> Result<usize, String>;
+    fn prepare_frame(&mut self, _frame: &[T]) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn select(&mut self, encoder_frame: &[T], state: &Self::State) -> Result<usize, String>;
 
     fn select_scored(
         &mut self,
-        _encoder_frame: &[f32],
+        _encoder_frame: &[T],
         _state: &Self::State,
     ) -> Result<(usize, f64), String> {
         Err("RNN-T transition does not support token scores".into())
@@ -38,10 +42,10 @@ pub trait RnntTransition {
 ///
 /// The adapter owns frame shape and storage cardinality. The greedy algorithm consumes those
 /// frames through this port and refuses a non-finite value before invoking a transition.
-pub trait RnntFrameSource {
+pub trait RnntFrameSource<T = f32> {
     fn output_frames(&self) -> usize;
 
-    fn frame(&self, index: usize) -> &[f32];
+    fn frame(&self, index: usize) -> &[T];
 }
 
 /// Greedy RNN-T output before vocabulary/timestamp projection.
@@ -78,6 +82,36 @@ pub fn greedy_with_detail<T: RnntTransition, F: RnntFrameSource>(
     max_symbols_per_step: usize,
     scored: bool,
 ) -> Result<RnntOutput, String> {
+    greedy_typed_with_detail(transition, frames, blank, max_symbols_per_step, scored)
+}
+
+pub(crate) trait FiniteFrameValue {
+    fn is_finite_value(&self) -> bool;
+}
+
+impl FiniteFrameValue for f32 {
+    fn is_finite_value(&self) -> bool {
+        self.is_finite()
+    }
+}
+
+impl FiniteFrameValue for half::f16 {
+    fn is_finite_value(&self) -> bool {
+        self.is_finite()
+    }
+}
+
+pub(crate) fn greedy_typed_with_detail<
+    T: FiniteFrameValue,
+    R: RnntTransition<T>,
+    F: RnntFrameSource<T>,
+>(
+    transition: &mut R,
+    frames: &F,
+    blank: usize,
+    max_symbols_per_step: usize,
+    scored: bool,
+) -> Result<RnntOutput, String> {
     let mut state = transition.start(blank)?;
     let output_frames = frames.output_frames();
     let mut tokens = Vec::new();
@@ -85,6 +119,7 @@ pub fn greedy_with_detail<T: RnntTransition, F: RnntFrameSource>(
     for frame_index in 0..output_frames {
         let frame = frames.frame(frame_index);
         validate_encoder_frame(frame, frame_index)?;
+        transition.prepare_frame(frame)?;
         let mut emitted = false;
         for _ in 0..max_symbols_per_step {
             let (token, score) = if scored {
@@ -113,9 +148,12 @@ pub fn greedy_with_detail<T: RnntTransition, F: RnntFrameSource>(
     Ok(RnntOutput { tokens, silence })
 }
 
-fn validate_encoder_frame(frame: &[f32], frame_index: usize) -> Result<(), String> {
+fn validate_encoder_frame<T: FiniteFrameValue>(
+    frame: &[T],
+    frame_index: usize,
+) -> Result<(), String> {
     for (value_index, value) in frame.iter().enumerate() {
-        if !value.is_finite() {
+        if !value.is_finite_value() {
             return Err(format!(
                 "RNN-T encoder value at frame {frame_index}, position {value_index} must be finite"
             ));
@@ -293,6 +331,64 @@ mod tests {
         assert_eq!(output.tokens()[1].frame(), 0);
         assert_eq!(output.tokens()[0].log_probability(), Some(-0.25));
         assert_eq!(output.tokens()[1].log_probability(), Some(-0.5));
+        Ok(())
+    }
+    #[test]
+    fn typed_frames_prepare_once_and_preserve_state_for_both_precisions() -> Result<(), String> {
+        struct Frames<T>(Vec<T>);
+        impl<T> RnntFrameSource<T> for Frames<T> {
+            fn output_frames(&self) -> usize {
+                1
+            }
+            fn frame(&self, _: usize) -> &[T] {
+                &self.0
+            }
+        }
+        struct Transition {
+            preparations: usize,
+            seen: Vec<usize>,
+        }
+        impl<T> RnntTransition<T> for Transition {
+            type State = usize;
+            fn start(&mut self, _: usize) -> Result<usize, String> {
+                Ok(0)
+            }
+            fn prepare_frame(&mut self, _: &[T]) -> Result<(), String> {
+                self.preparations += 1;
+                Ok(())
+            }
+            fn select(&mut self, _: &[T], state: &usize) -> Result<usize, String> {
+                self.seen.push(*state);
+                Ok(if *state < 2 { *state } else { 2 })
+            }
+            fn advance(&mut self, _: usize, state: &mut usize) -> Result<(), String> {
+                *state += 1;
+                Ok(())
+            }
+        }
+        fn check<T: FiniteFrameValue>(value: T) -> Result<(), String> {
+            let mut transition = Transition {
+                preparations: 0,
+                seen: Vec::new(),
+            };
+            let output =
+                greedy_typed_with_detail(&mut transition, &Frames(vec![value]), 2, 4, false)?;
+            assert_eq!(output.tokens(), &[Token::new(0, 0), Token::new(1, 0)]);
+            assert_eq!(transition.preparations, 1);
+            assert_eq!(transition.seen, [0, 1, 2]);
+            Ok(())
+        }
+        check(1.0_f32)?;
+        check(half::f16::from_f32(1.0))?;
+        let mut transition = Transition {
+            preparations: 0,
+            seen: Vec::new(),
+        };
+        assert!(
+            greedy_typed_with_detail(&mut transition, &Frames(vec![half::f16::NAN]), 2, 4, false)
+                .is_err()
+        );
+        assert_eq!(transition.preparations, 0);
         Ok(())
     }
 }

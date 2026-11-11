@@ -320,7 +320,7 @@ help or version command grammar.
 
 ~~~text
 asr transcribe FILE [--model DIR] [--ep cpu|cuda|tensorrt] [--ort-dylib PATH]
-                    [--fp16] [--rnnt] [--window S] [--overlap S] [--pad]
+                    [--fp16] [--rnnt] [--rnnt-precision fp32|fp16] [--window S] [--overlap S] [--pad]
                     [--words] [--split-channels] [--turns] [--turn-gap S]
                     [--evidence PATH] [--evidence-version 1|2]
                     [--vad] [--vad-threshold F] [--vad-neg-threshold F]
@@ -513,6 +513,15 @@ human-oriented projections are:
 | stream | The final client transcript as one joined text line. | Stream statistics; --ref FILE adds a reference-comparison row with batch and stream WER, which is absent without --ref; --events prints each applied stream event; ASR_TRACE adds per-window timing rows. |
 | vad | One start/end/duration row for each detected speech segment. | Aggregate speech, VAD timing, and RTF summary. |
 | dialog | One [channel N start-end] row per reconstructed turn, with [bc] on marked backchannels. | Channel, active-channel, and turn-count summary. |
+
+For offline RNN-T transcription, `--rnnt-precision fp32|fp16` or
+`ASR_RNNT_PRECISION=fp32|fp16` selects all RNN-T roles. Both may be supplied
+when they agree; either conflicts with the legacy `--fp16` encoder-only flag.
+The CLI option requires `--rnnt`; CTC-only commands ignore the environment
+setting. Without the new setting, the legacy encoder choice and fp32 heads
+remain in effect. Full fp16 requires compatible assets and a GPU provider;
+it does not fall back to fp32.
+
 
 When a CTC vocabulary has no standalone `▁`, CTC construction emits a blank-only
 silence-mask warning to stderr. `transcribe` and `stream` emit it once per constructed

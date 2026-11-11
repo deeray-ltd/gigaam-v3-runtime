@@ -49,6 +49,25 @@ pub(crate) fn validate_f32_output(
     values: &[f32],
     expected: ExpectedCardinality,
 ) -> Result<(), String> {
+    validate_output(role, shape, values, expected, |value| value.is_finite())
+}
+
+pub(crate) fn validate_f16_output(
+    role: NativeOutputRole,
+    shape: &[i64],
+    values: &[half::f16],
+    expected: ExpectedCardinality,
+) -> Result<(), String> {
+    validate_output(role, shape, values, expected, |value| value.is_finite())
+}
+
+fn validate_output<T>(
+    role: NativeOutputRole,
+    shape: &[i64],
+    values: &[T],
+    expected: ExpectedCardinality,
+    is_finite: impl Fn(&T) -> bool,
+) -> Result<(), String> {
     let mut cardinality = 1_usize;
     for (axis, &dimension) in shape.iter().enumerate() {
         let dimension = usize::try_from(dimension).map_err(|_| {
@@ -80,7 +99,7 @@ pub(crate) fn validate_f32_output(
             values.len()
         ));
     }
-    if let Some(index) = values.iter().position(|value| !value.is_finite()) {
+    if let Some(index) = values.iter().position(|value| !is_finite(value)) {
         return Err(format!(
             "native {} output value at index {index} is not finite",
             role.label()
@@ -181,6 +200,18 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+    #[test]
+    fn half_output_validates_shape_storage_and_every_value() {
+        use super::validate_f16_output;
+        let role = NativeOutputRole::RnntJoint;
+        let expected = ExpectedCardinality::Exact(2);
+        let finite = [half::f16::from_f32(1.0), half::f16::from_f32(2.0)];
+        assert!(validate_f16_output(role, &[2], &finite, expected).is_ok());
+        assert!(validate_f16_output(role, &[1], &finite, expected).is_err());
+        for invalid in [half::f16::NAN, half::f16::INFINITY, half::f16::NEG_INFINITY] {
+            assert!(validate_f16_output(role, &[2], &[finite[0], invalid], expected).is_err());
         }
     }
 }

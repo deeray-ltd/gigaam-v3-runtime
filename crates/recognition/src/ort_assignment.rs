@@ -25,6 +25,7 @@ pub struct CudaAssignmentEvidence {
     fingerprint: CudaAssignmentFingerprint,
     cpu_assignments: usize,
     cuda_assignments: usize,
+    cpu_operator_types: Vec<(String, usize)>,
 }
 
 impl CudaAssignmentEvidence {
@@ -38,6 +39,11 @@ impl CudaAssignmentEvidence {
 
     pub const fn cuda_assignments(&self) -> usize {
         self.cuda_assignments
+    }
+
+    /// CPU operator types and their assignment counts, sorted by type.
+    pub fn cpu_operator_types(&self) -> &[(String, usize)] {
+        &self.cpu_operator_types
     }
 }
 
@@ -64,12 +70,19 @@ fn evidence_from_records(
     }
     let mut cpu_assignments = 0_usize;
     let mut cuda_assignments = 0_usize;
+    let mut cpu_operator_types = std::collections::BTreeMap::<String, usize>::new();
     for record in &records {
         match record.provider.as_str() {
             "CPUExecutionProvider" => {
                 cpu_assignments = cpu_assignments
                     .checked_add(1)
                     .ok_or_else(|| "CPU assignment count overflows usize".to_owned())?;
+                let count = cpu_operator_types
+                    .entry(record.operator_type.clone())
+                    .or_insert(0);
+                *count = count
+                    .checked_add(1)
+                    .ok_or_else(|| "CPU operator count overflows usize".to_owned())?;
             }
             "CUDAExecutionProvider" => {
                 cuda_assignments = cuda_assignments
@@ -92,6 +105,7 @@ fn evidence_from_records(
         fingerprint: fingerprint(&records)?,
         cpu_assignments,
         cuda_assignments,
+        cpu_operator_types: cpu_operator_types.into_iter().collect(),
     })
 }
 
@@ -336,6 +350,7 @@ mod tests {
         let evidence = evidence_from_records(records.clone())?;
         assert_eq!(evidence.cpu_assignments(), 1);
         assert_eq!(evidence.cuda_assignments(), 2);
+        assert_eq!(evidence.cpu_operator_types(), &[("Cast".to_owned(), 1)]);
 
         let reordered = evidence_from_records(vec![cpu.clone(), cuda.clone(), cuda.clone()])?;
         assert_eq!(evidence.fingerprint(), reordered.fingerprint());
