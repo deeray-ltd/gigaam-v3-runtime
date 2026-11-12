@@ -8,7 +8,7 @@ use crate::grammar::RuntimeRequest;
 use gigaam_audio::FrontendMode;
 use gigaam_recognition::{
     CudaAssignmentEnvironment, Device, OrtConfig, OrtEnvironment, ProviderPlan,
-    RequiredEncoderRoles,
+    RequiredEncoderRoles, RnntPrecisionSelection,
 };
 use std::path::PathBuf;
 
@@ -80,6 +80,38 @@ pub(crate) fn runtime(
         "ORT_DYLIB_PATH",
     )?;
     Ok(RuntimeConfig { plan, dylib })
+}
+
+pub(crate) fn rnnt_precision(
+    cli: Option<RnntPrecisionSelection>,
+    legacy_fp16: bool,
+) -> Result<Option<RnntPrecisionSelection>, String> {
+    let value = process_env("ASR_RNNT_PRECISION")?;
+    resolve_rnnt_precision(cli, legacy_fp16, value.as_deref())
+}
+
+fn resolve_rnnt_precision(
+    cli: Option<RnntPrecisionSelection>,
+    legacy_fp16: bool,
+    environment: Option<&str>,
+) -> Result<Option<RnntPrecisionSelection>, String> {
+    let environment = environment
+        .map(|value| match value {
+            "fp32" => Ok(RnntPrecisionSelection::Fp32),
+            "fp16" => Ok(RnntPrecisionSelection::Fp16),
+            _ => Err("ASR_RNNT_PRECISION must be fp32 or fp16".to_owned()),
+        })
+        .transpose()?;
+    if legacy_fp16 && (cli.is_some() || environment.is_some()) {
+        return Err("--fp16 conflicts with --rnnt-precision and ASR_RNNT_PRECISION".into());
+    }
+    match (cli, environment) {
+        (Some(a), Some(b)) if a != b => {
+            Err("--rnnt-precision conflicts with ASR_RNNT_PRECISION".into())
+        }
+        (Some(value), _) | (_, Some(value)) => Ok(Some(value)),
+        (None, None) => Ok(None),
+    }
 }
 
 /// Parses the applicable frontend process setting exactly once before package/native work.
@@ -177,6 +209,22 @@ mod tests {
     use super::{TraceMode, evidence_path, frontend_mode_from, trace_mode_from};
     use gigaam_audio::FrontendMode;
     use std::path::PathBuf;
+
+    #[test]
+    fn rnnt_precision_resolves_equal_values_and_rejects_conflicts() {
+        use gigaam_recognition::RnntPrecisionSelection;
+        assert_eq!(super::resolve_rnnt_precision(None, false, None), Ok(None));
+        assert_eq!(
+            super::resolve_rnnt_precision(Some(RnntPrecisionSelection::Fp16), false, Some("fp16")),
+            Ok(Some(RnntPrecisionSelection::Fp16))
+        );
+        assert!(
+            super::resolve_rnnt_precision(Some(RnntPrecisionSelection::Fp32), false, Some("fp16"))
+                .is_err()
+        );
+        assert!(super::resolve_rnnt_precision(None, true, Some("fp16")).is_err());
+        assert!(super::resolve_rnnt_precision(None, false, Some("")).is_err());
+    }
 
     #[test]
     fn frontend_and_trace_process_values_are_parsed_at_the_cli_boundary() {

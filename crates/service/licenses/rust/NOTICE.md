@@ -14,9 +14,9 @@ locked Cargo metadata and checksum-verified local registry crate archives.
 - Selection: normal non-dev dependency edges only. Packages whose only library target
   is a procedural macro are excluded because their code is executed during compilation,
   not statically linked into `asr-serve`.
-- Registry packages: 108; the three selected closures are identical.
-- Cargo.lock SHA-256: `27261347900777e8a527bea7083e82a1defceb08dbc83a70025c43bd9fe9e37f`.
-- Closure SHA-256: `45d4883852551bf0d0fafd72ca17602147ee0dfea37b6b7afdc1f9d3f907f35e`.
+- Registry packages: 109; the three selected closures are identical.
+- Cargo.lock SHA-256: `d1a17d080399817ea0d66a48e1b4563316f6c6c35983d7b9abede9a8a89f8c2a`.
+- Closure SHA-256: `ee6c3301de018cafe1dc46c9ec65fedc18efacb2567a85fe0344814e6e8721fc`.
 - Project workspace code is covered by the parent `COPYING` and `COPYING.LESSER` files.
 
 ## Package records
@@ -341,6 +341,16 @@ locked Cargo metadata and checksum-verified local registry crate archives.
 - Packaged license, permission, and copyright notices:
   - `LICENSE-APACHE`: `texts/aaff376532ea30a0cd5330b9502ad4a4c8bf769c539c87ffe78819d188a18ebf.txt` (SHA-256 `aaff376532ea30a0cd5330b9502ad4a4c8bf769c539c87ffe78819d188a18ebf`).
   - `LICENSE-MIT`: `texts/29e9fe5074bd27e0e5d5d110394fbbcd841baee2651a3c4b4560a632702cede4.txt` (SHA-256 `29e9fe5074bd27e0e5d5d110394fbbcd841baee2651a3c4b4560a632702cede4`).
+
+### `half` 2.7.1
+- License expression: `MIT OR Apache-2.0`.
+- Locked crate archive SHA-256: `6ea2d84b969582b4b1864a92dc5d27cd2b77b622a8d79306834f1be5ba20d84b`.
+- Source archive: `https://static.crates.io/crates/half/half-2.7.1.crate`.
+- Repository declared by package metadata: `https://github.com/VoidStarKat/half-rs`.
+- Authors declared by package metadata: `Kathryn Long <squeeself@gmail.com>`.
+- Packaged license, permission, and copyright notices:
+  - `LICENSE-APACHE`: `texts/a6cba85bc92e0cff7a450b1d873c0eaa2e9fc96bf472df0247a26bec77bf3ff9.txt` (SHA-256 `a6cba85bc92e0cff7a450b1d873c0eaa2e9fc96bf472df0247a26bec77bf3ff9`).
+  - `LICENSE-MIT`: `texts/508a77d2e7b51d98adeed32648ad124b7b30241a8e70b2e72c99f92d8e5874d1.txt` (SHA-256 `508a77d2e7b51d98adeed32648ad124b7b30241a8e70b2e72c99f92d8e5874d1`).
 
 ### `http` 1.5.0
 - License expression: `MIT OR Apache-2.0`.
@@ -1041,11 +1051,12 @@ locked Cargo metadata and checksum-verified local registry crate archives.
   - `LICENSE-APACHE`: `texts/516b24e051bf5630880ebbd55c40a25ce9552ebaf8970a53e8976eb70e522406.txt` (SHA-256 `516b24e051bf5630880ebbd55c40a25ce9552ebaf8970a53e8976eb70e522406`).
   - `LICENSE-MIT`: `texts/a825bd853ab71619a4923d7b4311221427848070ff44d990da39b0b274c1683f.txt` (SHA-256 `a825bd853ab71619a4923d7b4311221427848070ff44d990da39b0b274c1683f`).
 
-### `zerocopy` 0.8.56
+### `zerocopy` 0.8.39
 - License expression: `BSD-2-Clause OR Apache-2.0 OR MIT`.
-- Locked crate archive SHA-256: `556764e583adb45a9f8d413c2a147fa7e8d821e48e12b14fd560b607998b75eb`.
-- Source archive: `https://static.crates.io/crates/zerocopy/zerocopy-0.8.56.crate`.
+- Locked crate archive SHA-256: `db6d35d663eadb6c932438e763b262fe1a70987f9ae936e60158176d710cae4a`.
+- Source archive: `https://static.crates.io/crates/zerocopy/zerocopy-0.8.39.crate`.
 - Repository declared by package metadata: `https://github.com/google/zerocopy`.
+- Authors declared by package metadata: `Joshua Liebow-Feeser <joshlf@google.com>`; `Jack Wrenn <jswrenn@amazon.com>`.
 - Packaged license, permission, and copyright notices:
   - `LICENSE-APACHE`: `texts/9d185ac6703c4b0453974c0d85e9eee43e6941009296bb1f5eb0b54e2329e9f3.txt` (SHA-256 `9d185ac6703c4b0453974c0d85e9eee43e6941009296bb1f5eb0b54e2329e9f3`).
   - `LICENSE-BSD`: `texts/83c1763356e822adde0a2cae748d938a73fdc263849ccff6b27776dff213bd32.txt` (SHA-256 `83c1763356e822adde0a2cae748d938a73fdc263849ccff6b27776dff213bd32`).

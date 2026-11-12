@@ -14,7 +14,7 @@ use gigaam_audio::{FrontendMode, SampleRate};
 use gigaam_model_package::EncoderPrecision;
 use gigaam_recognition::{
     CudaAssignmentEnvironment, Device, OrtConfig, OrtEnvironment, ProviderPlan,
-    RequiredEncoderRoles,
+    RequiredEncoderRoles, RnntPrecisionSelection,
 };
 use std::path::PathBuf;
 use std::time::Duration;
@@ -36,7 +36,8 @@ pub(crate) fn encoder_precision(fp16: bool) -> EncoderPrecision {
 pub(crate) fn precision_name(precision: EncoderPrecision) -> &'static str {
     match precision {
         EncoderPrecision::Fp32 => "fp32",
-        EncoderPrecision::Fp16Io32 => "fp16",
+        EncoderPrecision::Fp16Io32 => "fp16io32",
+        EncoderPrecision::Fp16 => "fp16",
     }
 }
 
@@ -49,6 +50,7 @@ struct CliOptions {
     ctc_fp16: bool,
     no_rnnt: bool,
     rnnt_fp16: bool,
+    rnnt_precision: Option<String>,
 }
 
 #[derive(Debug)]
@@ -60,12 +62,14 @@ pub(crate) struct Startup {
     pub(crate) ctc_fp16: bool,
     pub(crate) with_rnnt: bool,
     pub(crate) rnnt_fp16: bool,
+    pub(crate) rnnt_precision: Option<RnntPrecisionSelection>,
     pub(crate) frontend_mode: FrontendMode,
     pub(crate) trace_enabled: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct StartupEnvironment<'a> {
+    pub(crate) rnnt_precision: Option<&'a str>,
     pub(crate) encoder_ep: Option<&'a str>,
     pub(crate) ort_dylib: Option<&'a str>,
     pub(crate) ort_memory_pattern: Option<&'a str>,
@@ -85,6 +89,7 @@ pub(crate) struct StartupEnvironment<'a> {
 impl Startup {
     pub(crate) fn from_process() -> Result<Self, String> {
         let args: Vec<String> = std::env::args().skip(1).collect();
+        let rnnt_precision = process_env("ASR_RNNT_PRECISION")?;
         let encoder_ep = process_env("ASR_ENCODER_EP")?;
         let ort_dylib = process_env("ORT_DYLIB_PATH")?;
         let ort_memory_pattern = process_env("ASR_ORT_MEMPATTERN")?;
@@ -102,6 +107,7 @@ impl Startup {
         Self::parse(
             &args,
             StartupEnvironment {
+                rnnt_precision: rnnt_precision.as_deref(),
                 encoder_ep: encoder_ep.as_deref(),
                 ort_dylib: ort_dylib.as_deref(),
                 ort_memory_pattern: ort_memory_pattern.as_deref(),
@@ -127,6 +133,16 @@ impl Startup {
         let cli = parse_cli(args)?;
         if cli.no_rnnt && cli.rnnt_fp16 {
             return Err("--rnnt-fp16 conflicts with --no-rnnt".into());
+        }
+        let rnnt_precision =
+            resolve_rnnt_precision(cli.rnnt_precision.as_deref(), environment.rnnt_precision)?;
+        if cli.no_rnnt && rnnt_precision.is_some() {
+            return Err("--rnnt-precision or ASR_RNNT_PRECISION conflicts with --no-rnnt".into());
+        }
+        if cli.rnnt_fp16 && rnnt_precision.is_some() {
+            return Err(
+                "--rnnt-fp16 conflicts with --rnnt-precision and ASR_RNNT_PRECISION".into(),
+            );
         }
         let provider =
             Device::resolve_with_config(cli.provider.as_deref(), environment.encoder_ep)?;
@@ -178,9 +194,32 @@ impl Startup {
             ctc_fp16: cli.ctc_fp16,
             with_rnnt: !cli.no_rnnt,
             rnnt_fp16: cli.rnnt_fp16,
+            rnnt_precision,
             frontend_mode,
             trace_enabled,
         })
+    }
+}
+
+fn resolve_rnnt_precision(
+    cli: Option<&str>,
+    environment: Option<&str>,
+) -> Result<Option<RnntPrecisionSelection>, String> {
+    fn parse(value: &str) -> Result<RnntPrecisionSelection, String> {
+        match value {
+            "fp32" => Ok(RnntPrecisionSelection::Fp32),
+            "fp16" => Ok(RnntPrecisionSelection::Fp16),
+            _ => Err("RNN-T precision must be fp32 or fp16".into()),
+        }
+    }
+    let cli = cli.map(parse).transpose()?;
+    let environment = environment.map(parse).transpose()?;
+    match (cli, environment) {
+        (Some(a), Some(b)) if a != b => {
+            Err("--rnnt-precision conflicts with ASR_RNNT_PRECISION".into())
+        }
+        (Some(value), _) | (_, Some(value)) => Ok(Some(value)),
+        (None, None) => Ok(None),
     }
 }
 
@@ -224,6 +263,11 @@ fn parse_cli(args: &[String]) -> Result<CliOptions, String> {
             )?,
             "--ctc-fp16" => set_flag(&mut options.ctc_fp16, "--ctc-fp16")?,
             "--no-rnnt" => set_flag(&mut options.no_rnnt, "--no-rnnt")?,
+            "--rnnt-precision" => set_once(
+                &mut options.rnnt_precision,
+                next_value(args, &mut position, "--rnnt-precision")?,
+                "--rnnt-precision",
+            )?,
             "--rnnt-fp16" => set_flag(&mut options.rnnt_fp16, "--rnnt-fp16")?,
             option if option.starts_with('-') => return Err(format!("unknown option {option}")),
             value => return Err(format!("unexpected positional argument {value:?}")),
@@ -635,6 +679,24 @@ mod tests {
         {
             StartupEnvironment::default()
         }
+    }
+
+    #[test]
+    fn rnnt_precision_settings_resolve_and_refuse_conflicts() {
+        use gigaam_recognition::RnntPrecisionSelection;
+        assert_eq!(super::resolve_rnnt_precision(None, None), Ok(None));
+        assert_eq!(
+            super::resolve_rnnt_precision(Some("fp16"), Some("fp16")),
+            Ok(Some(RnntPrecisionSelection::Fp16))
+        );
+        assert!(super::resolve_rnnt_precision(Some("fp32"), Some("fp16")).is_err());
+        assert!(super::resolve_rnnt_precision(None, Some("")).is_err());
+        let env = StartupEnvironment {
+            rnnt_precision: Some("fp16"),
+            ..default_provider_environment()
+        };
+        assert!(Startup::parse(&arguments(&["--no-rnnt"]), env).is_err());
+        assert!(Startup::parse(&arguments(&["--rnnt-fp16"]), env).is_err());
     }
 
     #[test]

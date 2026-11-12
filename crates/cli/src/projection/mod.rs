@@ -139,6 +139,7 @@ pub(crate) struct TranscribeSummary<'a> {
     pub(crate) config: BatchConfig,
     pub(crate) output: TranscribeOutput,
     pub(crate) precision: EncoderPrecision,
+    pub(crate) rnnt_head_precision: Option<gigaam_recognition::RnntPrecisionSelection>,
     pub(crate) window_seconds: f32,
     pub(crate) overlap_seconds: f32,
     pub(crate) loading_elapsed: Duration,
@@ -191,7 +192,7 @@ pub(crate) fn transcribe(summary: TranscribeSummary<'_>) {
         summary.config.sample_rate().hertz(),
         summary.result.source_channels().get(),
         dual_mono,
-        precision_label(summary.precision),
+        transcribe_precision_label(summary.precision, summary.rnnt_head_precision),
         summary.window_seconds,
         summary.overlap_seconds,
         summary.loading_elapsed.as_secs_f32(),
@@ -338,16 +339,39 @@ pub(crate) fn dialog_failure_message(failure: &OfflineDialogFailure) -> String {
     }
 }
 
+fn transcribe_precision_label(
+    precision: EncoderPrecision,
+    rnnt_heads: Option<gigaam_recognition::RnntPrecisionSelection>,
+) -> String {
+    let encoder = match precision {
+        EncoderPrecision::Fp32 => "fp32",
+        EncoderPrecision::Fp16Io32 => "fp16io32",
+        EncoderPrecision::Fp16 => "fp16-native",
+    };
+    match rnnt_heads {
+        Some(gigaam_recognition::RnntPrecisionSelection::Fp16) => {
+            format!("encoder {encoder}, RNN-T heads fp16")
+        }
+        Some(gigaam_recognition::RnntPrecisionSelection::Fp32) => {
+            format!("encoder {encoder}, RNN-T heads fp32")
+        }
+        None => format!("encoder {encoder}"),
+    }
+}
+
 pub(super) fn precision_label(precision: EncoderPrecision) -> &'static str {
     match precision {
         EncoderPrecision::Fp32 => "fp32",
         EncoderPrecision::Fp16Io32 => "fp16",
+        EncoderPrecision::Fp16 => "fp16-native",
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{dialog_failure_message, precision_label, render_window_timing};
+    use super::{
+        dialog_failure_message, precision_label, render_window_timing, transcribe_precision_label,
+    };
     use gigaam_model_package::EncoderPrecision;
     use gigaam_transcription::{OfflineDialogFailure, OfflineDialogFailureOrigin};
 
@@ -356,6 +380,31 @@ mod tests {
         assert_eq!(
             render_window_timing(12.34, 7, 0.0125),
             "#   window   12.34s frames     7 encoder   12.5 ms"
+        );
+    }
+
+    #[test]
+    fn transcribe_precision_reports_encoder_boundary_and_rnnt_heads() {
+        assert_eq!(
+            transcribe_precision_label(
+                EncoderPrecision::Fp16Io32,
+                Some(gigaam_recognition::RnntPrecisionSelection::Fp16)
+            ),
+            "encoder fp16io32, RNN-T heads fp16"
+        );
+        assert_eq!(
+            transcribe_precision_label(
+                EncoderPrecision::Fp16,
+                Some(gigaam_recognition::RnntPrecisionSelection::Fp16)
+            ),
+            "encoder fp16-native, RNN-T heads fp16"
+        );
+        assert_eq!(
+            transcribe_precision_label(
+                EncoderPrecision::Fp32,
+                Some(gigaam_recognition::RnntPrecisionSelection::Fp32)
+            ),
+            "encoder fp32, RNN-T heads fp32"
         );
     }
 

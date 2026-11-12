@@ -113,3 +113,39 @@ The schema establishes configuration and selected-asset safety, not redistributi
 or model quality. Obtain authorization for the exact GigaAM, vocabulary, and VAD artifacts
 you deploy, and validate a real package with the selected CPU, CUDA, or TensorRT runtime
 before treating an image as a release artifact.
+
+## Version 2 GPU artifacts
+
+Version 2 retains the version 1 keys and requires `artifact_format=onnx` or
+`artifact_format=trt_ep_context`, plus `ctc.encoder_fp16` and
+`rnnt.encoder_fp16` paths for native FP16 encoder I/O. The FP16Io32 paths retain
+their existing FP32 I/O meaning. Version 1 remains ONNX and its optional FP16
+encoder fields remain opaque. Decoder and joint FP16 paths use the existing keys.
+The format applies to the neural model artifacts; frontend, vocabulary and VAD
+retain their existing meanings. Selected paths are checked as package assets;
+actual tensor and engine compatibility is determined when sessions load.
+
+`scripts/prepare_gpu_model.py` is an offline tool. Its `export` command loads a
+fresh upstream model and exports the selected `--dtype`; use separate invocations
+for each precision. Its `build` command invokes `trtexec` with supplied profile
+and precision options, and `wrap` creates a file-backed EPContext ONNX wrapper
+beside the engine using the original ONNX interface. Existing official ONNX
+exports can be passed directly to `build` and `wrap`. Install the upstream GigaAM,
+PyTorch, ONNX and TensorRT tools in the preparation environment as needed.
+Engine portability and model quality require validation on the target runtime.
+
+As an explicit alternative when `trtexec` is unavailable, `build-python` uses
+TensorRT's Python builder and ONNX parser. It uses a strongly typed network so
+the ONNX graph defines tensor precision, and disables TF32 unless `--tf32` is
+specified. Supply each dynamic input profile using its actual ONNX name, with
+minimum, optimum and maximum dimensions separated by colons and dimensions by
+`x`. For example (replace the names and dimensions with the model's contract):
+
+```sh
+python scripts/prepare_gpu_model.py build-python encoder.onnx encoder.plan \
+  --shape features:1x64x16:1x64x512:1x64x3000 \
+  --shape feature_lengths:1:1:1
+```
+
+Fixed-shape models do not need a profile. Parser and engine build errors stop
+preparation; this command does not fall back to another builder.

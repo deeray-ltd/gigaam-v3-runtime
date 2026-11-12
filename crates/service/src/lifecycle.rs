@@ -237,9 +237,15 @@ pub(super) fn run_process(
     );
 
     let rnnt = if startup.with_rnnt {
-        let decoder =
-            DirectRecognizer::rnnt(&pack, &startup.plan, encoder_precision(startup.rnnt_fp16))
-                .unwrap_or_else(|error| fatal(&format!("RNNT decoder: {error}")));
+        let decoder = match startup.rnnt_precision {
+            Some(selection) => {
+                DirectRecognizer::rnnt_with_precision(&pack, &startup.plan, selection)
+            }
+            None => {
+                DirectRecognizer::rnnt(&pack, &startup.plan, encoder_precision(startup.rnnt_fp16))
+            }
+        }
+        .unwrap_or_else(|error| fatal(&format!("RNNT decoder: {error}")));
         let precision = precision_name(decoder.encoder_precision());
         emit_unverified_cuda_assignment(
             &startup.plan,

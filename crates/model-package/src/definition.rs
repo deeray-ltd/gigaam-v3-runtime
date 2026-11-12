@@ -15,6 +15,7 @@ pub struct SchemaVersion(u8);
 
 impl SchemaVersion {
     pub(crate) const V1: Self = Self(1);
+    pub(crate) const V2: Self = Self(2);
 
     pub fn value(self) -> u8 {
         self.0
@@ -22,9 +23,16 @@ impl SchemaVersion {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ArtifactFormat {
+    Onnx,
+    TrtEpContext,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EncoderPrecision {
     Fp32,
     Fp16Io32,
+    Fp16,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -255,6 +263,7 @@ pub struct CtcDefinition {
     pub(crate) vocabulary: RelativeAsset,
     pub(crate) blank_id: usize,
     pub(crate) encoder_fp16io32: RelativeAsset,
+    pub(crate) encoder_fp16: Option<RelativeAsset>,
     pub(crate) encoder_fp32: RelativeAsset,
     pub(crate) tensor_contract: EncoderTensorContract,
     pub(crate) output_dimension: usize,
@@ -270,10 +279,21 @@ impl CtcDefinition {
         &self.vocabulary
     }
 
-    pub(crate) fn encoder_asset(&self, precision: EncoderPrecision) -> &RelativeAsset {
+    pub(crate) fn encoder_asset(
+        &self,
+        precision: EncoderPrecision,
+    ) -> Result<&RelativeAsset, PackageError> {
         match precision {
-            EncoderPrecision::Fp32 => &self.encoder_fp32,
-            EncoderPrecision::Fp16Io32 => &self.encoder_fp16io32,
+            EncoderPrecision::Fp32 => Ok(&self.encoder_fp32),
+            EncoderPrecision::Fp16Io32 => Ok(&self.encoder_fp16io32),
+            EncoderPrecision::Fp16 => {
+                self.encoder_fp16
+                    .as_ref()
+                    .ok_or(PackageError::Compatibility {
+                        field: "encoder precision",
+                        reason: "native FP16 encoder requires a V2 package",
+                    })
+            }
         }
     }
 
@@ -297,6 +317,7 @@ pub struct RnntDefinition {
     pub(crate) prediction_hidden: usize,
     pub(crate) max_symbols_per_step: usize,
     pub(crate) encoder_fp16io32: RelativeAsset,
+    pub(crate) encoder_fp16: Option<RelativeAsset>,
     pub(crate) decoder_fp16: RelativeAsset,
     pub(crate) joint_fp16: RelativeAsset,
     pub(crate) encoder_fp32: RelativeAsset,
@@ -344,24 +365,35 @@ impl RnntDefinition {
         &self.vocabulary
     }
 
-    pub(crate) fn encoder_asset(&self, precision: EncoderPrecision) -> &RelativeAsset {
+    pub(crate) fn encoder_asset(
+        &self,
+        precision: EncoderPrecision,
+    ) -> Result<&RelativeAsset, PackageError> {
         match precision {
-            EncoderPrecision::Fp32 => &self.encoder_fp32,
-            EncoderPrecision::Fp16Io32 => &self.encoder_fp16io32,
+            EncoderPrecision::Fp32 => Ok(&self.encoder_fp32),
+            EncoderPrecision::Fp16Io32 => Ok(&self.encoder_fp16io32),
+            EncoderPrecision::Fp16 => {
+                self.encoder_fp16
+                    .as_ref()
+                    .ok_or(PackageError::Compatibility {
+                        field: "encoder precision",
+                        reason: "native FP16 encoder requires a V2 package",
+                    })
+            }
         }
     }
 
     pub(crate) fn decoder_asset(&self, precision: EncoderPrecision) -> &RelativeAsset {
         match precision {
             EncoderPrecision::Fp32 => &self.decoder_fp32,
-            EncoderPrecision::Fp16Io32 => &self.decoder_fp16,
+            EncoderPrecision::Fp16Io32 | EncoderPrecision::Fp16 => &self.decoder_fp16,
         }
     }
 
     pub(crate) fn joint_asset(&self, precision: EncoderPrecision) -> &RelativeAsset {
         match precision {
             EncoderPrecision::Fp32 => &self.joint_fp32,
-            EncoderPrecision::Fp16Io32 => &self.joint_fp16,
+            EncoderPrecision::Fp16Io32 | EncoderPrecision::Fp16 => &self.joint_fp16,
         }
     }
 
@@ -424,6 +456,7 @@ impl RetainedMetadata {
 #[derive(Clone, Debug)]
 pub(crate) struct PackageDefinition {
     schema_version: SchemaVersion,
+    artifact_format: ArtifactFormat,
     frontend: FrontendDefinition,
     ctc: CtcDefinition,
     rnnt: RnntDefinition,
@@ -434,6 +467,7 @@ pub(crate) struct PackageDefinition {
 impl PackageDefinition {
     pub(crate) fn new(
         schema_version: SchemaVersion,
+        artifact_format: ArtifactFormat,
         frontend: FrontendDefinition,
         ctc: CtcDefinition,
         rnnt: RnntDefinition,
@@ -442,6 +476,7 @@ impl PackageDefinition {
     ) -> Self {
         Self {
             schema_version,
+            artifact_format,
             frontend,
             ctc,
             rnnt,
@@ -452,6 +487,10 @@ impl PackageDefinition {
 
     pub(crate) fn schema_version(&self) -> SchemaVersion {
         self.schema_version
+    }
+
+    pub(crate) fn artifact_format(&self) -> ArtifactFormat {
+        self.artifact_format
     }
 
     pub(crate) fn frontend(&self) -> &FrontendDefinition {

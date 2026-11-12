@@ -11,44 +11,45 @@
 
 use crate::contracts::{Decoded, Encoder, FrameRate, WindowDecoder};
 use crate::ctc;
-use crate::native_output::{ExpectedCardinality, NativeOutputRole, validate_f32_output};
+use crate::native_output::{
+    ExpectedCardinality, NativeOutputRole, validate_f16_output, validate_f32_output,
+};
 use crate::ort_assignment::CudaAssignmentEvidence;
-use crate::ort_encoder::OrtEncoder;
-use crate::provider::ProviderPlan;
+use crate::ort_encoder::{EncodedRnntWindow, OrtEncoder};
+use crate::provider::{Device, ProviderPlan};
 use crate::rnnt::{self, RnntFrameSource, RnntTransition};
 use gigaam_audio::FeatureMatrixView;
 use gigaam_model_package::{EncoderPrecision, ModelPackage};
 use gigaam_primitives::{f64_to_f32, usize_to_i64};
 use ort::session::Session;
 use ort::value::Tensor;
-use std::num::NonZeroUsize;
 use std::path::Path;
 use std::time::Instant;
 
-struct PredictionState {
-    decoder: Vec<f32>,
-    hidden: Vec<f32>,
-    cell: Vec<f32>,
+struct PredictionState<T> {
+    decoder: Vec<T>,
+    hidden: Vec<T>,
+    cell: Vec<T>,
 }
 
-struct OrtFrameSource<'a> {
-    values: &'a [f32],
+struct OrtFrameSource<'a, T> {
+    values: &'a [T],
     output_frames: usize,
     encoder_dimension: usize,
 }
 
-impl RnntFrameSource for OrtFrameSource<'_> {
+impl<T> RnntFrameSource<T> for OrtFrameSource<'_, T> {
     fn output_frames(&self) -> usize {
         self.output_frames
     }
 
-    fn frame(&self, index: usize) -> &[f32] {
+    fn frame(&self, index: usize) -> &[T] {
         let start = index * self.encoder_dimension;
         &self.values[start..start + self.encoder_dimension]
     }
 }
 
-struct OrtRnntTransition {
+struct OrtRnntTransition<T> {
     prediction: Session,
     joint: Session,
     prediction_inputs: [String; 3],
@@ -58,15 +59,16 @@ struct OrtRnntTransition {
     prediction_hidden: usize,
     encoder_dimension: usize,
     blank: usize,
+    prepared_frame: Vec<T>,
 }
 
-impl OrtRnntTransition {
+impl<T: SessionFloat> OrtRnntTransition<T> {
     fn prediction_step(
         &mut self,
         label: i64,
-        hidden: &[f32],
-        cell: &[f32],
-    ) -> Result<PredictionState, String> {
+        hidden: &[T],
+        cell: &[T],
+    ) -> Result<PredictionState<T>, String> {
         let hidden_size = self.prediction_hidden;
         let input =
             Tensor::from_array(([1_usize, 1], vec![label])).map_err(|error| error.to_string())?;
@@ -83,32 +85,40 @@ impl OrtRnntTransition {
             ])
             .map_err(|error| error.to_string())?;
         let (decoder_shape, decoder) = output[self.prediction_outputs[0].as_str()]
-            .try_extract_tensor::<f32>()
+            .try_extract_tensor::<T>()
             .map_err(|error| error.to_string())?;
         let (hidden_shape, hidden) = output[self.prediction_outputs[1].as_str()]
-            .try_extract_tensor::<f32>()
+            .try_extract_tensor::<T>()
             .map_err(|error| error.to_string())?;
         let (cell_shape, cell) = output[self.prediction_outputs[2].as_str()]
-            .try_extract_tensor::<f32>()
+            .try_extract_tensor::<T>()
             .map_err(|error| error.to_string())?;
-        validate_f32_output(
+        T::validate(
             NativeOutputRole::RnntPredictionDecoder,
             decoder_shape,
             decoder,
             ExpectedCardinality::Exact(self.prediction_hidden),
         )?;
-        validate_f32_output(
+        T::validate(
             NativeOutputRole::RnntPredictionHidden,
             hidden_shape,
             hidden,
             ExpectedCardinality::Exact(self.prediction_hidden),
         )?;
-        validate_f32_output(
+        T::validate(
             NativeOutputRole::RnntPredictionCell,
             cell_shape,
             cell,
             ExpectedCardinality::Exact(self.prediction_hidden),
         )?;
+        validate_vector_axes(
+            "prediction decoder",
+            decoder_shape,
+            self.prediction_hidden,
+            3,
+        )?;
+        validate_vector_axes("prediction hidden", hidden_shape, self.prediction_hidden, 3)?;
+        validate_vector_axes("prediction cell", cell_shape, self.prediction_hidden, 3)?;
         Ok(PredictionState {
             decoder: decoder.to_vec(),
             hidden: hidden.to_vec(),
@@ -118,8 +128,8 @@ impl OrtRnntTransition {
 
     fn joint_argmax(
         &mut self,
-        frame: &[f32],
-        decoder: &[f32],
+        frame: &[T],
+        decoder: &[T],
         scored: bool,
     ) -> Result<(usize, Option<f64>), String> {
         let encoder = Tensor::from_array(([1_usize, self.encoder_dimension, 1], frame.to_vec()))
@@ -135,18 +145,19 @@ impl OrtRnntTransition {
             ])
             .map_err(|error| error.to_string())?;
         let (shape, logits) = output[self.joint_output.as_str()]
-            .try_extract_tensor::<f32>()
+            .try_extract_tensor::<T>()
             .map_err(|error| error.to_string())?;
         let expected = self
             .blank
             .checked_add(1)
             .ok_or_else(|| "RNNT blank identifier overflows joint vocabulary size".to_owned())?;
-        validate_f32_output(
+        T::validate(
             NativeOutputRole::RnntJoint,
             shape,
             logits,
             ExpectedCardinality::Exact(expected),
         )?;
+        validate_vector_axes("joint", shape, expected, 4)?;
         let mut best = 0_usize;
         for (index, &value) in logits.iter().enumerate() {
             if value > logits[best] {
@@ -154,7 +165,13 @@ impl OrtRnntTransition {
             }
         }
         let score = if scored {
-            Some(crate::contracts::selected_log_probability(logits, best)?)
+            Some(crate::contracts::selected_log_probability(
+                &logits
+                    .iter()
+                    .map(|value| value.to_f32())
+                    .collect::<Vec<_>>(),
+                best,
+            )?)
         } else {
             None
         };
@@ -162,52 +179,160 @@ impl OrtRnntTransition {
     }
 }
 
-impl RnntTransition for OrtRnntTransition {
-    type State = PredictionState;
+fn validate_vector_axes(
+    role: &str,
+    shape: &[i64],
+    width: usize,
+    rank: usize,
+) -> Result<(), String> {
+    let width = i64::try_from(width).map_err(|_| format!("{role} width exceeds i64"))?;
+    if shape.len() != rank
+        || shape.last() != Some(&width)
+        || shape[..shape.len().saturating_sub(1)]
+            .iter()
+            .any(|&axis| axis != 1)
+    {
+        return Err(format!("unexpected RNN-T {role} output shape {shape:?}"));
+    }
+    Ok(())
+}
 
-    fn start(&mut self, blank: usize) -> Result<Self::State, String> {
+trait SessionFloat:
+    ort::value::PrimitiveTensorElementType + std::fmt::Debug + PartialOrd + Copy + Send + Sync + 'static
+{
+    fn zero() -> Self;
+    fn to_f32(self) -> f32;
+    fn validate(
+        role: NativeOutputRole,
+        shape: &[i64],
+        values: &[Self],
+        expected: ExpectedCardinality,
+    ) -> Result<(), String>;
+}
+impl SessionFloat for f32 {
+    fn zero() -> Self {
+        0.0
+    }
+    fn to_f32(self) -> f32 {
+        self
+    }
+    fn validate(
+        role: NativeOutputRole,
+        shape: &[i64],
+        values: &[Self],
+        expected: ExpectedCardinality,
+    ) -> Result<(), String> {
+        validate_f32_output(role, shape, values, expected)
+    }
+}
+impl SessionFloat for half::f16 {
+    fn zero() -> Self {
+        half::f16::ZERO
+    }
+    fn to_f32(self) -> f32 {
+        f32::from(self)
+    }
+    fn validate(
+        role: NativeOutputRole,
+        shape: &[i64],
+        values: &[Self],
+        expected: ExpectedCardinality,
+    ) -> Result<(), String> {
+        validate_f16_output(role, shape, values, expected)
+    }
+}
+impl<T: SessionFloat> OrtRnntTransition<T> {
+    fn start_state(&mut self, blank: usize) -> Result<PredictionState<T>, String> {
         if blank != self.blank {
             return Err(
                 "RNNT transition blank identifier does not match its native session".into(),
             );
         }
-        let hidden = vec![0.0_f32; self.prediction_hidden];
-        let cell = vec![0.0_f32; self.prediction_hidden];
+        let zeros = vec![T::zero(); self.prediction_hidden];
         let label =
             usize_to_i64(blank).map_err(|error| format!("RNNT blank token identifier: {error}"))?;
-        self.prediction_step(label, &hidden, &cell)
+        self.prediction_step(label, &zeros, &zeros)
     }
-
-    fn select(&mut self, frame: &[f32], state: &Self::State) -> Result<usize, String> {
-        self.joint_argmax(frame, &state.decoder, false)
-            .map(|(token, _)| token)
-    }
-
-    fn select_scored(
+    fn advance_state(
         &mut self,
-        frame: &[f32],
-        state: &Self::State,
-    ) -> Result<(usize, f64), String> {
-        let (token, score) = self.joint_argmax(frame, &state.decoder, true)?;
-        Ok((
-            token,
-            score.ok_or_else(|| "missing RNN-T joint score".to_owned())?,
-        ))
-    }
-
-    fn advance(&mut self, token: usize, state: &mut Self::State) -> Result<(), String> {
+        token: usize,
+        state: &mut PredictionState<T>,
+    ) -> Result<(), String> {
         let label =
             usize_to_i64(token).map_err(|error| format!("RNNT token identifier: {error}"))?;
         *state = self.prediction_step(label, &state.hidden, &state.cell)?;
         Ok(())
     }
 }
+macro_rules! native_transition {
+    ($ty:ty) => {
+        impl RnntTransition<$ty> for OrtRnntTransition<$ty> {
+            type State = PredictionState<$ty>;
+            fn start(&mut self, blank: usize) -> Result<Self::State, String> {
+                self.start_state(blank)
+            }
+            fn select(&mut self, frame: &[$ty], state: &Self::State) -> Result<usize, String> {
+                self.joint_argmax(frame, &state.decoder, false)
+                    .map(|result| result.0)
+            }
+            fn select_scored(
+                &mut self,
+                frame: &[$ty],
+                state: &Self::State,
+            ) -> Result<(usize, f64), String> {
+                let (token, score) = self.joint_argmax(frame, &state.decoder, true)?;
+                Ok((
+                    token,
+                    score.ok_or_else(|| "missing RNN-T joint score".to_owned())?,
+                ))
+            }
+            fn advance(&mut self, token: usize, state: &mut Self::State) -> Result<(), String> {
+                self.advance_state(token, state)
+            }
+        }
+    };
+}
+native_transition!(f32);
+native_transition!(half::f16);
+impl RnntTransition<f32> for OrtRnntTransition<half::f16> {
+    type State = PredictionState<half::f16>;
+    fn start(&mut self, blank: usize) -> Result<Self::State, String> {
+        self.start_state(blank)
+    }
+    fn prepare_frame(&mut self, frame: &[f32]) -> Result<(), String> {
+        self.prepared_frame = frame.iter().copied().map(half::f16::from_f32).collect();
+        if self.prepared_frame.iter().any(|v| !v.is_finite()) {
+            return Err("RNN-T frame cannot be represented as finite FP16".into());
+        }
+        Ok(())
+    }
+    fn select(&mut self, _: &[f32], state: &Self::State) -> Result<usize, String> {
+        let frame = self.prepared_frame.clone();
+        self.joint_argmax(&frame, &state.decoder, false)
+            .map(|result| result.0)
+    }
+    fn select_scored(&mut self, _: &[f32], state: &Self::State) -> Result<(usize, f64), String> {
+        let frame = self.prepared_frame.clone();
+        let (token, score) = self.joint_argmax(&frame, &state.decoder, true)?;
+        Ok((
+            token,
+            score.ok_or_else(|| "missing RNN-T joint score".to_owned())?,
+        ))
+    }
+    fn advance(&mut self, token: usize, state: &mut Self::State) -> Result<(), String> {
+        self.advance_state(token, state)
+    }
+}
 
-/// A native RNN-T decoder. Its encoder follows the selected provider plan; prediction and joint
-/// are intentional CPU-only session roles and use the fp32 package assets.
+enum Transition {
+    F32(OrtRnntTransition<f32>),
+    F16(OrtRnntTransition<half::f16>),
+}
+
+/// A native RNN-T decoder using the selected provider plan for each neural session.
 pub(crate) struct RnntDecoder {
     encoder: OrtEncoder,
-    transition: OrtRnntTransition,
+    transition: Transition,
     vocabulary: Vec<String>,
     blank: usize,
     encoder_dimension: usize,
@@ -215,32 +340,90 @@ pub(crate) struct RnntDecoder {
     frame_rate: FrameRate,
 }
 
-fn cpu_session(path: &Path, intra_threads: Option<NonZeroUsize>) -> Result<Session, String> {
+fn head_session(path: &Path, plan: &ProviderPlan) -> Result<Session, String> {
     let mut builder = Session::builder().map_err(|error| error.to_string())?;
-    if let Some(threads) = intra_threads {
+    if let Some(threads) = plan.config.intra_threads {
         builder = builder
             .with_intra_threads(threads.get())
             .map_err(|error| error.to_string())?;
     }
-    builder
+    match plan.device() {
+        Device::Cpu => {}
+        Device::Cuda => {
+            #[cfg(feature = "cuda")]
+            {
+                builder = builder
+                    .with_config_entry("session.record_ep_graph_assignment_info", "1")
+                    .map_err(|error| error.to_string())?
+                    .with_execution_providers([ort::ep::CUDA::default().build().error_on_failure()])
+                    .map_err(|error| error.to_string())?
+                    .with_disable_cpu_fallback()
+                    .map_err(|error| error.to_string())?;
+            }
+            #[cfg(not(feature = "cuda"))]
+            return Err(
+                "cuda EP is unavailable in this build; rebuild with --features cuda".into(),
+            );
+        }
+        Device::Tensorrt => {
+            #[cfg(feature = "tensorrt")]
+            {
+                builder = builder
+                    .with_execution_providers([ort::ep::TensorRT::default()
+                        .build()
+                        .error_on_failure()])
+                    .map_err(|error| error.to_string())?
+                    .with_disable_cpu_fallback()
+                    .map_err(|error| error.to_string())?;
+            }
+            #[cfg(not(feature = "tensorrt"))]
+            return Err("tensorrt EP requires building with --features tensorrt".into());
+        }
+    }
+    let session = builder
         .commit_from_file(path)
-        .map_err(|error| format!("{}: {error}", path.display()))
+        .map_err(|error| format!("{}: {error}", path.display()))?;
+    if plan.device() == Device::Cuda {
+        let evidence = crate::ort_assignment::inspect(&session)?;
+        eprintln!(
+            "RNN-T head {} CUDA assignment: {} CUDA nodes, {} CPU nodes",
+            path.display(),
+            evidence.cuda_assignments(),
+            evidence.cpu_assignments()
+        );
+        eprintln!(
+            "RNN-T head {} CPU operator assignments: {:?}",
+            path.display(),
+            evidence.cpu_operator_types()
+        );
+    }
+    Ok(session)
 }
 
 impl RnntDecoder {
-    /// Creates an RNN-T decoder with one selected accelerator or CPU encoder and CPU prediction
-    /// and joint sessions. `precision` applies to the encoder only.
+    /// Creates an RNN-T decoder; `precision` applies to the encoder only.
     pub(crate) fn from_pack(
         pack: &ModelPackage,
         plan: &ProviderPlan,
         precision: EncoderPrecision,
+        full_fp16: bool,
     ) -> Result<Self, String> {
+        if !full_fp16 && precision == EncoderPrecision::Fp16 {
+            return Err("native FP16 encoder requires FP16 RNN-T heads".into());
+        }
+        if full_fp16 && plan.device() == Device::Cpu {
+            return Err("full RNN-T FP16 requires CUDA or TensorRT".into());
+        }
         let encoder = OrtEncoder::rnnt(pack, plan, precision)?;
         let assets = pack
-            .rnnt_assets(EncoderPrecision::Fp32)
+            .rnnt_assets(if full_fp16 {
+                precision
+            } else {
+                EncoderPrecision::Fp32
+            })
             .map_err(|error| error.to_string())?;
-        let prediction = cpu_session(assets.decoder().path(), plan.config.intra_threads)?;
-        let joint = cpu_session(assets.joint().path(), plan.config.intra_threads)?;
+        let prediction = head_session(assets.decoder().path(), plan)?;
+        let joint = head_session(assets.joint().path(), plan)?;
         let vocabulary = assets
             .load_vocabulary()
             .map_err(|error| error.to_string())?;
@@ -259,16 +442,26 @@ impl RnntDecoder {
                 vocabulary.len()
             ));
         }
-        let transition = OrtRnntTransition {
-            prediction,
-            joint,
-            prediction_inputs: definition.decoder_input_names().clone(),
-            prediction_outputs: definition.decoder_output_names().clone(),
-            joint_inputs: definition.joint_input_names().clone(),
-            joint_output: definition.joint_output_name().to_owned(),
-            prediction_hidden: definition.prediction_hidden(),
-            encoder_dimension,
-            blank,
+        macro_rules! make_transition {
+            () => {
+                OrtRnntTransition {
+                    prediction,
+                    joint,
+                    prediction_inputs: definition.decoder_input_names().clone(),
+                    prediction_outputs: definition.decoder_output_names().clone(),
+                    joint_inputs: definition.joint_input_names().clone(),
+                    joint_output: definition.joint_output_name().to_owned(),
+                    prediction_hidden: definition.prediction_hidden(),
+                    encoder_dimension,
+                    blank,
+                    prepared_frame: Vec::new(),
+                }
+            };
+        }
+        let transition = if full_fp16 {
+            Transition::F16(make_transition!())
+        } else {
+            Transition::F32(make_transition!())
         };
         Ok(Self {
             encoder,
@@ -306,20 +499,65 @@ impl WindowDecoder for RnntDecoder {
         detail: crate::contracts::ScoreDetail,
     ) -> Result<Decoded, String> {
         let started = Instant::now();
-        let (encoded, output_frames) = self.encoder.forward(features)?;
+        let encoded = self.encoder.forward_rnnt(features)?;
         let encoder_seconds = started.elapsed().as_secs_f64();
-        let frames = OrtFrameSource {
-            values: &encoded,
-            output_frames,
-            encoder_dimension: self.encoder_dimension,
+        let scored = detail == crate::contracts::ScoreDetail::TokenLogProbabilities;
+        let (output, output_frames) = match (&mut self.transition, encoded) {
+            (Transition::F32(transition), EncodedRnntWindow::F32(values, count)) => {
+                let frames = OrtFrameSource {
+                    values: &values,
+                    output_frames: count,
+                    encoder_dimension: self.encoder_dimension,
+                };
+                (
+                    rnnt::greedy_with_detail(
+                        transition,
+                        &frames,
+                        self.blank,
+                        self.max_symbols_per_step,
+                        scored,
+                    )?,
+                    count,
+                )
+            }
+            (Transition::F16(transition), EncodedRnntWindow::F32(values, count)) => {
+                let frames = OrtFrameSource {
+                    values: &values,
+                    output_frames: count,
+                    encoder_dimension: self.encoder_dimension,
+                };
+                (
+                    rnnt::greedy_with_detail(
+                        transition,
+                        &frames,
+                        self.blank,
+                        self.max_symbols_per_step,
+                        scored,
+                    )?,
+                    count,
+                )
+            }
+            (Transition::F16(transition), EncodedRnntWindow::F16(values, count)) => {
+                let frames = OrtFrameSource {
+                    values: &values,
+                    output_frames: count,
+                    encoder_dimension: self.encoder_dimension,
+                };
+                (
+                    rnnt::greedy_typed_with_detail(
+                        transition,
+                        &frames,
+                        self.blank,
+                        self.max_symbols_per_step,
+                        scored,
+                    )?,
+                    count,
+                )
+            }
+            (Transition::F32(_), EncodedRnntWindow::F16(_, _)) => {
+                return Err("native FP16 encoder requires FP16 RNN-T heads".into());
+            }
         };
-        let output = rnnt::greedy_with_detail(
-            &mut self.transition,
-            &frames,
-            self.blank,
-            self.max_symbols_per_step,
-            detail == crate::contracts::ScoreDetail::TokenLogProbabilities,
-        )?;
         let words = ctc::tokens_to_words(output.tokens(), &self.vocabulary, self.frame_rate)?;
         let spans = ctc::word_token_spans(output.tokens(), &self.vocabulary);
         Decoded::new_with_tokens(crate::contracts::DecodedTokensInput {
@@ -330,5 +568,23 @@ impl WindowDecoder for RnntDecoder {
             tokens: output.tokens().to_vec(),
             word_spans: spans,
         })
+    }
+}
+
+#[cfg(test)]
+mod shape_tests {
+    use super::validate_vector_axes;
+
+    #[test]
+    fn rnnt_outputs_require_width_on_the_final_axis() {
+        assert!(validate_vector_axes("prediction", &[1, 1, 8], 8, 3).is_ok());
+        assert!(validate_vector_axes("joint", &[1, 1, 1, 5], 5, 4).is_ok());
+        assert!(validate_vector_axes("prediction", &[1, 1, 1], 1, 3).is_ok());
+        assert!(validate_vector_axes("joint", &[1, 1, 1, 1], 1, 4).is_ok());
+        assert!(validate_vector_axes("prediction", &[8, 1, 1], 8, 3).is_err());
+        assert!(validate_vector_axes("prediction", &[1, 8, 1], 8, 3).is_err());
+        assert!(validate_vector_axes("joint", &[5, 1, 1, 1], 5, 4).is_err());
+        assert!(validate_vector_axes("joint", &[1, 1, 5, 1], 5, 4).is_err());
+        assert!(validate_vector_axes("joint", &[1, 1, 5], 5, 4).is_err());
     }
 }

@@ -15,13 +15,18 @@ startup; the runtime does not discover a substitute package or provider.
 
 ~~~text
 asr-serve [--model DIR] [--port 1..65535] [--ep cpu|cuda|tensorrt]
-          [--ort-dylib PATH] [--ctc-fp16] [--no-rnnt] [--rnnt-fp16]
+          [--ort-dylib PATH] [--ctc-fp16] [--no-rnnt] [--rnnt-fp16] [--rnnt-precision fp32|fp16]
 ~~~
 
 model defaults to model and port defaults to 8080. Each option can occur once; positional
 arguments and unknown options refuse. --no-rnnt conflicts with --rnnt-fp16. CTC uses fp32
 unless --ctc-fp16 selects fp16io32; RNN-T is loaded unless --no-rnnt, and --rnnt-fp16
-selects its fp16io32 graph. Precision selection is explicit and may change model output.
+selects its fp16io32 encoder only. `--rnnt-precision fp32|fp16` or
+`ASR_RNNT_PRECISION=fp32|fp16` selects all RNN-T roles; fp16 requires compatible
+package assets and does not fall back to fp32. Both settings may be supplied only when
+they agree. They conflict with `--rnnt-fp16` and `--no-rnnt`. When absent, the legacy
+encoder choice and fp32 heads remain in effect. Full fp16 is intended for GPU providers.
+Precision selection may change model output.
 
 ## Service limits and policy environment
 
@@ -57,6 +62,7 @@ processing deadline configured by ASR_REQ_TIMEOUT_SEC returns 504 instead.
 
 | Variable | Default | Accepted value and effect |
 | --- | --- | --- |
+| ASR_RNNT_PRECISION | Absent | `fp32` or `fp16`; selects precision for all RNN-T roles. |
 | ASR_ENCODER_EP | Compiled default | cpu, cuda, or tensorrt. It must agree with --ep when both are set. |
 | ORT_DYLIB_PATH | None | Required regular ONNX Runtime library unless --ort-dylib supplies the same path. |
 | ASR_ORT_MEMPATTERN | 1 | 1 preserves ORT memory-pattern optimization; 0 disables it. |

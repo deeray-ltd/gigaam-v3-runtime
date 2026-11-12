@@ -71,8 +71,14 @@ pub(crate) fn rnnt_recognizer(
     package: &ModelPackage,
     runtime: &RuntimeConfig,
     precision: EncoderPrecision,
+    selection: Option<gigaam_recognition::RnntPrecisionSelection>,
 ) -> Result<DirectRecognizer, String> {
-    DirectRecognizer::rnnt(package, runtime.plan(), precision)
+    match selection {
+        Some(selection) => {
+            DirectRecognizer::rnnt_with_precision(package, runtime.plan(), selection)
+        }
+        None => DirectRecognizer::rnnt(package, runtime.plan(), precision),
+    }
 }
 
 /// Builds one exact CTC encoder for the selected provider and precision.

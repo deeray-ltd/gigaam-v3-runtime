@@ -32,6 +32,13 @@ pub(crate) fn run(invocation: TranscribeInvocation) -> Result<(), String> {
         DecoderChoice::Ctc => RequiredEncoderRoles::ctc(),
         DecoderChoice::Rnnt => RequiredEncoderRoles::rnnt(),
     };
+    let rnnt_precision = match invocation.decoder {
+        DecoderChoice::Ctc => None,
+        DecoderChoice::Rnnt => configuration::rnnt_precision(
+            invocation.rnnt_precision,
+            invocation.precision == gigaam_model_package::EncoderPrecision::Fp16Io32,
+        )?,
+    };
     let evidence_path = configuration::evidence_path(invocation.evidence.clone())?;
     if evidence_path.is_some() && invocation.decoder == DecoderChoice::Rnnt {
         return Err("--evidence requires CTC; it does not support --rnnt".into());
@@ -91,8 +98,13 @@ pub(crate) fn run(invocation: TranscribeInvocation) -> Result<(), String> {
             decoder
         }
         DecoderChoice::Rnnt => {
-            let decoder = composition::rnnt_recognizer(&package, &runtime, invocation.precision)
-                .map_err(|error| format!("RNNT decoder: {error}"))?;
+            let decoder = composition::rnnt_recognizer(
+                &package,
+                &runtime,
+                invocation.precision,
+                rnnt_precision,
+            )
+            .map_err(|error| format!("RNNT decoder: {error}"))?;
             projection::emit_unverified_cuda_assignment(
                 runtime.plan(),
                 gigaam_recognition::EncoderRole::Rnnt,
@@ -102,6 +114,7 @@ pub(crate) fn run(invocation: TranscribeInvocation) -> Result<(), String> {
         }
     };
 
+    let effective_precision = decoder.encoder_precision();
     let evidence: Option<Arc<EvidenceWriter>> = match &evidence_path {
         Some(path) => Some(Arc::new(open_evidence_writer(
             path,
@@ -161,7 +174,13 @@ pub(crate) fn run(invocation: TranscribeInvocation) -> Result<(), String> {
         source_rate,
         config,
         output: invocation.output,
-        precision: invocation.precision,
+        precision: effective_precision,
+        rnnt_head_precision: match invocation.decoder {
+            DecoderChoice::Ctc => None,
+            DecoderChoice::Rnnt => {
+                Some(rnnt_precision.unwrap_or(gigaam_recognition::RnntPrecisionSelection::Fp32))
+            }
+        },
         window_seconds: invocation.window_seconds,
         overlap_seconds: invocation.overlap_seconds,
         loading_elapsed,

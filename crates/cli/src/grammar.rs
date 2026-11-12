@@ -6,6 +6,7 @@
 
 use gigaam_audio::SampleRate;
 use gigaam_model_package::EncoderPrecision;
+use gigaam_recognition::RnntPrecisionSelection;
 use gigaam_transcription::{
     EndpointRules, EndpointSource, OfflineChannelPolicy, PadPolicy, StreamConfig, StreamLockPolicy,
     VadDurations, VadPadding, VadPolicyConfig, VadProbability, VadThresholds,
@@ -77,6 +78,7 @@ pub(crate) struct TranscribeInvocation {
     pub(crate) runtime: RuntimeRequest,
     pub(crate) precision: EncoderPrecision,
     pub(crate) decoder: DecoderChoice,
+    pub(crate) rnnt_precision: Option<RnntPrecisionSelection>,
     pub(crate) window_seconds: f32,
     pub(crate) overlap_seconds: f32,
     pub(crate) padding: PadPolicy,
@@ -307,6 +309,7 @@ impl Command {
             Self::Transcribe => matches!(
                 option,
                 "--model"
+                    | "--rnnt-precision"
                     | "--ep"
                     | "--ort-dylib"
                     | "--window"
@@ -564,6 +567,18 @@ fn transcribe(parsed: ParsedArguments) -> Result<Invocation, String> {
         true => DecoderChoice::Rnnt,
         false => DecoderChoice::Ctc,
     };
+    let rnnt_precision = match parsed.value("--rnnt-precision") {
+        None => None,
+        Some("fp32") => Some(RnntPrecisionSelection::Fp32),
+        Some("fp16") => Some(RnntPrecisionSelection::Fp16),
+        Some(_) => return Err("--rnnt-precision must be fp32 or fp16".into()),
+    };
+    if rnnt_precision.is_some() && decoder != DecoderChoice::Rnnt {
+        return Err("--rnnt-precision requires --rnnt".into());
+    }
+    if rnnt_precision.is_some() && parsed.has_flag("--fp16") {
+        return Err("--rnnt-precision conflicts with --fp16".into());
+    }
     let evidence = parsed.value("--evidence").map(PathBuf::from);
     let evidence_version = match parsed.value("--evidence-version") {
         None => EvidenceVersion::V1,
@@ -590,6 +605,7 @@ fn transcribe(parsed: ParsedArguments) -> Result<Invocation, String> {
         runtime: parsed.runtime(),
         precision: parsed.precision(),
         decoder,
+        rnnt_precision,
         window_seconds,
         overlap_seconds,
         padding,
@@ -940,6 +956,49 @@ mod tests {
             Invocation::Dialog(value) => (value.stream_policy, value.applied_config),
             other => panic!("a streaming command must produce stream or dialog: {other:?}"),
         }
+    }
+
+    #[test]
+    fn rnnt_precision_option_requires_rnnt_and_excludes_legacy_fp16() {
+        assert!(
+            parse_text(&arguments(&[
+                "transcribe",
+                "audio.wav",
+                "--rnnt",
+                "--rnnt-precision",
+                "fp16"
+            ]))
+            .is_ok()
+        );
+        assert!(
+            parse_text(&arguments(&[
+                "transcribe",
+                "audio.wav",
+                "--rnnt-precision",
+                "fp16"
+            ]))
+            .is_err()
+        );
+        assert!(
+            parse_text(&arguments(&[
+                "transcribe",
+                "audio.wav",
+                "--rnnt",
+                "--fp16",
+                "--rnnt-precision",
+                "fp32"
+            ]))
+            .is_err()
+        );
+        assert!(
+            parse_text(&arguments(&[
+                "stream",
+                "audio.wav",
+                "--rnnt-precision",
+                "fp16"
+            ]))
+            .is_err()
+        );
     }
 
     #[test]
