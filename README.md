@@ -1,14 +1,18 @@
 # GigaAM v3 Runtime
 
+[![Latest release](https://img.shields.io/github/v/release/deeray-ltd/gigaam-v3-runtime)](https://github.com/deeray-ltd/gigaam-v3-runtime/releases/latest)
+[![CI](https://github.com/deeray-ltd/gigaam-v3-runtime/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/deeray-ltd/gigaam-v3-runtime/actions/workflows/ci.yml?query=branch%3Amain)
+
 GigaAM v3 Runtime is a Rust speech-recognition runtime for GigaAM v3 model packages.
 It prepares audio, runs a selected ONNX Runtime provider, decodes CTC or RNN-T batch
 audio, and serves revisable streaming word and dialog events. Python and a deep-learning
 framework are absent from the serving path; ONNX Runtime is loaded dynamically through an
 explicit shared-library path.
 
-> Status: latest release 0.1.0 (tag v0.1.0), images `deerayltd/asr:0.1.0-cpu`,
-> `deerayltd/asr:0.1.0-cuda`, and `deerayltd/asr:0.1.0-tensorrt` (digests below). The main
-> branch is the 0.1.1 development line; pre-1.0 interfaces may change.
+See the [latest release](https://github.com/deeray-ltd/gigaam-v3-runtime/releases/latest)
+for its version, image digests and validation boundaries. This README describes the current
+branch; use the documentation at a release tag when deploying that release. Pre-1.0 interfaces
+may change.
 
 ## What it provides
 
@@ -16,8 +20,9 @@ explicit shared-library path.
 - WebSocket CTC streaming with tail revisions, stable/final frontiers, and multichannel
   dialog turn patches.
 - Offline commands through asr: transcribe, bench, stream, vad, and dialog.
-- Explicit CPU, CUDA, and TensorRT provider selection with no provider fallback.
-- Version-1 typed model-package validation before selected asset or native-session use.
+- CPU and CUDA execution, plus TensorRT loading of engines prepared offline.
+- RNN-T encoder, prediction and joint use the selected provider, with explicit FP32/FP16 selection.
+- Typed V1/V2 model-package validation before selected asset or native-session use.
 - Bounded Service admission, cooperative HTTP batch cancellation, Prometheus metrics, and
   bounded best-effort runtime access/trace telemetry.
 
@@ -64,7 +69,12 @@ curl --data-binary @audio.wav \
   'http://127.0.0.1:8080/v1/transcribe?model=ctc&words=true'
 ~~~
 
-Set `ASR_API_MODE=openai` to accept OpenAI Python SDK transcription requests at `/v1/audio/transcriptions` instead of the native API (supported model IDs and fields are documented in [docs/API.md](docs/API.md)). The SDK bearer token is not authenticated; bind locally or place the service behind a trusted ingress.
+The default `ASR_API_MODE=native` serves native HTTP and WebSocket routes. Set
+`ASR_API_MODE=openai` to accept OpenAI Python SDK transcription requests at
+`/v1/audio/transcriptions` instead of the native API (supported model IDs and fields are
+documented in [docs/API.md](docs/API.md)). The SDK bearer token is not authenticated; bind
+locally or place the service behind a trusted ingress. This mode supports file transcription
+and model listing; OpenAI-compatible SSE and Realtime APIs are not implemented.
 
 This quick start is CPU-only. Default-feature Service and CLI builds select CUDA and require
 role-specific verified CTC/RNN-T assignment fingerprints. Explicit
@@ -72,29 +82,56 @@ role-specific verified CTC/RNN-T assignment fingerprints. Explicit
 it does not accept CUDA results. See [docs/OPERATIONS.md](docs/OPERATIONS.md) for the exact
 role, environment, and evidence rules.
 
-Provider selection is strict. An explicit CPU, CUDA, or TensorRT choice must be compiled
-into the executable, agree between command line and environment when both are supplied,
-and initialize successfully. CTC fp32 is the default precision; fp16io32 is an explicit
-choice and may change model output. Streaming on the CPU provider at the default 30-second
-window can be slower than real time for one stream, depending on the host and
-ASR_ORT_THREADS; measure on the target host before relying on it, and prefer a CUDA or
-TensorRT provider for streaming.
+Provider selection is strict: the provider must be compiled into the executable, agree
+between command line and environment when both are supplied, and initialize successfully.
+CUDA encoder placement follows the existing assignment policy and may include CPU graph
+nodes; RNN-T GPU heads disable CPU fallback. TensorRT uses prepared EPContext artifacts,
+not serving-time compilation of ordinary ONNX models.
+
+| Precision choice | Behavior |
+| --- | --- |
+| Default | FP32 encoder and RNN-T heads; CPU execution remains available. |
+| Service `--ctc-fp16` or CTC CLI `--fp16` | FP16Io32 encoder: FP16 model with FP32 tensor I/O. |
+| Service `--rnnt-fp16` or `asr transcribe --rnnt --fp16` | Encoder-only FP16Io32; RNN-T heads stay FP32. |
+| `--rnnt-precision fp16` or `ASR_RNNT_PRECISION=fp16` | FP16 RNN-T heads on GPU; V2 uses native FP16 encoder I/O, V1 uses the explicit FP16Io32 boundary conversion. |
+
+The all-role RNN-T choice also accepts `fp32`, requires compatible assets and conflicts
+with the legacy encoder-only flag. CLI/environment choices must agree. It applies to
+service RNN-T and offline `asr transcribe --rnnt`, not CTC-only commands. Missing FP16
+assets refuse rather than silently substituting FP32. Native-FP16 CTC artifacts are
+supported by the library but are not selectable through the current service/CLI flags.
+See [API](docs/API.md) and [operations](docs/OPERATIONS.md) for exact configuration rules.
+
+Streaming on the CPU provider at the default 30-second window can be slower than real time
+for one stream, depending on the host and `ASR_ORT_THREADS`; measure on the target host
+before relying on it, and prefer a CUDA or TensorRT provider for streaming.
 
 ## Docker images
 
 Published images are on Docker Hub at [deerayltd/asr](https://hub.docker.com/r/deerayltd/asr).
-They contain no model; mount a version-1 model package read-only at /app/model:
+They contain no model. Choose a released version and pin its provider tag or digest from
+[the release notes](https://github.com/deeray-ltd/gigaam-v3-runtime/releases/latest).
+Tags follow `deerayltd/asr:<version>-cpu`, `-cuda` and `-tensorrt`; the dynamic release link
+is for discovery, not an instruction to automatically upgrade a running service.
+Mount a compatible model package read-only at `/app/model`:
+
+Replace `<released-version>` below with the selected version (without the `v` prefix).
 
 ~~~sh
-docker pull deerayltd/asr:0.1.0-cpu
+ASR_VERSION='<released-version>'
+docker pull "deerayltd/asr:${ASR_VERSION}-cpu"
 
 docker run --rm -p 127.0.0.1:8080:8080 \
   --mount type=bind,src="$PWD/model",dst=/app/model,readonly \
-  deerayltd/asr:0.1.0-cpu
+  "deerayltd/asr:${ASR_VERSION}-cpu"
 ~~~
 
 The CUDA and TensorRT images additionally need `--gpus all`; the CUDA image also needs the
-verified placement fingerprints described in [docs/OPERATIONS.md](docs/OPERATIONS.md).
+verified encoder placement fingerprints described in [docs/OPERATIONS.md](docs/OPERATIONS.md).
+CPU/CUDA accept V1 ONNX packages and compatible V2 ONNX packages. TensorRT requires V2
+`artifact_format=trt_ep_context` with engines prepared for the selected runtime, hardware
+and shapes. Prepare the artifacts offline with `scripts/prepare_gpu_model.py`; see
+[model preparation](docs/MODELS.md#version-2-gpu-artifacts).
 
 ### Building from source
 
@@ -111,15 +148,6 @@ docker run --rm -p 127.0.0.1:8080:8080 \
   --mount type=bind,src="$PWD/model",dst=/app/model,readonly \
   gigaam-v3-runtime:cpu
 ~~~
-
-The published images on Docker Hub, built from this source and run against a real GigaAM v3
-model package (and, for CUDA and TensorRT, a real GPU) before publication:
-
-| Tag | Digest |
-| --- | --- |
-| `deerayltd/asr:0.1.0-cpu` | `sha256:ec2d258e614940ccf2b5de03b43f8212af830053173824d95c8b632f724c58ab` |
-| `deerayltd/asr:0.1.0-cuda` | `sha256:90d8b13279f587455e11095791e3363016ab6977676719eae8c00d8cc6f58263` |
-| `deerayltd/asr:0.1.0-tensorrt` | `sha256:936cd20fa9ce2b4f459987af9ea22629aceb33d20cd89e53c74fe4a471213bdc` |
 
 Building an image from source is not the same as validating it: an image built locally must
 still be run against a real model package, and a real GPU for the accelerator variants, before
@@ -144,7 +172,7 @@ particular model, native library, GPU, or deployment.
 - [docs/REQUIREMENTS.md](docs/REQUIREMENTS.md) — canonical product and engineering requirements
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — capability ownership and data flow
 - [docs/DECISIONS.md](docs/DECISIONS.md) — design choices and costs
-- [docs/MODELS.md](docs/MODELS.md) — version-1 package contract
+- [docs/MODELS.md](docs/MODELS.md) — V1/V2 package contracts and offline engine preparation
 - [docs/API.md](docs/API.md) — HTTP, WebSocket, and CLI contracts
 - [docs/OPERATIONS.md](docs/OPERATIONS.md) — configuration, telemetry, lifecycle, and images
 - [docs/ROADMAP.md](docs/ROADMAP.md) — deferred work, why it is deferred, and what unlocks it

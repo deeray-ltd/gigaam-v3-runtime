@@ -126,11 +126,13 @@ origins through the CLI evidence format before enabling segmented evidence outpu
 The package graph deliberately has one ONNX Runtime owner: Recognition. CPU and TensorRT
 either initialize as selected or refuse; TensorRT requires the CUDA feature but registers
 TensorRT rather than silently using CUDA. CUDA registers exactly CUDA as its accelerator
-provider, intentionally leaves built-in CPU placement available while ORT records graph
-assignment, and refuses any observed provider other than CPU or CUDA. It does not register
-CUDA as a TensorRT fallback.
+provider. CUDA encoders leave built-in CPU placement available while ORT records graph
+assignment, and refuse any observed provider other than CPU or CUDA. CUDA prediction and
+joint sessions disable CPU fallback and report observed assignment. TensorRT loads
+prepared engines through EPContext wrappers with CPU fallback disabled; ordinary ONNX
+packages are refused for that serving path. It does not register CUDA as a TensorRT fallback.
 
-For CUDA, Recognition derives the CTC/RNN-T role set before package or native work and parses
+For CUDA encoders, Recognition derives the CTC/RNN-T role set before package or native work and parses
 the corresponding assignment policy there. Default `verified` mode requires a distinct
 SHA-256 fingerprint for every required role; the selected role is admitted again before
 `Session::builder` for a direct native caller. After the session is created, but before it can be
