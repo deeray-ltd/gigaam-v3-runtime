@@ -60,8 +60,11 @@ and release material describe the same behavior in more detail and do not contra
 
 ### PACK-SCHEMA-001 · Explicit closed package schema
 
-- Requirement: format_version=1 is a required version discriminator. Version 1 admits exactly
-  36 required entries, including 35 typed runtime keys, and eight optional opaque retained keys.
+- Requirement: `format_version` is required and selects the supported closed V1 or V2 schema.
+  Version 1 admits exactly 36 required entries, including 35 typed runtime keys, and eight optional opaque retained keys.
+  Version 2 retains the V1 runtime keys and adds required `artifact_format=onnx|trt_ep_context`
+  plus typed `ctc.encoder_fp16` and `rnnt.encoder_fp16` paths for native FP16 I/O. Those
+  paths remain opaque optional metadata in V1; FP16Io32 retains FP32 I/O in both versions.
   Missing, malformed, duplicate, unknown, or unsupported configuration refuses before asset
   resolution or native-session construction. No unversioned legacy path exists; a new key or
   changed meaning needs an explicitly supported schema version and migration rule.
@@ -166,8 +169,9 @@ and release material describe the same behavior in more detail and do not contra
 ### REL-001 · Three truthful release artifacts
 
 - Requirement: The public release has distinct CPU, CUDA, and TensorRT artifacts with truthful
-  tags `deerayltd/asr:0.1.0-cpu`, `deerayltd/asr:0.1.0-cuda`, and
-  `deerayltd/asr:0.1.0-tensorrt`.
+  tags `deerayltd/asr:<version>-cpu`, `deerayltd/asr:<version>-cuda`, and
+  `deerayltd/asr:<version>-tensorrt` for the published workspace version declared in `Cargo.toml`. Release records
+  identify the exact image digests and validation scope.
 - Scope: Image definitions, tags, runtime contents, and publication records.
 
 ### REL-002 · Hermetic pinned provenance

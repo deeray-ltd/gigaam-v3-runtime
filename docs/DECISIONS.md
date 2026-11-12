@@ -23,9 +23,13 @@ deployed or fault-isolated. Process supervision remains the recovery boundary.
 **Context.** A permissive anonymous key/value file makes a misspelled key, changed meaning,
 or package built by a different exporter indistinguishable from a valid runtime input.
 
-**Decision.** Require format_version=1 and a closed V1 inventory: 35 typed runtime keys,
-the required discriminator, and eight opaque retained keys. Parse and compatibility-check
-the configuration before selecting assets or creating a native session.
+**Decision.** Require an explicit supported `format_version` and a closed inventory for
+that version. V1 has 35 typed runtime keys, the required discriminator, and eight opaque
+retained keys. V2 retains the runtime keys, requires `artifact_format=onnx|trt_ep_context`,
+and makes `ctc.encoder_fp16` and `rnnt.encoder_fp16` required native-FP16 artifact paths.
+Those two keys retain their opaque meaning in V1. FP16Io32 paths retain FP32 tensor I/O.
+Parse and compatibility-check configuration before selecting assets or creating a native
+session; actual tensor/engine compatibility is checked when the session loads.
 
 **Cost.** Unversioned packages refuse and a future key or changed meaning needs an explicit
 schema branch and migration. Hashes, provenance, compatibility ranges, offline verification,
