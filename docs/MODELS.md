@@ -119,7 +119,10 @@ before treating an image as a release artifact.
 Version 2 retains the version 1 keys and requires `artifact_format=onnx` or
 `artifact_format=trt_ep_context`, plus `ctc.encoder_fp16` and
 `rnnt.encoder_fp16` paths for native FP16 encoder I/O. The FP16Io32 paths retain
-their existing FP32 I/O meaning. Version 1 remains ONNX and its optional FP16
+their existing FP32 I/O meaning. Service and CTC CLI commands select these assets with
+`--ctc-precision fp32|fp16io32|fp16` or `ASR_CTC_PRECISION`; native fp16
+requires the V2 asset and does not silently substitute another precision. CPU native FP16
+execution is unverified. Version 1 remains ONNX and its optional FP16
 encoder fields remain opaque. Decoder and joint FP16 paths use the existing keys.
 The format applies to the neural model artifacts; frontend, vocabulary and VAD
 retain their existing meanings. Selected paths are checked as package assets;

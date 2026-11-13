@@ -108,21 +108,24 @@ pub(crate) struct DialogStreamFactory<'a> {
     plan: &'a ProviderPlan,
     native: &'a NativeRuntime,
     frontend: Arc<FrontendProcessor>,
+    precision: EncoderPrecision,
 }
 
 impl<'a> DialogStreamFactory<'a> {
     /// Groups package, provider, and frontend capabilities for one dialog workflow.
     pub(crate) fn new(
         package: &'a ModelPackage,
-        runtime: &'a RuntimeConfig,
+        context: (&'a RuntimeConfig, &'a NativeRuntime),
         frontend: Arc<FrontendProcessor>,
-        native: &'a NativeRuntime,
+        precision: EncoderPrecision,
     ) -> Self {
+        let (runtime, native) = context;
         Self {
             package,
             plan: runtime.plan(),
             frontend,
             native,
+            precision,
         }
     }
 }
@@ -136,9 +139,12 @@ impl StreamChannelFactory for DialogStreamFactory<'_> {
         _channel: OriginalChannel,
         config: StreamConfig,
     ) -> Result<StreamSetup<Self::Decoder, Self::Detector>, String> {
-        let decoder =
-            DirectRecognizer::ctc(self.package, self.native, self.plan, EncoderPrecision::Fp32)
-                .map_err(|error| format!("decoder: {error}"))?;
+        let decoder = DirectRecognizer::ctc(self.package, self.native, self.plan, self.precision)
+            .map_err(|error| format!("decoder: {error}"))?;
+        eprintln!(
+            "# dialog CTC encoder: {}",
+            projection::precision_label(decoder.encoder_precision())
+        );
         projection::emit_ctc_construction_notice(&decoder);
         projection::emit_unverified_cuda_assignment(
             self.plan,

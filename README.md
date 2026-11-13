@@ -91,6 +91,7 @@ not serving-time compilation of ordinary ONNX models.
 | Precision choice | Behavior |
 | --- | --- |
 | Default | FP32 encoder and RNN-T heads; CPU execution remains available. |
+| `--ctc-precision fp32\|fp16io32\|fp16` or `ASR_CTC_PRECISION` | Select the exact CTC encoder precision; `fp16` uses native FP16 tensor I/O. |
 | Service `--ctc-fp16` or CTC CLI `--fp16` | FP16Io32 encoder: FP16 model with FP32 tensor I/O. |
 | Service `--rnnt-fp16` or `asr transcribe --rnnt --fp16` | Encoder-only FP16Io32; RNN-T heads stay FP32. |
 | `--rnnt-precision fp16` or `ASR_RNNT_PRECISION=fp16` | FP16 RNN-T heads on GPU; V2 uses native FP16 encoder I/O, V1 uses the explicit FP16Io32 boundary conversion. |
@@ -98,8 +99,10 @@ not serving-time compilation of ordinary ONNX models.
 The all-role RNN-T choice also accepts `fp32`, requires compatible assets and conflicts
 with the legacy encoder-only flag. CLI/environment choices must agree. It applies to
 service RNN-T and offline `asr transcribe --rnnt`, not CTC-only commands. Missing FP16
-assets refuse rather than silently substituting FP32. Native-FP16 CTC artifacts are
-supported by the library but are not selectable through the current service/CLI flags.
+assets refuse rather than silently substituting FP32. CTC selection applies to Service and
+CLI `transcribe` (CTC), `bench`, `stream`, and `dialog`. CLI and environment selections
+must agree; either conflicts with the applicable legacy CTC flag. RNN-T transcription and
+VAD ignore the CTC environment setting. CPU native-FP16 execution remains unverified.
 See [API](docs/API.md) and [operations](docs/OPERATIONS.md) for exact configuration rules.
 
 Streaming on the CPU provider at the default 30-second window can be slower than real time

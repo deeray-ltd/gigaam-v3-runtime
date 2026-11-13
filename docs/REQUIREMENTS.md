@@ -79,7 +79,12 @@ and release material describe the same behavior in more detail and do not contra
   constructor receives it and each session retains the environment while it is live. Service
   retains the capability for lazy VAD and drains physical native work before normal process
   return, including post-initialization error paths. A service facade without that capability
-  refuses selected native VAD construction. For `asr bench`, the selected Model Package supplies the validated SampleRate
+  refuses selected native VAD construction.
+  Service and CTC CLI transcribe, bench, stream, and dialog resolve
+  `--ctc-precision` and `ASR_CTC_PRECISION` as exact fp32, fp16io32, or fp16;
+  both must agree and either conflicts with the applicable legacy CTC flag. RNN-T
+  transcribe and VAD ignore the CTC environment setting, and reject the CTC option.
+  Native fp16 selects native FP16 graph I/O without substitution. For `asr bench`, the selected Model Package supplies the validated SampleRate
   used to derive the --window and optional --alt-window plan; Audio resamples decoded WAV input
   to that rate before native runtime initialization. Audio defines frontend modes but never reads
   ASR_FRONTEND; Transcription defines the observation port but never reads ASR_TRACE or writes

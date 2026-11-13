@@ -11,8 +11,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT_TEMPORARY_ROOT: AtomicU64 = AtomicU64::new(0);
 
-const PRODUCT_ENVIRONMENT_KEYS: [&str; 14] = [
+const PRODUCT_ENVIRONMENT_KEYS: [&str; 16] = [
     "ASR_ENCODER_EP",
+    "ASR_CTC_PRECISION",
+    "ASR_RNNT_PRECISION",
     "ASR_ORT_MEMPATTERN",
     "ASR_ORT_ARENA",
     "ASR_ORT_THREADS",
@@ -583,4 +585,79 @@ fn vad_ignores_inapplicable_frontend_configuration() {
     let mut command = witness.command("vad", witness.valid_package());
     command.env("ASR_FRONTEND", "invalid");
     assert_ort_sentinel(run(command), &witness, "VAD inapplicable invalid frontend");
+}
+
+#[test]
+fn ctc_environment_is_applicable_only_to_ctc_commands() {
+    let root = CliWitnessRoot::new();
+    let mut invalid_values = vec![
+        std::ffi::OsString::from(""),
+        std::ffi::OsString::from("invalid"),
+    ];
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        invalid_values.push(std::ffi::OsString::from_vec(vec![0xff]));
+    }
+    for value in invalid_values {
+        for command_name in ["transcribe", "stream", "dialog", "bench"] {
+            let mut command = if command_name == "bench" {
+                root.benchmark_command(root.missing_model())
+            } else {
+                root.command(command_name, root.missing_model())
+            };
+            command.env("ASR_CTC_PRECISION", &value);
+            let expected = if value.to_str().is_none() {
+                "ASR_CTC_PRECISION must contain UTF-8 text"
+            } else {
+                "ASR_CTC_PRECISION must be fp32, fp16io32 or fp16"
+            };
+            assert_exact_failure(run(command), expected, command_name);
+        }
+        for command_name in ["transcribe", "vad"] {
+            let mut command = root.command(command_name, root.missing_model());
+            if command_name == "transcribe" {
+                command.arg("--rnnt");
+            }
+            command.env("ASR_CTC_PRECISION", &value);
+            assert_missing_package_refusal(run(command), &root, command_name);
+        }
+    }
+}
+
+#[test]
+fn ctc_selection_conflicts_refuse_before_package_open() {
+    let root = CliWitnessRoot::new();
+    for command_name in ["transcribe", "stream", "dialog", "bench"] {
+        let make_command = || {
+            if command_name == "bench" {
+                root.benchmark_command(root.missing_model())
+            } else {
+                root.command(command_name, root.missing_model())
+            }
+        };
+        let mut conflict = make_command();
+        conflict
+            .args(["--ctc-precision", "fp32"])
+            .env("ASR_CTC_PRECISION", "fp16");
+        assert_exact_failure(
+            run(conflict),
+            "--ctc-precision conflicts with ASR_CTC_PRECISION",
+            command_name,
+        );
+        let mut equal = make_command();
+        equal
+            .args(["--ctc-precision", "fp16"])
+            .env("ASR_CTC_PRECISION", "fp16");
+        assert_missing_package_refusal(run(equal), &root, command_name);
+        if command_name != "dialog" {
+            let mut legacy = make_command();
+            legacy.args(["--fp16", "--ctc-precision", "fp16io32"]);
+            assert_exact_failure(
+                run(legacy),
+                "--fp16 conflicts with --ctc-precision and ASR_CTC_PRECISION",
+                command_name,
+            );
+        }
+    }
 }

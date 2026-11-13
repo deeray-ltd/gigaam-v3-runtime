@@ -320,17 +320,17 @@ help or version command grammar.
 
 ~~~text
 asr transcribe FILE [--model DIR] [--ep cpu|cuda|tensorrt] [--ort-dylib PATH]
-                    [--fp16] [--rnnt] [--rnnt-precision fp32|fp16] [--window S] [--overlap S] [--pad]
+                    [--fp16] [--ctc-precision fp32|fp16io32|fp16] [--rnnt] [--rnnt-precision fp32|fp16] [--window S] [--overlap S] [--pad]
                     [--words] [--split-channels] [--turns] [--turn-gap S]
                     [--evidence PATH] [--evidence-version 1|2]
                     [--vad] [--vad-threshold F] [--vad-neg-threshold F]
                     [--vad-min-speech-ms N] [--vad-min-silence-ms N] [--vad-speech-pad-ms N]
 
 asr bench [--audio FILE] [--model DIR] [--ep cpu|cuda|tensorrt] [--ort-dylib PATH]
-          [--fp16] [--window S] [--iters N] [--gap-ms N] [--alt-window S]
+          [--fp16] [--ctc-precision fp32|fp16io32|fp16] [--window S] [--iters N] [--gap-ms N] [--alt-window S]
 
 asr stream FILE [--model DIR] [--ep cpu|cuda|tensorrt] [--ort-dylib PATH]
-              [--fp16] [--chunk-ms N] [--step-ms N] [--horizon S]
+              [--fp16] [--ctc-precision fp32|fp16io32|fp16] [--chunk-ms N] [--step-ms N] [--horizon S]
               [--window S] [--overlap S] [--endpoint blank|vad] [--silence-ms N]
               [--no-speech-ms N] [--vad-threshold F] [--seam-after S] [--keep-silence S]
               [--ref FILE] [--lock] [--events] [--applied-config]
@@ -339,6 +339,7 @@ asr vad FILE [--model DIR] [--ort-dylib PATH] [--threshold F] [--neg-threshold F
            [--min-speech-ms N] [--min-silence-ms N] [--speech-pad-ms N] [--channels all|0,2]
 
 asr dialog FILE [--model DIR] [--ep cpu|cuda|tensorrt] [--ort-dylib PATH]
+              [--ctc-precision fp32|fp16io32|fp16]
               [--turn-gap S] [--endpoint blank|vad] [--no-dedup]
               [--backchannel-max-ms N] [--window S] [--overlap S] [--step-ms N]
               [--horizon S] [--silence-ms N] [--no-speech-ms N] [--vad-threshold F]
@@ -513,6 +514,12 @@ human-oriented projections are:
 | stream | The final client transcript as one joined text line. | Stream statistics; --ref FILE adds a reference-comparison row with batch and stream WER, which is absent without --ref; --events prints each applied stream event; ASR_TRACE adds per-window timing rows. |
 | vad | One start/end/duration row for each detected speech segment. | Aggregate speech, VAD timing, and RTF summary. |
 | dialog | One [channel N start-end] row per reconstructed turn, with [bc] on marked backchannels. | Channel, active-channel, and turn-count summary. |
+
+For CTC transcribe, bench, stream, and dialog, `--ctc-precision` or
+`ASR_CTC_PRECISION` selects `fp32`, `fp16io32`, or native-I/O `fp16`. Equal
+CLI and environment choices are accepted; different choices or either choice combined
+with the applicable legacy `--fp16` flag refuse. Dialog does not accept `--fp16`.
+RNN-T transcription and VAD ignore the CTC environment setting and reject the CTC option.
 
 For offline RNN-T transcription, `--rnnt-precision fp32|fp16` or
 `ASR_RNNT_PRECISION=fp32|fp16` selects all RNN-T roles. Both may be supplied

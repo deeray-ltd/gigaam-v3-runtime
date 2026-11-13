@@ -28,6 +28,13 @@ use std::time::Instant;
 
 /// Executes a complete direct batch transcription without a service scheduler.
 pub(crate) fn run(invocation: TranscribeInvocation) -> Result<(), String> {
+    let ctc_precision = match invocation.decoder {
+        DecoderChoice::Ctc => Some(configuration::ctc_precision(
+            invocation.ctc_precision,
+            invocation.precision == gigaam_model_package::EncoderPrecision::Fp16Io32,
+        )?),
+        DecoderChoice::Rnnt => None,
+    };
     let required_roles = match invocation.decoder {
         DecoderChoice::Ctc => RequiredEncoderRoles::ctc(),
         DecoderChoice::Rnnt => RequiredEncoderRoles::rnnt(),
@@ -87,9 +94,13 @@ pub(crate) fn run(invocation: TranscribeInvocation) -> Result<(), String> {
         .map_err(|error| format!("frontend: {error}"))?;
     let decoder = match invocation.decoder {
         DecoderChoice::Ctc => {
-            let decoder =
-                composition::ctc_recognizer(&package, &runtime, &native, invocation.precision)
-                    .map_err(|error| format!("decoder: {error}"))?;
+            let decoder = composition::ctc_recognizer(
+                &package,
+                &runtime,
+                &native,
+                ctc_precision.expect("CTC branch resolves CTC precision"),
+            )
+            .map_err(|error| format!("decoder: {error}"))?;
             projection::emit_ctc_construction_notice(&decoder);
             projection::emit_unverified_cuda_assignment(
                 runtime.plan(),

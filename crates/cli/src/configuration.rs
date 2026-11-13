@@ -114,6 +114,41 @@ fn resolve_rnnt_precision(
     }
 }
 
+pub(crate) fn ctc_precision(
+    cli: Option<gigaam_model_package::EncoderPrecision>,
+    legacy_fp16: bool,
+) -> Result<gigaam_model_package::EncoderPrecision, String> {
+    let value = process_env("ASR_CTC_PRECISION")?;
+    resolve_ctc_precision(cli, legacy_fp16, value.as_deref())
+}
+
+fn resolve_ctc_precision(
+    cli: Option<gigaam_model_package::EncoderPrecision>,
+    legacy_fp16: bool,
+    environment: Option<&str>,
+) -> Result<gigaam_model_package::EncoderPrecision, String> {
+    use gigaam_model_package::EncoderPrecision;
+    let environment = environment
+        .map(|value| match value {
+            "fp32" => Ok(EncoderPrecision::Fp32),
+            "fp16io32" => Ok(EncoderPrecision::Fp16Io32),
+            "fp16" => Ok(EncoderPrecision::Fp16),
+            _ => Err("ASR_CTC_PRECISION must be fp32, fp16io32 or fp16".to_owned()),
+        })
+        .transpose()?;
+    if legacy_fp16 && (cli.is_some() || environment.is_some()) {
+        return Err("--fp16 conflicts with --ctc-precision and ASR_CTC_PRECISION".into());
+    }
+    match (cli, environment) {
+        (Some(a), Some(b)) if a != b => {
+            Err("--ctc-precision conflicts with ASR_CTC_PRECISION".into())
+        }
+        (Some(value), _) | (_, Some(value)) => Ok(value),
+        (None, None) if legacy_fp16 => Ok(EncoderPrecision::Fp16Io32),
+        (None, None) => Ok(EncoderPrecision::Fp32),
+    }
+}
+
 /// Parses the applicable frontend process setting exactly once before package/native work.
 pub(crate) fn frontend_mode() -> Result<FrontendMode, String> {
     let value = process_env("ASR_FRONTEND")?;
@@ -209,6 +244,51 @@ mod tests {
     use super::{TraceMode, evidence_path, frontend_mode_from, trace_mode_from};
     use gigaam_audio::FrontendMode;
     use std::path::PathBuf;
+
+    #[test]
+    fn ctc_precision_resolves_all_choices_and_conflicts() {
+        use gigaam_model_package::EncoderPrecision;
+        let choices = [
+            ("fp32", EncoderPrecision::Fp32),
+            ("fp16io32", EncoderPrecision::Fp16Io32),
+            ("fp16", EncoderPrecision::Fp16),
+        ];
+        assert_eq!(
+            super::resolve_ctc_precision(None, false, None),
+            Ok(EncoderPrecision::Fp32)
+        );
+        assert_eq!(
+            super::resolve_ctc_precision(None, true, None),
+            Ok(EncoderPrecision::Fp16Io32)
+        );
+        for (text, choice) in choices {
+            assert_eq!(
+                super::resolve_ctc_precision(Some(choice), false, None),
+                Ok(choice)
+            );
+            assert_eq!(
+                super::resolve_ctc_precision(None, false, Some(text)),
+                Ok(choice)
+            );
+            assert_eq!(
+                super::resolve_ctc_precision(Some(choice), false, Some(text)),
+                Ok(choice)
+            );
+            assert!(super::resolve_ctc_precision(Some(choice), true, None).is_err());
+            assert!(super::resolve_ctc_precision(None, true, Some(text)).is_err());
+            for (other_text, other_choice) in choices {
+                if choice != other_choice {
+                    assert!(
+                        super::resolve_ctc_precision(Some(choice), false, Some(other_text))
+                            .is_err()
+                    );
+                }
+            }
+        }
+        for invalid in ["", "FP16", " fp16", "fp16 ", "other"] {
+            assert!(super::resolve_ctc_precision(None, false, Some(invalid)).is_err());
+        }
+    }
 
     #[test]
     fn rnnt_precision_resolves_equal_values_and_rejects_conflicts() {

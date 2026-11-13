@@ -20,6 +20,10 @@ use std::time::Instant;
 
 /// Executes the direct stream simulator and preserves incremental client projection.
 pub(crate) fn run(invocation: StreamInvocation) -> Result<(), String> {
+    let precision = configuration::ctc_precision(
+        invocation.ctc_precision,
+        invocation.precision == gigaam_model_package::EncoderPrecision::Fp16Io32,
+    )?;
     let runtime = configuration::runtime(&invocation.runtime, RequiredEncoderRoles::ctc())
         .map_err(|error| format!("runtime configuration: {error}"))?;
     let reference = match &invocation.reference {
@@ -51,8 +55,9 @@ pub(crate) fn run(invocation: StreamInvocation) -> Result<(), String> {
     let native = composition::initialize_runtime(&runtime)?;
     let frontend = composition::frontend_for_package(&package, frontend_mode)
         .map_err(|error| format!("frontend: {error}"))?;
-    let recognizer = composition::ctc_recognizer(&package, &runtime, &native, invocation.precision)
+    let recognizer = composition::ctc_recognizer(&package, &runtime, &native, precision)
         .map_err(|error| format!("decoder: {error}"))?;
+    let effective_precision = recognizer.encoder_precision();
     projection::emit_ctc_construction_notice(&recognizer);
     projection::emit_unverified_cuda_assignment(
         runtime.plan(),
@@ -136,7 +141,7 @@ pub(crate) fn run(invocation: StreamInvocation) -> Result<(), String> {
         batch_text: batch.text(),
         config: &config,
         chunk_milliseconds: invocation.chunk_milliseconds,
-        precision: invocation.precision,
+        precision: effective_precision,
         decoder_seconds: session.decoder_seconds(),
         encoder_seconds: session.encoder_seconds(),
         decodes: session.decodes(),

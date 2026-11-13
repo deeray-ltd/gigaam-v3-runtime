@@ -176,6 +176,13 @@ optimizations; preserve recognition quality, timestamps, cancellation, bounded a
 and provider behavior. Review window reuse, avoidable copying and allocation, threading,
 queue fairness and optional silence skipping against their quality and resource tradeoffs.
 
+### CTC precision selection
+
+Service and CTC CLI commands select the existing FP32, FP16Io32, or native FP16
+asset through typed process configuration. Native CUDA and prepared TensorRT execution
+requires validation with compatible artifacts and a known speech fixture; CPU native FP16
+execution remains unverified. No performance claim follows from selection alone.
+
 ### Model variants and decoding
 
 Bind advertised model variants to their actual package assets, tokenizer, frontend,

@@ -359,10 +359,10 @@ fn transcribe_precision_label(
     }
 }
 
-pub(super) fn precision_label(precision: EncoderPrecision) -> &'static str {
+pub(crate) fn precision_label(precision: EncoderPrecision) -> &'static str {
     match precision {
         EncoderPrecision::Fp32 => "fp32",
-        EncoderPrecision::Fp16Io32 => "fp16",
+        EncoderPrecision::Fp16Io32 => "fp16io32",
         EncoderPrecision::Fp16 => "fp16-native",
     }
 }
@@ -411,7 +411,7 @@ mod tests {
     #[test]
     fn precision_labels_preserve_each_supported_encoder_choice() {
         assert_eq!(precision_label(EncoderPrecision::Fp32), "fp32");
-        assert_eq!(precision_label(EncoderPrecision::Fp16Io32), "fp16");
+        assert_eq!(precision_label(EncoderPrecision::Fp16Io32), "fp16io32");
     }
 
     #[test]

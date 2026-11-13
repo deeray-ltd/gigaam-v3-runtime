@@ -239,13 +239,9 @@ fn run_scoped(
                 .map_err(|error| format!("frontend: {error}"))?,
         );
 
-        let ctc_decoder = DirectRecognizer::ctc(
-            &pack,
-            native,
-            &startup.plan,
-            encoder_precision(startup.ctc_fp16),
-        )
-        .map_err(|error| format!("CTC decoder: {error}"))?;
+        let ctc_decoder =
+            DirectRecognizer::ctc(&pack, native, &startup.plan, startup.ctc_precision)
+                .map_err(|error| format!("CTC decoder: {error}"))?;
         let ctc_precision = precision_name(ctc_decoder.encoder_precision());
         emit_ctc_construction_notice(&ctc_decoder);
         emit_unverified_cuda_assignment(

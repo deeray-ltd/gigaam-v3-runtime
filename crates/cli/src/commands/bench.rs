@@ -16,6 +16,10 @@ use std::time::Instant;
 
 /// Benchmarks one warmed direct CTC encoder shape and an optional alternate shape.
 pub(crate) fn run(invocation: BenchInvocation) -> Result<(), String> {
+    let precision = configuration::ctc_precision(
+        invocation.ctc_precision,
+        invocation.precision == gigaam_model_package::EncoderPrecision::Fp16Io32,
+    )?;
     let runtime = configuration::runtime(&invocation.runtime, RequiredEncoderRoles::ctc())
         .map_err(|error| format!("runtime configuration: {error}"))?;
     let frontend_mode =
@@ -33,8 +37,9 @@ pub(crate) fn run(invocation: BenchInvocation) -> Result<(), String> {
     let frontend = composition::frontend_for_package(&package, frontend_mode)
         .map_err(|error| format!("frontend: {error}"))?;
     let native = composition::initialize_runtime(&runtime)?;
-    let mut encoder = composition::ctc_encoder(&package, &runtime, &native, invocation.precision)
+    let mut encoder = composition::ctc_encoder(&package, &runtime, &native, precision)
         .map_err(|error| format!("encoder: {error}"))?;
+    let effective_precision = encoder.precision();
     projection::emit_unverified_cuda_assignment(
         runtime.plan(),
         gigaam_recognition::EncoderRole::Ctc,
@@ -103,7 +108,7 @@ pub(crate) fn run(invocation: BenchInvocation) -> Result<(), String> {
     projection::benchmark(BenchmarkSummary {
         window_seconds: invocation.window_seconds,
         alternate_window_seconds: invocation.alternate_window_seconds,
-        precision: invocation.precision,
+        precision: effective_precision,
         device: runtime.plan().device(),
         gap_milliseconds: invocation.gap_milliseconds,
         frontend_median_milliseconds: frontend_median,
