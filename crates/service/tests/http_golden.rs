@@ -14,7 +14,8 @@ mod external_artifacts;
 use gigaam_audio::{FrontendMode, FrontendProcessor, SampleRate};
 use gigaam_model_package::{EncoderPrecision, ModelPackage};
 use gigaam_recognition::{
-    Device, DirectRecognizer, ExecutionScheduler, OrtConfig, ProviderPlan, init_runtime,
+    Device, DirectRecognizer, ExecutionScheduler, OrtConfig, OrtEnvironment, ProviderPlan,
+    init_runtime,
 };
 use gigaam_service::{
     RequestBodyLimit, ServiceAdmission, ServiceApplication, ServiceApplicationParameters,
@@ -58,7 +59,7 @@ fn application(root: &Path) -> ServiceApplication {
         backchannel_max_seconds: 0.0,
     })
     .expect("the golden service policy must be valid");
-    init_runtime(&dylib).expect("the explicit ORT library must initialize");
+    let native = init_runtime(&dylib).expect("the explicit ORT library must initialize");
     let frontend = Arc::new(
         FrontendProcessor::new(
             pack.frontend(),
@@ -68,19 +69,26 @@ fn application(root: &Path) -> ServiceApplication {
         )
         .expect("the test model pack frontend must be supported"),
     );
-    let plan = ProviderPlan::new(Device::Cpu, OrtConfig::default())
-        .expect("the CPU provider plan must be valid");
+    let ort_config = OrtConfig::from_environment(OrtEnvironment {
+        intra_threads: Some("2"),
+        ..OrtEnvironment::default()
+    })
+    .expect("the golden suite thread count must be valid");
+    let plan =
+        ProviderPlan::new(Device::Cpu, ort_config).expect("the CPU provider plan must be valid");
+    let intra_threads = plan.intra_threads();
     let ctc = Arc::new(ExecutionScheduler::spawn(
-        DirectRecognizer::ctc(&pack, &plan, EncoderPrecision::Fp32)
+        DirectRecognizer::ctc(&pack, &native, &plan, EncoderPrecision::Fp32)
             .expect("the CTC decoder must match the test pack"),
     ));
     let capabilities = ServiceCapabilities::new(ServiceCapabilitiesParameters {
+        native_runtime: Some(native),
         pack,
         frontend,
         ctc,
         rnnt: None,
         provider: Device::Cpu,
-        intra_threads: None,
+        intra_threads,
     })
     .expect("the golden capabilities must share one model sample rate");
     let admission = ServiceAdmission::new(1, 1, Duration::from_secs(120))
@@ -161,6 +169,48 @@ async fn http_short_clip_ctc_text_matches_the_unpadded_golden() {
         .read_to_end(&mut response)
         .await
         .expect("the valid HTTP response must read");
+    let mut vad_stream = TcpStream::connect(address)
+        .await
+        .expect("the VAD test client must connect to the loopback listener");
+    let vad_request = format!(
+        "POST /v1/transcribe?model=ctc&response_version=2&vad=true HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\nContent-Length: {}\r\n\r\n",
+        audio.len()
+    );
+    vad_stream
+        .write_all(vad_request.as_bytes())
+        .await
+        .expect("the VAD request headers must write");
+    vad_stream
+        .write_all(&audio)
+        .await
+        .expect("the VAD request body must write");
+    let mut vad_response = Vec::new();
+    vad_stream
+        .read_to_end(&mut vad_response)
+        .await
+        .expect("the VAD response must read");
+    let vad_response = String::from_utf8(vad_response).expect("the VAD response must be UTF-8");
+    let (vad_headers, vad_body) = vad_response
+        .split_once("\r\n\r\n")
+        .expect("the VAD HTTP response must include headers and body");
+    assert!(
+        vad_headers.starts_with("HTTP/1.1 200"),
+        "unexpected VAD response: {vad_response}"
+    );
+    assert!(
+        vad_body.contains("\"applied\":{\"vad\":{\"enabled\":true"),
+        "the response must report the applied VAD policy: {vad_body}"
+    );
+    let vad_text = vad_body
+        .split_once("\"text\":\"")
+        .and_then(|(_, tail)| tail.split_once('"'))
+        .map(|(text, _)| text)
+        .expect("the VAD response must contain text");
+    assert!(
+        !vad_text.is_empty(),
+        "the real VAD request must return speech text: {vad_body}"
+    );
+
     let shutdown_result = shutdown_tx.send(());
     let server_result = server.await.expect("HTTP server task panicked");
     server_result.expect("HTTP server failed");

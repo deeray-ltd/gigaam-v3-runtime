@@ -20,10 +20,11 @@ use gigaam_transcription::{
 
 fn batch(
     pack: &ModelPackage,
+    native: &gigaam_recognition::NativeRuntime,
     precision: EncoderPrecision,
     config: BatchConfig,
 ) -> BatchTranscriber<DirectRecognizer> {
-    let decoder = DirectRecognizer::ctc(pack, &common::cpu_plan(), precision)
+    let decoder = DirectRecognizer::ctc(pack, native, &common::cpu_plan(), precision)
         .expect("the CTC decoder must match the test pack");
     BatchTranscriber::new(BatchSetup {
         frontend: common::frontend(pack),
@@ -35,10 +36,15 @@ fn batch(
     .expect("the documented batch setup must be valid")
 }
 
-fn golden(pack: &ModelPackage, precision: EncoderPrecision, config: BatchConfig) -> String {
+fn golden(
+    pack: &ModelPackage,
+    native: &gigaam_recognition::NativeRuntime,
+    precision: EncoderPrecision,
+    config: BatchConfig,
+) -> String {
     let root = common::root();
     let audio = read_wav(&root.join("fixtures/example.wav")).expect("the test WAV must decode");
-    batch(pack, precision, config)
+    batch(pack, native, precision, config)
         .transcribe_channel(&audio.channels()[0])
         .expect("the test WAV must transcribe")
         .text()
@@ -50,13 +56,12 @@ fn model_rate(pack: &ModelPackage) -> SampleRate {
         .expect("test model package rate is representable")
 }
 
-#[test]
-fn cpu_end_to_end_matches_golden_text() {
-    common::init_ort();
+fn cpu_end_to_end_matches_golden_text(native: &gigaam_recognition::NativeRuntime) {
     let root = common::root();
     let pack = ModelPackage::open(&root.join("model")).expect("the test model pack must open");
     let text = golden(
         &pack,
+        native,
         EncoderPrecision::Fp32,
         BatchConfig::new(model_rate(&pack), 100.0, 6.0, PadPolicy::Exact)
             .expect("the documented batch window must be valid"),
@@ -66,13 +71,12 @@ fn cpu_end_to_end_matches_golden_text() {
     assert_eq!(text, expected);
 }
 
-#[test]
-fn cpu_fp16_graph_with_fp32_io_matches_golden_text() {
-    common::init_ort();
+fn cpu_fp16_graph_with_fp32_io_matches_golden_text(native: &gigaam_recognition::NativeRuntime) {
     let root = common::root();
     let pack = ModelPackage::open(&root.join("model")).expect("the test model pack must open");
     let text = golden(
         &pack,
+        native,
         EncoderPrecision::Fp16Io32,
         BatchConfig::new(model_rate(&pack), 100.0, 6.0, PadPolicy::Exact)
             .expect("the documented batch window must be valid"),
@@ -82,13 +86,12 @@ fn cpu_fp16_graph_with_fp32_io_matches_golden_text() {
     assert_eq!(text, expected);
 }
 
-#[test]
-fn pad_to_window_keeps_words_and_trailing_punctuation() {
-    common::init_ort();
+fn pad_to_window_keeps_words_and_trailing_punctuation(native: &gigaam_recognition::NativeRuntime) {
     let root = common::root();
     let pack = ModelPackage::open(&root.join("model")).expect("the test model pack must open");
     let text = golden(
         &pack,
+        native,
         EncoderPrecision::Fp32,
         BatchConfig::new(model_rate(&pack), 30.0, 6.0, PadPolicy::PadToWindow)
             .expect("the stream window must be valid"),
@@ -105,4 +108,12 @@ fn pad_to_window_keeps_words_and_trailing_punctuation() {
         text.trim_end().ends_with('.'),
         "trailing punctuation must be preserved: {text}"
     );
+}
+
+#[test]
+fn native_golden_suite() {
+    let native = common::init_ort();
+    cpu_end_to_end_matches_golden_text(&native);
+    cpu_fp16_graph_with_fp32_io_matches_golden_text(&native);
+    pad_to_window_keeps_words_and_trailing_punctuation(&native);
 }

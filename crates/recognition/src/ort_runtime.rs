@@ -11,9 +11,19 @@
 
 use std::path::Path;
 
+/// Owned native runtime shared by every session constructed in this process.
+#[derive(Clone, Debug)]
+pub struct NativeRuntime(ort::environment::Environment);
+
+impl NativeRuntime {
+    pub(crate) fn environment(&self) -> &ort::environment::Environment {
+        &self.0
+    }
+}
+
 /// Initializes ONNX Runtime from one explicit regular dynamic-library file before any session is
 /// created.
-pub fn init_runtime(dylib: &Path) -> Result<(), String> {
+pub fn init_runtime(dylib: &Path) -> Result<NativeRuntime, String> {
     let metadata = std::fs::metadata(dylib)
         .map_err(|error| format!("ORT dylib {}: {error}", dylib.display()))?;
     if !metadata.is_file() {
@@ -24,13 +34,11 @@ pub fn init_runtime(dylib: &Path) -> Result<(), String> {
     }
     let builder =
         ort::init_from(dylib).map_err(|error| format!("ORT dylib {}: {error}", dylib.display()))?;
-    if !builder.with_name("asr").commit() {
-        return Err(
-            "ORT runtime is already initialized; startup must initialize it before creating sessions"
-                .into(),
-        );
-    }
-    Ok(())
+    builder
+        .with_name("asr")
+        .build()
+        .map(NativeRuntime)
+        .map_err(|error| format!("ORT environment: {error}"))
 }
 
 #[cfg(test)]

@@ -150,7 +150,12 @@ through a changed observed assignment; it does not independently hash model or r
 Service and CLI parse their applicable command-line and environment values before package,
 frontend, scheduler, or native-runtime construction. The model rate is then bound to
 time-based transcription configuration, preventing adapters from maintaining a parallel
-unvalidated sample-rate value.
+unvalidated sample-rate value. Recognition returns an owned `NativeRuntime` from explicit
+initialization; native constructors receive that capability and their sessions retain the
+underlying environment. CLI retains it through command completion. Service shares it with
+lazy VAD construction and returns from post-initialization errors only after owned resources
+unwind; scheduler workers join after physically executing work finishes. Synthetic Service
+facades may omit the runtime, but a request selecting native VAD then refuses.
 
 HTTP batch work receives a shared execution control. When its deadline publishes a 504,
 queued or successor windows cannot start after cancellation is observed; the admission

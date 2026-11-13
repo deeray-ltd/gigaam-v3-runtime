@@ -75,7 +75,11 @@ and release material describe the same behavior in more detail and do not contra
 
 - Requirement: Service and CLI read applicable command-line and process-environment values once,
   validate them before runtime/model construction, and pass typed choices to capability
-  constructors. For `asr bench`, the selected Model Package supplies the validated SampleRate
+  constructors. Recognition exposes one explicitly owned native runtime capability; each native
+  constructor receives it and each session retains the environment while it is live. Service
+  retains the capability for lazy VAD and drains physical native work before normal process
+  return, including post-initialization error paths. A service facade without that capability
+  refuses selected native VAD construction. For `asr bench`, the selected Model Package supplies the validated SampleRate
   used to derive the --window and optional --alt-window plan; Audio resamples decoded WAV input
   to that rate before native runtime initialization. Audio defines frontend modes but never reads
   ASR_FRONTEND; Transcription defines the observation port but never reads ASR_TRACE or writes

@@ -9,6 +9,7 @@
 
 //! Direct assembly of the current CTC and RNN-T recognizer implementations.
 
+use crate::NativeRuntime;
 use crate::contracts::{Decoded, FrameRate, WindowDecoder};
 use crate::ctc::{CtcConstructionNotice, CtcDecoder};
 use crate::ort_assignment::CudaAssignmentEvidence;
@@ -41,10 +42,11 @@ enum Implementation {
 impl DirectRecognizer {
     pub fn ctc(
         pack: &ModelPackage,
+        runtime: &NativeRuntime,
         plan: &ProviderPlan,
         precision: EncoderPrecision,
     ) -> Result<Self, String> {
-        let encoder = OrtEncoder::ctc(pack, plan, precision)?;
+        let encoder = OrtEncoder::ctc(pack, runtime, plan, precision)?;
         let assignment_evidence = encoder.assignment_evidence().cloned();
         Ok(Self(Implementation::Ctc {
             decoder: Box::new(CtcDecoder::from_pack(pack, encoder)?),
@@ -55,22 +57,24 @@ impl DirectRecognizer {
 
     pub fn rnnt(
         pack: &ModelPackage,
+        runtime: &NativeRuntime,
         plan: &ProviderPlan,
         precision: EncoderPrecision,
     ) -> Result<Self, String> {
         Ok(Self(Implementation::Rnnt(Box::new(
-            RnntDecoder::from_pack(pack, plan, precision, false)?,
+            RnntDecoder::from_pack(pack, (runtime, plan), precision, false)?,
         ))))
     }
 
     /// Opens a recognizer with the selected precision for all RNN-T neural roles.
     pub fn rnnt_with_precision(
         pack: &ModelPackage,
+        runtime: &NativeRuntime,
         plan: &ProviderPlan,
         selection: RnntPrecisionSelection,
     ) -> Result<Self, String> {
         match selection {
-            RnntPrecisionSelection::Fp32 => Self::rnnt(pack, plan, EncoderPrecision::Fp32),
+            RnntPrecisionSelection::Fp32 => Self::rnnt(pack, runtime, plan, EncoderPrecision::Fp32),
             RnntPrecisionSelection::Fp16 => {
                 let precision = if pack.schema_version().value() == 1 {
                     EncoderPrecision::Fp16Io32
@@ -78,7 +82,7 @@ impl DirectRecognizer {
                     EncoderPrecision::Fp16
                 };
                 Ok(Self(Implementation::Rnnt(Box::new(
-                    RnntDecoder::from_pack(pack, plan, precision, true)?,
+                    RnntDecoder::from_pack(pack, (runtime, plan), precision, true)?,
                 ))))
             }
         }

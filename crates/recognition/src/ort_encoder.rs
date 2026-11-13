@@ -9,6 +9,7 @@
 
 //! ONNX Runtime encoder sessions for the one resolved execution-provider plan.
 
+use crate::NativeRuntime;
 use crate::contracts::Encoder;
 use crate::native_output::{
     ExpectedCardinality, NativeOutputRole, validate_f16_output, validate_f32_output,
@@ -42,6 +43,7 @@ impl OrtEncoder {
     /// Opens the selected CTC encoder artifact for one resolved provider plan.
     pub fn ctc(
         pack: &ModelPackage,
+        runtime: &NativeRuntime,
         plan: &ProviderPlan,
         precision: EncoderPrecision,
     ) -> Result<Self, String> {
@@ -49,12 +51,13 @@ impl OrtEncoder {
         let artifact = pack
             .ctc_encoder(precision)
             .map_err(|error| error.to_string())?;
-        Self::open(artifact, plan, EncoderRole::Ctc)
+        Self::open(artifact, runtime, plan, EncoderRole::Ctc)
     }
 
     /// Opens the selected RNN-T encoder artifact for one resolved provider plan.
     pub fn rnnt(
         pack: &ModelPackage,
+        runtime: &NativeRuntime,
         plan: &ProviderPlan,
         precision: EncoderPrecision,
     ) -> Result<Self, String> {
@@ -62,12 +65,13 @@ impl OrtEncoder {
         let artifact = pack
             .rnnt_encoder(precision)
             .map_err(|error| error.to_string())?;
-        Self::open(artifact, plan, EncoderRole::Rnnt)
+        Self::open(artifact, runtime, plan, EncoderRole::Rnnt)
     }
 
     /// Opens one typed encoder artifact only through its declared process role.
     fn open(
         artifact: EncoderArtifact,
+        runtime: &NativeRuntime,
         plan: &ProviderPlan,
         role: EncoderRole,
     ) -> Result<Self, String> {
@@ -82,7 +86,8 @@ impl OrtEncoder {
         if plan.device() == Device::Cuda {
             plan.preflight_cuda_role(role)?;
         }
-        let mut builder = Session::builder().map_err(|error| error.to_string())?;
+        let mut builder =
+            Session::builder(runtime.environment()).map_err(|error| error.to_string())?;
         if plan.config.memory_pattern == crate::provider::MemoryPattern::Disabled {
             builder = builder
                 .with_memory_pattern(false)

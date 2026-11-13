@@ -29,11 +29,12 @@ fn resampler(input: u32, output: u32) -> Resampler {
 
 #[test]
 fn telephony_roundtrip_keeps_text() {
-    common::init_ort();
+    let native = common::init_ort();
     let root = common::root();
     let pack = ModelPackage::open(&root.join("model")).expect("the test model pack must open");
-    let decoder = DirectRecognizer::ctc(&pack, &common::cpu_plan(), EncoderPrecision::Fp32)
-        .expect("the CPU CTC test session must open");
+    let decoder =
+        DirectRecognizer::ctc(&pack, &native, &common::cpu_plan(), EncoderPrecision::Fp32)
+            .expect("the CPU CTC test session must open");
     let frontend = common::frontend(&pack);
     let sample_rate = frontend.sample_rate();
     let mut batch = BatchTranscriber::new(BatchSetup {

@@ -15,8 +15,8 @@ locked Cargo metadata and checksum-verified local registry crate archives.
   is a procedural macro are excluded because their code is executed during compilation,
   not statically linked into `asr-serve`.
 - Registry packages: 109; the three selected closures are identical.
-- Cargo.lock SHA-256: `d1a17d080399817ea0d66a48e1b4563316f6c6c35983d7b9abede9a8a89f8c2a`.
-- Closure SHA-256: `ee6c3301de018cafe1dc46c9ec65fedc18efacb2567a85fe0344814e6e8721fc`.
+- Cargo.lock SHA-256: `fccae6e98a652d96aac39906393ddd821dfbf7f06bbf2890a4a13b6eb05317e9`.
+- Closure SHA-256: `71798a6de7726ec9ed0f37e9b116e46bef0b61e4d715d26d137ca127998f02af`.
 - Project workspace code is covered by the parent `COPYING` and `COPYING.LESSER` files.
 
 ## Package records
@@ -603,20 +603,20 @@ locked Cargo metadata and checksum-verified local registry crate archives.
 - Repository declared by package metadata: `https://github.com/TadeuszWolfGang/Rusopus`.
 - The locked crate archive contains no standalone license or notice file; its metadata and source archive above are retained without inventing text.
 
-### `ort` 2.0.0-rc.13
+### `ort` 2.0.0-rc.15
 - License expression: `MIT OR Apache-2.0`.
-- Locked crate archive SHA-256: `4336a1e2b38848325241c72889086886004e589b7c74f335e60a8e8db5138a0b`.
-- Source archive: `https://static.crates.io/crates/ort/ort-2.0.0-rc.13.crate`.
+- Locked crate archive SHA-256: `37c87aa7a90b7ff3e0fe36cccd475df8d67f15f07f4d6c370c4b38464232813c`.
+- Source archive: `https://static.crates.io/crates/ort/ort-2.0.0-rc.15.crate`.
 - Repository declared by package metadata: `https://github.com/pykeio/ort`.
 - Authors declared by package metadata: `pyke.io <contact@pyke.io>`; `Nicolas Bigaouette <nbigaouette@gmail.com>`.
 - Packaged license, permission, and copyright notices:
   - `LICENSE-APACHE`: `texts/cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30.txt` (SHA-256 `cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30`).
   - `LICENSE-MIT`: `texts/6bba08de46289c40986a2e6b310e2da61fcea33b3c112c8320f6093f8f9cb71b.txt` (SHA-256 `6bba08de46289c40986a2e6b310e2da61fcea33b3c112c8320f6093f8f9cb71b`).
 
-### `ort-sys` 2.0.0-rc.13
+### `ort-sys` 2.0.0-rc.15
 - License expression: `MIT OR Apache-2.0`.
-- Locked crate archive SHA-256: `cf211e3776eea6aec988552fa118dd746d70e1b1e5e244058d1c98015f3e5872`.
-- Source archive: `https://static.crates.io/crates/ort-sys/ort-sys-2.0.0-rc.13.crate`.
+- Locked crate archive SHA-256: `8d22b0417f1838db5a3ac0b3f98dfe39f6fb73624aa0a27c6bbb5040b9c7db2b`.
+- Source archive: `https://static.crates.io/crates/ort-sys/ort-sys-2.0.0-rc.15.crate`.
 - Repository declared by package metadata: `https://github.com/pykeio/ort`.
 - Authors declared by package metadata: `pyke.io <contact@pyke.io>`.
 - Packaged license, permission, and copyright notices:

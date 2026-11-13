@@ -75,10 +75,10 @@ pub(crate) fn run(invocation: TranscribeInvocation) -> Result<(), String> {
         invocation.overlap_seconds,
         invocation.padding,
     )?;
-    composition::initialize_runtime(&runtime)?;
+    let native = composition::initialize_runtime(&runtime)?;
     let mut vad = vad_policy
         .map(|policy| {
-            composition::vad(&package, runtime.plan().intra_threads())
+            composition::vad(&package, &native, runtime.plan().intra_threads())
                 .map(|detector| (detector, policy))
                 .map_err(|error| format!("vad: {error}"))
         })
@@ -87,8 +87,9 @@ pub(crate) fn run(invocation: TranscribeInvocation) -> Result<(), String> {
         .map_err(|error| format!("frontend: {error}"))?;
     let decoder = match invocation.decoder {
         DecoderChoice::Ctc => {
-            let decoder = composition::ctc_recognizer(&package, &runtime, invocation.precision)
-                .map_err(|error| format!("decoder: {error}"))?;
+            let decoder =
+                composition::ctc_recognizer(&package, &runtime, &native, invocation.precision)
+                    .map_err(|error| format!("decoder: {error}"))?;
             projection::emit_ctc_construction_notice(&decoder);
             projection::emit_unverified_cuda_assignment(
                 runtime.plan(),
@@ -100,7 +101,7 @@ pub(crate) fn run(invocation: TranscribeInvocation) -> Result<(), String> {
         DecoderChoice::Rnnt => {
             let decoder = composition::rnnt_recognizer(
                 &package,
-                &runtime,
+                (&runtime, &native),
                 invocation.precision,
                 rnnt_precision,
             )

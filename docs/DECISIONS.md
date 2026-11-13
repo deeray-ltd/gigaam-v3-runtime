@@ -59,10 +59,15 @@ failure order, reuse, and testability ambiguous.
 **Decision.** Service and CLI parse their own arguments and environment once. They bind
 time-based application configuration to Audio's validated model sample rate before
 initializing the runtime. Audio owns frontend modes; Transcription owns observation ports;
-neither reads process environment or writes process streams.
+neither reads process environment or writes process streams. Recognition returns an owned
+native runtime capability; direct session constructors accept it explicitly. Service retains
+it for lazy VAD, and native sessions keep their environment alive through their actual
+lifetimes. Post-initialization Service errors unwind owned work before terminal exit.
 
 **Cost.** Startup has a strict validation order and refuses invalid inputs early. A caller
-cannot rely on a hidden default after providing an invalid value.
+cannot rely on a hidden default after providing an invalid value. Library callers must pass
+the returned native runtime to recognizer, encoder and VAD constructors, and keep an owner
+while they may construct further sessions.
 
 ## 5. Validate audio at the boundary
 

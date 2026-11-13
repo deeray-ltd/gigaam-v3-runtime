@@ -24,10 +24,11 @@ use std::sync::Arc;
 
 fn transcribe(
     pack: &ModelPackage,
+    native: &gigaam_recognition::NativeRuntime,
     frontend: Arc<FrontendProcessor>,
     path: &str,
 ) -> (String, u32, usize) {
-    let decoder = DirectRecognizer::ctc(pack, &common::cpu_plan(), EncoderPrecision::Fp32)
+    let decoder = DirectRecognizer::ctc(pack, native, &common::cpu_plan(), EncoderPrecision::Fp32)
         .expect("the CPU CTC test session must open");
     let sample_rate = frontend.sample_rate();
     let mut batch = BatchTranscriber::new(BatchSetup {
@@ -60,9 +61,7 @@ fn golden() -> String {
         .expect("the CTC golden text must be available")
 }
 
-#[test]
-fn telephony_wavs_8k_alaw_ulaw_pcm() {
-    common::init_ort();
+fn telephony_wavs_8k_alaw_ulaw_pcm(native: &gigaam_recognition::NativeRuntime) {
     let pack =
         ModelPackage::open(&common::root().join("model")).expect("the test model pack must open");
     let frontend = common::frontend(&pack);
@@ -71,7 +70,7 @@ fn telephony_wavs_8k_alaw_ulaw_pcm() {
         "fixtures/example_8k_alaw.wav",
         "fixtures/example_8k.wav",
     ] {
-        let (text, rate, _) = transcribe(&pack, frontend.clone(), fixture);
+        let (text, rate, _) = transcribe(&pack, native, frontend.clone(), fixture);
         let edits = word_edits(&golden(), &text);
         eprintln!("{fixture}: {rate} Hz, edits {edits}");
         assert!(edits <= 2, "{fixture}: {edits} edits\n{text}");
@@ -112,9 +111,7 @@ fn flac_is_bit_exact() {
     );
 }
 
-#[test]
-fn lossy_formats_keep_text() {
-    common::init_ort();
+fn lossy_formats_keep_text(native: &gigaam_recognition::NativeRuntime) {
     let pack =
         ModelPackage::open(&common::root().join("model")).expect("the test model pack must open");
     let frontend = common::frontend(&pack);
@@ -123,24 +120,25 @@ fn lossy_formats_keep_text() {
         "fixtures/example.opus",
         "fixtures/example.mp3",
     ] {
-        let (text, rate, channels) = transcribe(&pack, frontend.clone(), fixture);
+        let (text, rate, channels) = transcribe(&pack, native, frontend.clone(), fixture);
         let edits = word_edits(&golden(), &text);
         eprintln!("{fixture}: {rate} Hz, channels {channels}, edits {edits}");
         assert!(edits <= 2, "{fixture}: {edits} edits\n{text}");
     }
 }
 
-#[test]
-fn stereo_turns_preserve_channel_identity_and_word_count() {
-    common::init_ort();
+fn stereo_turns_preserve_channel_identity_and_word_count(
+    native: &gigaam_recognition::NativeRuntime,
+) {
     let pack =
         ModelPackage::open(&common::root().join("model")).expect("the test model pack must open");
     let audio = read_wav(&common::root().join("fixtures/example_stereo.wav"))
         .expect("the stereo fixture must decode");
     let mut transcripts = Vec::new();
     for (channel, samples) in audio.channels().iter().enumerate() {
-        let decoder = DirectRecognizer::ctc(&pack, &common::cpu_plan(), EncoderPrecision::Fp32)
-            .expect("the CPU CTC test session must open");
+        let decoder =
+            DirectRecognizer::ctc(&pack, native, &common::cpu_plan(), EncoderPrecision::Fp32)
+                .expect("the CPU CTC test session must open");
         let frontend = common::frontend(&pack);
         let sample_rate = frontend.sample_rate();
         let mut batch = BatchTranscriber::new(BatchSetup {
@@ -186,4 +184,12 @@ fn stereo_turns_preserve_channel_identity_and_word_count() {
             .iter()
             .all(|word| word.channel() == turn.channel())
     }));
+}
+
+#[test]
+fn native_golden_suite() {
+    let native = common::init_ort();
+    telephony_wavs_8k_alaw_ulaw_pcm(&native);
+    lossy_formats_keep_text(&native);
+    stereo_turns_preserve_channel_identity_and_word_count(&native);
 }

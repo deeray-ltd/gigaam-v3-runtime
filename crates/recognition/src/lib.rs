@@ -35,7 +35,7 @@ pub use contracts::{
 pub use execution::{ExecutionControl, ExecutionState};
 pub use ort_assignment::CudaAssignmentEvidence;
 pub use ort_encoder::OrtEncoder;
-pub use ort_runtime::init_runtime;
+pub use ort_runtime::{NativeRuntime, init_runtime};
 pub use ort_vad::Vad;
 pub use provider::{
     CudaArena, CudaAssignmentEnvironment, CudaAssignmentFingerprint, CudaAssignmentPolicy, Device,

@@ -21,8 +21,8 @@ pub(crate) fn run(invocation: VadInvocation) -> Result<(), String> {
     let config = invocation.policy.bind()?;
 
     let package = composition::open_package(&invocation.model)?;
-    composition::initialize_runtime(&runtime)?;
-    let mut detector = composition::vad(&package, runtime.plan().intra_threads())
+    let native = composition::initialize_runtime(&runtime)?;
+    let mut detector = composition::vad(&package, &native, runtime.plan().intra_threads())
         .map_err(|error| format!("vad: {error}"))?;
     let loaded = load(&invocation.input)?;
     let target_rate = SampleRate::new(usize_to_u32(VAD_SR, "VAD sample rate")?)?;

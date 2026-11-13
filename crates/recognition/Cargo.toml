@@ -13,7 +13,7 @@ publish = false
 gigaam-audio = { path = "../audio" }
 gigaam-model-package = { path = "../model-package" }
 gigaam-primitives = { path = "../primitives" }
-ort = { version = "2.0.0-rc.13", default-features = false, features = ["std", "load-dynamic", "api-24", "half"] }
+ort = { version = "=2.0.0-rc.15", default-features = false, features = ["std", "load-dynamic", "api-24", "half"] }
 sha2 = "0.11.0"
 half = "2"
 

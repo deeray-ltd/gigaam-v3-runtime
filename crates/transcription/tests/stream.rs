@@ -32,8 +32,12 @@ fn default_config(pack: &ModelPackage) -> StreamConfig {
         .expect("default stream configuration must be valid")
 }
 
-fn cpu_session(pack: &ModelPackage, config: StreamConfig) -> Session {
-    let decoder = DirectRecognizer::ctc(pack, &common::cpu_plan(), EncoderPrecision::Fp32)
+fn cpu_session(
+    pack: &ModelPackage,
+    native: &gigaam_recognition::NativeRuntime,
+    config: StreamConfig,
+) -> Session {
+    let decoder = DirectRecognizer::ctc(pack, native, &common::cpu_plan(), EncoderPrecision::Fp32)
         .expect("the CTC decoder must match the test pack");
     StreamSession::new(StreamSetup {
         frontend: common::frontend(pack),
@@ -91,13 +95,11 @@ fn run(mut session: Session, samples: &[f32], chunk: usize) -> Vec<StreamWord> {
     client
 }
 
-#[test]
-fn stream_matches_batch_and_patches_are_consistent() {
-    common::init_ort();
+fn stream_matches_batch_and_patches_are_consistent(native: &gigaam_recognition::NativeRuntime) {
     let root = common::root();
     let pack = ModelPackage::open(&root.join("model")).expect("the test model pack must open");
     let audio = read_wav(&root.join("fixtures/example.wav")).expect("the test WAV must decode");
-    let decoder = DirectRecognizer::ctc(&pack, &common::cpu_plan(), EncoderPrecision::Fp32)
+    let decoder = DirectRecognizer::ctc(&pack, native, &common::cpu_plan(), EncoderPrecision::Fp32)
         .expect("the CTC decoder must match the test pack");
     let mut batch = BatchTranscriber::new(BatchSetup {
         frontend: common::frontend(&pack),
@@ -112,7 +114,7 @@ fn stream_matches_batch_and_patches_are_consistent() {
         .transcribe_channel(&audio.channels()[0])
         .expect("the test clip must transcribe in batch mode");
     let client = run(
-        cpu_session(&pack, default_config(&pack)),
+        cpu_session(&pack, native, default_config(&pack)),
         audio.channels()[0].samples(),
         1600,
     );
@@ -131,9 +133,7 @@ fn stream_matches_batch_and_patches_are_consistent() {
     assert!(edits <= 1, "stream diverged from batch: {edits} edits");
 }
 
-#[test]
-fn stream_forced_cuts_lock_no_adjacent_duplicates() {
-    common::init_ort();
+fn stream_forced_cuts_lock_no_adjacent_duplicates(native: &gigaam_recognition::NativeRuntime) {
     let root = common::root();
     let pack = ModelPackage::open(&root.join("model")).expect("the test model pack must open");
     let audio =
@@ -148,7 +148,7 @@ fn stream_forced_cuts_lock_no_adjacent_duplicates() {
         .with_lock_policy(StreamLockPolicy::CommitStable)
         .expect("lock policy must preserve a valid configuration");
     let client = run(
-        cpu_session(&pack, config),
+        cpu_session(&pack, native, config),
         audio.channels()[0].samples(),
         1600,
     );
@@ -172,16 +172,16 @@ fn stream_forced_cuts_lock_no_adjacent_duplicates() {
     );
 }
 
-#[test]
-fn stream_endpoint_fires_on_silence_and_keeps_both_parts() {
-    common::init_ort();
+fn stream_endpoint_fires_on_silence_and_keeps_both_parts(
+    native: &gigaam_recognition::NativeRuntime,
+) {
     let root = common::root();
     let pack = ModelPackage::open(&root.join("model")).expect("the test model pack must open");
     let example = read_wav(&root.join("fixtures/example.wav")).expect("the test WAV must decode");
     let mut samples = example.channels()[0].samples().to_vec();
     samples.extend(std::iter::repeat_n(0.0_f32, 32000));
     samples.extend_from_slice(example.channels()[0].samples());
-    let mut session = cpu_session(&pack, default_config(&pack));
+    let mut session = cpu_session(&pack, native, default_config(&pack));
     let mut client = Vec::new();
     let mut endpoints = 0;
     for part in samples.chunks(1600) {
@@ -213,4 +213,12 @@ fn stream_endpoint_fires_on_silence_and_keeps_both_parts() {
         words >= single + single / 2,
         "both parts must appear in text: {words} vs {single}"
     );
+}
+
+#[test]
+fn native_golden_suite() {
+    let native = common::init_ort();
+    stream_matches_batch_and_patches_are_consistent(&native);
+    stream_forced_cuts_lock_no_adjacent_duplicates(&native);
+    stream_endpoint_fires_on_silence_and_keeps_both_parts(&native);
 }
