@@ -20,6 +20,7 @@ use gigaam_transcription::{
 /// Confirms the immutable policy bound to an active session without claiming channel activation.
 pub(crate) fn applied_config_event(config: &StreamConfig) -> String {
     let (endpoint, vad) = match config.endpoint_source() {
+        EndpointSource::Manual => ("manual", obj(vec![("enabled", Json::Bool(false))])),
         EndpointSource::Blank => ("blank", obj(vec![("enabled", Json::Bool(false))])),
         EndpointSource::Vad => (
             "vad",

@@ -24,6 +24,7 @@ pub(super) fn applied_config_record(
         return None;
     }
     let (endpoint, vad) = match config.endpoint_source() {
+        EndpointSource::Manual => ("manual", "{\"enabled\":false}".to_owned()),
         EndpointSource::Blank => ("blank", "{\"enabled\":false}".to_owned()),
         EndpointSource::Vad => (
             "vad",

@@ -36,8 +36,8 @@ pub(crate) fn run(invocation: BenchInvocation) -> Result<(), String> {
     let buffers = prepare_buffers(loaded, sample_rate, sample_plan, &invocation.audio)?;
     let frontend = composition::frontend_for_package(&package, frontend_mode)
         .map_err(|error| format!("frontend: {error}"))?;
-    composition::initialize_runtime(&runtime)?;
-    let mut encoder = composition::ctc_encoder(&package, &runtime, precision)
+    let native = composition::initialize_runtime(&runtime)?;
+    let mut encoder = composition::ctc_encoder(&package, &runtime, &native, precision)
         .map_err(|error| format!("encoder: {error}"))?;
     let effective_precision = encoder.precision();
     projection::emit_unverified_cuda_assignment(

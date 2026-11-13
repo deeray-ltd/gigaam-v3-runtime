@@ -52,10 +52,10 @@ pub(crate) fn run(invocation: StreamInvocation) -> Result<(), String> {
     .map_err(|error| format!("batch configuration: {error}"))?;
     let chunk = stream_chunk(invocation.chunk_milliseconds, config.sample_rate())?;
 
-    composition::initialize_runtime(&runtime)?;
+    let native = composition::initialize_runtime(&runtime)?;
     let frontend = composition::frontend_for_package(&package, frontend_mode)
         .map_err(|error| format!("frontend: {error}"))?;
-    let recognizer = composition::ctc_recognizer(&package, &runtime, precision)
+    let recognizer = composition::ctc_recognizer(&package, &runtime, &native, precision)
         .map_err(|error| format!("decoder: {error}"))?;
     let effective_precision = recognizer.encoder_precision();
     projection::emit_ctc_construction_notice(&recognizer);
@@ -89,9 +89,10 @@ pub(crate) fn run(invocation: StreamInvocation) -> Result<(), String> {
         .map_err(|error| format!("batch transcription: {error}"))?;
     let decoder = batch_transcriber.into_decoder();
     let detector = match config.endpoint_source() {
+        gigaam_transcription::EndpointSource::Manual => EndpointDetector::Manual,
         gigaam_transcription::EndpointSource::Blank => EndpointDetector::Blank,
         gigaam_transcription::EndpointSource::Vad => EndpointDetector::Vad(
-            composition::vad(&package, runtime.plan().intra_threads())
+            composition::vad(&package, &native, runtime.plan().intra_threads())
                 .map_err(|error| format!("vad: {error}"))?,
         ),
     };

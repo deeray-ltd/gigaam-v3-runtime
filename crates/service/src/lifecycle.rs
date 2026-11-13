@@ -163,6 +163,14 @@ fn warmup(
     }
 }
 
+/// Keeps the initialized capability alive until all scoped startup and serving work unwinds.
+fn with_runtime_owner<T, R>(
+    owner: T,
+    run: impl FnOnce(&T) -> Result<R, String>,
+) -> Result<R, String> {
+    run(&owner)
+}
+
 /// Runs the process lifecycle and delegates application assembly to the crate facade.
 pub(super) fn run_process(
     assemble: impl FnOnce(
@@ -171,11 +179,22 @@ pub(super) fn run_process(
         PreparedTelemetry,
     ) -> Result<(Router, Arc<AdmissionState>), String>,
 ) {
+    if let Err(error) = run_scoped(assemble) {
+        fatal(&error);
+    }
+}
+
+fn run_scoped(
+    assemble: impl FnOnce(
+        ServiceApplicationParameters,
+        Arc<Metrics>,
+        PreparedTelemetry,
+    ) -> Result<(Router, Arc<AdmissionState>), String>,
+) -> Result<(), String> {
     let (startup, limits, pack) =
-        continue_after_configuration(ProcessConfiguration::from_process(), open_model)
-            .unwrap_or_else(|error| fatal(&error));
+        continue_after_configuration(ProcessConfiguration::from_process(), open_model)?;
     let sample_rate_config = pack.frontend().sample_rate();
-    let sample_rate = model_sample_rate(sample_rate_config).unwrap_or_else(|error| fatal(&error));
+    let sample_rate = model_sample_rate(sample_rate_config)?;
     let window_seconds = WINDOW_DURATION.as_secs_f32();
     let overlap_seconds = OVERLAP_DURATION.as_secs_f32();
     let (limits, policy, metrics, telemetry) = match continue_after_model_policy(
@@ -206,107 +225,117 @@ pub(super) fn run_process(
     ) {
         Ok(value) => value,
         Err(ModelPolicyFailure::ModelLimits(error))
-        | Err(ModelPolicyFailure::Continuation(error)) => fatal(&error),
-        Err(ModelPolicyFailure::Policy(error)) => fatal(&format!("service policy: {error}")),
+        | Err(ModelPolicyFailure::Continuation(error)) => return Err(error),
+        Err(ModelPolicyFailure::Policy(error)) => return Err(format!("service policy: {error}")),
     };
 
-    init_runtime(&startup.ort_dylib).unwrap_or_else(|error| fatal(&error));
-    let weights = pack
-        .frontend_weights()
-        .unwrap_or_else(|error| fatal(&format!("frontend weights: {error}")));
-    let frontend = Arc::new(
-        FrontendProcessor::new(pack.frontend(), weights, startup.frontend_mode)
-            .unwrap_or_else(|error| fatal(&format!("frontend: {error}"))),
-    );
+    let native = init_runtime(&startup.ort_dylib)?;
+    with_runtime_owner(native, |native| {
+        let weights = pack
+            .frontend_weights()
+            .map_err(|error| format!("frontend weights: {error}"))?;
+        let frontend = Arc::new(
+            FrontendProcessor::new(pack.frontend(), weights, startup.frontend_mode)
+                .map_err(|error| format!("frontend: {error}"))?,
+        );
 
-    let ctc_decoder = DirectRecognizer::ctc(&pack, &startup.plan, startup.ctc_precision)
-        .unwrap_or_else(|error| fatal(&format!("CTC decoder: {error}")));
-    let ctc_precision = precision_name(ctc_decoder.encoder_precision());
-    emit_ctc_construction_notice(&ctc_decoder);
-    emit_unverified_cuda_assignment(
-        &startup.plan,
-        EncoderRole::Ctc,
-        ctc_decoder.assignment_evidence(),
-    );
-    let ctc = Arc::new(ExecutionScheduler::spawn(ctc_decoder));
-    warmup(&ctc, &frontend, policy.http_batch, "CTC").unwrap_or_else(|error| fatal(&error));
-    eprintln!(
-        "# CTC worker started ({ctc_precision}, {})",
-        startup.plan.device().as_str()
-    );
-
-    let rnnt = if startup.with_rnnt {
-        let decoder = match startup.rnnt_precision {
-            Some(selection) => {
-                DirectRecognizer::rnnt_with_precision(&pack, &startup.plan, selection)
-            }
-            None => {
-                DirectRecognizer::rnnt(&pack, &startup.plan, encoder_precision(startup.rnnt_fp16))
-            }
-        }
-        .unwrap_or_else(|error| fatal(&format!("RNNT decoder: {error}")));
-        let precision = precision_name(decoder.encoder_precision());
+        let ctc_decoder =
+            DirectRecognizer::ctc(&pack, native, &startup.plan, startup.ctc_precision)
+                .map_err(|error| format!("CTC decoder: {error}"))?;
+        let ctc_precision = precision_name(ctc_decoder.encoder_precision());
+        emit_ctc_construction_notice(&ctc_decoder);
         emit_unverified_cuda_assignment(
             &startup.plan,
-            EncoderRole::Rnnt,
-            decoder.assignment_evidence(),
+            EncoderRole::Ctc,
+            ctc_decoder.assignment_evidence(),
         );
-        let scheduler = Arc::new(ExecutionScheduler::spawn(decoder));
-        warmup(&scheduler, &frontend, policy.http_batch, "RNNT")
-            .unwrap_or_else(|error| fatal(&error));
+        let ctc = Arc::new(ExecutionScheduler::spawn(ctc_decoder));
+        warmup(&ctc, &frontend, policy.http_batch, "CTC")?;
         eprintln!(
-            "# RNNT worker started ({precision}, {})",
+            "# CTC worker started ({ctc_precision}, {})",
             startup.plan.device().as_str()
         );
-        Some(scheduler)
-    } else {
-        None
-    };
 
-    eprintln!(
-        "# limits: transcribe≤{}, channels≤{}, body≤{}MB, timeout {}s; dedup {}",
-        limits.admission().max_http(),
-        limits.admission().max_ws(),
-        limits.body_megabytes(),
-        limits.admission().request_timeout().as_secs(),
-        if limits.dedup_default { "on" } else { "off" }
-    );
+        let rnnt = if startup.with_rnnt {
+            let decoder = match startup.rnnt_precision {
+                Some(selection) => {
+                    DirectRecognizer::rnnt_with_precision(&pack, native, &startup.plan, selection)
+                }
+                None => DirectRecognizer::rnnt(
+                    &pack,
+                    native,
+                    &startup.plan,
+                    encoder_precision(startup.rnnt_fp16),
+                ),
+            }
+            .map_err(|error| format!("RNNT decoder: {error}"))?;
+            let precision = precision_name(decoder.encoder_precision());
+            emit_unverified_cuda_assignment(
+                &startup.plan,
+                EncoderRole::Rnnt,
+                decoder.assignment_evidence(),
+            );
+            let scheduler = Arc::new(ExecutionScheduler::spawn(decoder));
+            warmup(&scheduler, &frontend, policy.http_batch, "RNNT")?;
+            eprintln!(
+                "# RNNT worker started ({precision}, {})",
+                startup.plan.device().as_str()
+            );
+            Some(scheduler)
+        } else {
+            None
+        };
 
-    let capabilities = ServiceCapabilities::new(ServiceCapabilitiesParameters {
-        pack,
-        frontend,
-        ctc,
-        rnnt,
-        provider: startup.plan.device(),
-        intra_threads: startup.plan.intra_threads(),
-    })
-    .unwrap_or_else(|error| fatal(&format!("service capabilities: {error}")));
-    let request_body_limit = limits.request_body_limit();
-    let api_mode = limits.admission.api_mode();
-    let admission = limits.admission;
-    let (app, admission) = assemble(
-        ServiceApplicationParameters::new(capabilities, policy, admission, request_body_limit),
-        metrics,
-        telemetry,
-    )
-    .unwrap_or_else(|error| fatal(&format!("service application: {error}")));
+        eprintln!(
+            "# limits: transcribe≤{}, channels≤{}, body≤{}MB, timeout {}s; dedup {}",
+            limits.admission().max_http(),
+            limits.admission().max_ws(),
+            limits.body_megabytes(),
+            limits.admission().request_timeout().as_secs(),
+            if limits.dedup_default { "on" } else { "off" }
+        );
 
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .unwrap_or_else(|error| fatal(&error.to_string()));
-    runtime.block_on(async move {
+        let capabilities = ServiceCapabilities::new(ServiceCapabilitiesParameters {
+            native_runtime: Some(native.clone()),
+            pack,
+            frontend,
+            ctc,
+            rnnt,
+            provider: startup.plan.device(),
+            intra_threads: startup.plan.intra_threads(),
+        })
+        .map_err(|error| format!("service capabilities: {error}"))?;
+        let request_body_limit = limits.request_body_limit();
+        let api_mode = limits.admission.api_mode();
+        let admission = limits.admission;
+        let (app, admission) = assemble(
+            ServiceApplicationParameters::new(capabilities, policy, admission, request_body_limit),
+            metrics,
+            telemetry,
+        )
+        .map_err(|error| format!("service application: {error}"))?;
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| error.to_string())?;
+        runtime.block_on(async move {
         let address = format!("0.0.0.0:{}", startup.port);
         let listener = tokio::net::TcpListener::bind(&address)
             .await
-            .unwrap_or_else(|error| fatal(&format!("bind {address}: {error}")));
+            .map_err(|error| format!("bind {address}: {error}"))?;
         let api = match api_mode {
             crate::admission::ApiMode::Native => "POST /v1/transcribe, WS /v1/stream",
             crate::admission::ApiMode::OpenAi => "POST /v1/audio/transcriptions, GET /v1/models",
         };
         eprintln!("# asr-serve listening on http://{address} ({api}; GET /health, /livez, /readyz)");
+        let (signal_tx, mut signal_rx) = tokio::sync::oneshot::channel();
         let shutdown = async move {
-            wait_signal().await.unwrap_or_else(|error| fatal(&error));
+            if let Err(error) = wait_signal().await {
+                let _ = signal_tx.send(Err(error));
+                return;
+            }
+            let _ = signal_tx.send(Ok(()));
             crate::admission::begin_draining_then(admission.as_ref(), || {
                 eprintln!("# termination signal — graceful shutdown (draining in-flight work, /readyz -> 503)");
             });
@@ -315,9 +344,16 @@ pub(super) fn run_process(
         axum::serve(listener, app)
             .with_graceful_shutdown(shutdown)
             .await
-            .unwrap_or_else(|error| fatal(&error.to_string()));
+            .map_err(|error| error.to_string())?;
+        match signal_rx.try_recv() {
+            Ok(result) => result?,
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {},
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed) => return Err("shutdown signal task ended without a result".into()),
+        }
         eprintln!("# server stopped");
-    });
+        Ok(())
+    })
+    })
 }
 
 async fn wait_signal() -> Result<(), String> {
@@ -352,6 +388,7 @@ mod tests {
     use super::{
         ModelPolicyFailure, ProcessConfiguration, continue_after_configuration,
         continue_after_model_limits, continue_after_model_policy, continue_after_package_open,
+        with_runtime_owner,
     };
     use crate::config::{ServerLimitEnvironment, ServerLimits, Startup, StartupEnvironment};
     use crate::context::{ServicePolicy, ServicePolicyParameters};
@@ -370,6 +407,54 @@ mod tests {
                 ..StartupEnvironment::default()
             },
         )
+    }
+
+    #[test]
+    fn post_initialization_error_drops_worker_before_runtime_owner() {
+        use gigaam_audio::FeatureMatrixView;
+        use gigaam_recognition::{
+            Decoded, ExecutionScheduler, FrameRate, SilenceCapability, WindowDecoder,
+        };
+        use std::sync::{Arc, Mutex};
+        struct Owner(Arc<Mutex<Vec<&'static str>>>);
+        impl Drop for Owner {
+            fn drop(&mut self) {
+                self.0
+                    .lock()
+                    .expect("test drop log is unpoisoned")
+                    .push("owner");
+            }
+        }
+        struct Decoder(Arc<Mutex<Vec<&'static str>>>);
+        impl WindowDecoder for Decoder {
+            fn silence_capability(&self) -> SilenceCapability {
+                SilenceCapability::LegacyBlank
+            }
+            fn frame_rate(&self) -> FrameRate {
+                FrameRate::new(25.0).expect("valid test rate")
+            }
+            fn decode(&mut self, _: FeatureMatrixView<'_>) -> Result<Decoded, String> {
+                Err("unused decoder".into())
+            }
+        }
+        impl Drop for Decoder {
+            fn drop(&mut self) {
+                self.0
+                    .lock()
+                    .expect("test drop log is unpoisoned")
+                    .push("decoder");
+            }
+        }
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let result = with_runtime_owner(Owner(Arc::clone(&log)), |_| {
+            let _worker = ExecutionScheduler::spawn(Decoder(Arc::clone(&log)));
+            Err::<(), _>("later startup failed".to_owned())
+        });
+        assert_eq!(result, Err("later startup failed".to_owned()));
+        assert_eq!(
+            *log.lock().expect("test drop log is unpoisoned"),
+            ["decoder", "owner"]
+        );
     }
 
     #[test]

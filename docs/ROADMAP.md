@@ -11,6 +11,13 @@ separate-channel audio, strict CPU, CUDA, and TensorRT provider selection, and t
 image definitions. The boundaries it does not establish are listed in
 [ARCHITECTURE.md](ARCHITECTURE.md) and expanded below.
 
+## Runtime lifetime validation
+
+The owned native runtime capability keeps the ONNX Runtime environment alive through session
+and worker lifetimes and lets normal process cleanup occur before terminal exit. Validate the
+CUDA teardown regression with the retained failing fixture and native provider library; a
+successful build or transcript alone does not establish that process cleanup succeeds.
+
 ## Deferred work
 
 ### Model package integrity and compatibility

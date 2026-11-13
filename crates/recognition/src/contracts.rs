@@ -348,8 +348,22 @@ pub fn selected_log_probability(row: &[f32], selected: usize) -> Result<f64, Str
     Ok((f64::from(row[selected]) - maximum) - sum.ln())
 }
 
+/// Meaning of the silence mask returned by a decoder. This value is immutable for
+/// the decoder's lifetime; implementors must explicitly declare it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SilenceCapability {
+    /// The existing CTC blank/space endpoint heuristic.
+    LegacyBlank,
+    /// No token was emitted; this is not acoustic silence.
+    TokenAbsence,
+    /// No usable interpretation has been declared.
+    Unknown,
+}
+
 /// Decodes one validated feature window into a coherent recognition result.
 pub trait WindowDecoder {
+    fn silence_capability(&self) -> SilenceCapability;
+
     fn frame_rate(&self) -> FrameRate;
 
     fn decode(&mut self, features: FeatureMatrixView<'_>) -> Result<Decoded, String>;
@@ -370,6 +384,10 @@ pub trait WindowDecoder {
 
 /// Dynamically dispatched decoder used by the current CLI composition.
 impl WindowDecoder for Box<dyn WindowDecoder> {
+    fn silence_capability(&self) -> SilenceCapability {
+        (**self).silence_capability()
+    }
+
     fn frame_rate(&self) -> FrameRate {
         (**self).frame_rate()
     }

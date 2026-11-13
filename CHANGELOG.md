@@ -61,6 +61,12 @@ All notable changes are recorded here. Pre-1.0 releases do not promise a stable 
 
 ### Changed
 
+- Recognition `init_runtime` returns an owned `NativeRuntime`. Pass a reference to direct
+  recognizer, encoder, and VAD constructors; retain an owner while further sessions may be
+  constructed. Service facade callers provide `Some(runtime)` for lazy native VAD, or `None`
+  when their synthetic capabilities do not construct VAD. Post-initialization Service errors
+  unwind owned work before terminal exit.
+
 - Standalone VAD minimum speech/silence and padding accept finite nonnegative fractional
   milliseconds, including zero, through the same checked policy as batch VAD.
 - Speech segmentation now refuses incomplete or excess detector probability coverage,

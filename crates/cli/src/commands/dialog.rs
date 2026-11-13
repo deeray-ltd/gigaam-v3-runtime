@@ -39,7 +39,7 @@ pub(crate) fn run(invocation: DialogInvocation) -> Result<(), String> {
         backchannel_policy,
     })
     .map_err(|error| format!("dialog setup: {error}"))?;
-    composition::initialize_runtime(&runtime)?;
+    let native = composition::initialize_runtime(&runtime)?;
     let frontend = composition::frontend_for_package(&package, frontend_mode)
         .map_err(|error| format!("frontend: {error}"))?;
     let loaded = load(&invocation.input)?;
@@ -47,7 +47,7 @@ pub(crate) fn run(invocation: DialogInvocation) -> Result<(), String> {
         .map_err(|error| format!("resample: {error}"))?;
     let channels = audio.channels().len();
     let mut factory =
-        composition::DialogStreamFactory::new(&package, &runtime, frontend, precision);
+        composition::DialogStreamFactory::new(&package, (&runtime, &native), frontend, precision);
     let result = transcribe_offline_dialog(setup, &mut factory, audio.channels())
         .map_err(|failure| projection::dialog_failure_message(&failure))?;
     projection::dialog(&result, channels);

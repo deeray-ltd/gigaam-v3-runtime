@@ -75,7 +75,12 @@ and release material describe the same behavior in more detail and do not contra
 
 - Requirement: Service and CLI read applicable command-line and process-environment values once,
   validate them before runtime/model construction, and pass typed choices to capability
-  constructors. Service and CTC CLI transcribe, bench, stream, and dialog resolve
+  constructors. Recognition exposes one explicitly owned native runtime capability; each native
+  constructor receives it and each session retains the environment while it is live. Service
+  retains the capability for lazy VAD and drains physical native work before normal process
+  return, including post-initialization error paths. A service facade without that capability
+  refuses selected native VAD construction.
+  Service and CTC CLI transcribe, bench, stream, and dialog resolve
   `--ctc-precision` and `ASR_CTC_PRECISION` as exact fp32, fp16io32, or fp16;
   both must agree and either conflicts with the applicable legacy CTC flag. RNN-T
   transcribe and VAD ignore the CTC environment setting, and reject the CTC option.
@@ -205,3 +210,13 @@ and release material describe the same behavior in more detail and do not contra
   refusal behavior agree with its declared CPU, CUDA, or TensorRT artifact identity.
 - Scope: Rust features, runtime initialization, image payloads, health state, and artifact
   verification.
+
+### STREAM-ENDPOINT-001 · Decoder silence and acoustic endpointing
+
+- Requirement: Each window decoder explicitly declares its immutable silence-mask meaning.
+  Blank endpointing admits only the legacy CTC heuristic. For other decoder meanings, VAD
+  endpointing measures newly observed source samples across overlapping windows, and manual
+  endpointing commits remaining words on flush without automatic endpoints. Invalid acoustic
+  observations and cancellation refuse before their candidate state is accepted.
+- Scope: Recognition decoder implementors and Transcription streaming sessions; process
+  adapters expose only their separately documented endpoint selectors.

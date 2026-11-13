@@ -29,13 +29,13 @@ pub mod vad;
 
 pub use assembly::{DirectRecognizer, RnntPrecisionSelection};
 pub use contracts::{
-    Decoded, DecodedTokensInput, Encoder, FrameRate, ScoreDetail, SpeechProbabilityDetector, Token,
-    WindowDecoder, Word,
+    Decoded, DecodedTokensInput, Encoder, FrameRate, ScoreDetail, SilenceCapability,
+    SpeechProbabilityDetector, Token, WindowDecoder, Word,
 };
 pub use execution::{ExecutionControl, ExecutionState};
 pub use ort_assignment::CudaAssignmentEvidence;
 pub use ort_encoder::OrtEncoder;
-pub use ort_runtime::init_runtime;
+pub use ort_runtime::{NativeRuntime, init_runtime};
 pub use ort_vad::Vad;
 pub use provider::{
     CudaArena, CudaAssignmentEnvironment, CudaAssignmentFingerprint, CudaAssignmentPolicy, Device,

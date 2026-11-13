@@ -82,10 +82,10 @@ pub(crate) fn run(invocation: TranscribeInvocation) -> Result<(), String> {
         invocation.overlap_seconds,
         invocation.padding,
     )?;
-    composition::initialize_runtime(&runtime)?;
+    let native = composition::initialize_runtime(&runtime)?;
     let mut vad = vad_policy
         .map(|policy| {
-            composition::vad(&package, runtime.plan().intra_threads())
+            composition::vad(&package, &native, runtime.plan().intra_threads())
                 .map(|detector| (detector, policy))
                 .map_err(|error| format!("vad: {error}"))
         })
@@ -97,6 +97,7 @@ pub(crate) fn run(invocation: TranscribeInvocation) -> Result<(), String> {
             let decoder = composition::ctc_recognizer(
                 &package,
                 &runtime,
+                &native,
                 ctc_precision.expect("CTC branch resolves CTC precision"),
             )
             .map_err(|error| format!("decoder: {error}"))?;
@@ -111,7 +112,7 @@ pub(crate) fn run(invocation: TranscribeInvocation) -> Result<(), String> {
         DecoderChoice::Rnnt => {
             let decoder = composition::rnnt_recognizer(
                 &package,
-                &runtime,
+                (&runtime, &native),
                 invocation.precision,
                 rnnt_precision,
             )

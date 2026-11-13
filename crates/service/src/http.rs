@@ -276,7 +276,13 @@ async fn openai_transcribe(State(state): State<HttpState>, request: Request) -> 
                 control,
                 progress: &work_progress,
             },
-            || Vad::from_pack(&capabilities.pack, capabilities.intra_threads),
+            || {
+                Vad::from_pack(
+                    &capabilities.pack,
+                    capabilities.native_runtime()?,
+                    capabilities.intra_threads,
+                )
+            },
             input.segment,
             true,
         )?;
@@ -1075,7 +1081,11 @@ struct BatchWork<'a> {
 fn do_transcribe(work: BatchWork<'_>) -> Result<String, TranscribeError> {
     let capabilities = &work.context.capabilities;
     do_transcribe_with_vad_factory(work, || {
-        Vad::from_pack(&capabilities.pack, capabilities.intra_threads)
+        Vad::from_pack(
+            &capabilities.pack,
+            capabilities.native_runtime()?,
+            capabilities.intra_threads,
+        )
     })
 }
 
@@ -1790,6 +1800,9 @@ mod tests {
     struct TerminalDecoder;
 
     impl WindowDecoder for TerminalDecoder {
+        fn silence_capability(&self) -> gigaam_recognition::SilenceCapability {
+            gigaam_recognition::SilenceCapability::LegacyBlank
+        }
         fn frame_rate(&self) -> FrameRate {
             FrameRate::new(25.0).expect("the controlled terminal decoder frame rate is valid")
         }
@@ -1814,6 +1827,7 @@ mod tests {
         telemetry: TelemetryProducer,
     ) -> Result<HttpState, String> {
         let capabilities = ServiceCapabilities::new(ServiceCapabilitiesParameters {
+            native_runtime: None,
             pack: Arc::clone(&fixture.pack),
             frontend: Arc::clone(&fixture.frontend),
             ctc: Arc::new(ExecutionScheduler::spawn(TerminalDecoder)),
@@ -2108,6 +2122,9 @@ mod tests {
     }
 
     impl WindowDecoder for ControlledDecoder {
+        fn silence_capability(&self) -> gigaam_recognition::SilenceCapability {
+            gigaam_recognition::SilenceCapability::LegacyBlank
+        }
         fn frame_rate(&self) -> FrameRate {
             FrameRate::new(100.0).expect("the controlled decoder frame rate is valid")
         }

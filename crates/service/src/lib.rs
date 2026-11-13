@@ -428,6 +428,9 @@ pub(crate) mod tests {
     struct IdleDecoder;
 
     impl WindowDecoder for IdleDecoder {
+        fn silence_capability(&self) -> gigaam_recognition::SilenceCapability {
+            gigaam_recognition::SilenceCapability::LegacyBlank
+        }
         fn frame_rate(&self) -> FrameRate {
             FrameRate::new(25.0).expect("the fixed assembly decoder frame rate is positive")
         }
@@ -482,6 +485,7 @@ pub(crate) mod tests {
 
     fn service_capabilities(fixture: &AssemblyFixture) -> Result<ServiceCapabilities, String> {
         ServiceCapabilities::new(ServiceCapabilitiesParameters {
+            native_runtime: None,
             pack: Arc::clone(&fixture.pack),
             frontend: Arc::clone(&fixture.frontend),
             ctc: Arc::new(ExecutionScheduler::spawn(IdleDecoder)),
@@ -541,6 +545,19 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn synthetic_service_refuses_native_vad_without_runtime_capability() -> Result<(), String> {
+        let fixture = assembly_fixture()?;
+        let capabilities = service_capabilities(&fixture)?;
+        assert_eq!(
+            capabilities
+                .native_runtime()
+                .expect_err("native VAD requires a runtime"),
+            "native runtime capability is required for VAD"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn facade_assembly_refuses_policy_frontend_rate_mismatch_before_routes_exist()
     -> Result<(), String> {
         let fixture = assembly_fixture()?;
@@ -551,6 +568,7 @@ pub(crate) mod tests {
             "the assembly fixture must exercise distinct policy and frontend rates"
         );
         let capabilities = ServiceCapabilities::new(ServiceCapabilitiesParameters {
+            native_runtime: None,
             pack: Arc::clone(&fixture.pack),
             frontend: Arc::clone(&fixture.frontend),
             ctc: Arc::new(ExecutionScheduler::spawn(IdleDecoder)),

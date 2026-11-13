@@ -437,6 +437,9 @@ mod tests {
     struct EvidenceDecoder;
 
     impl WindowDecoder for EvidenceDecoder {
+        fn silence_capability(&self) -> gigaam_recognition::SilenceCapability {
+            gigaam_recognition::SilenceCapability::LegacyBlank
+        }
         fn frame_rate(&self) -> FrameRate {
             FrameRate::new(8.0).expect("test frame rate is positive")
         }
@@ -613,6 +616,9 @@ mod tests {
     }
 
     impl WindowDecoder for StatefulDecoder {
+        fn silence_capability(&self) -> gigaam_recognition::SilenceCapability {
+            gigaam_recognition::SilenceCapability::LegacyBlank
+        }
         fn frame_rate(&self) -> FrameRate {
             FrameRate::new(8.0).expect("test decoder frame rate is finite and positive")
         }

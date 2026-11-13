@@ -458,20 +458,17 @@ struct ServiceStreamChannelFactory {
     frontend: Arc<FrontendProcessor>,
     scheduler: Arc<ExecutionScheduler>,
     intra_threads: Option<NonZeroUsize>,
+    native_runtime: Option<gigaam_recognition::NativeRuntime>,
 }
 
 impl ServiceStreamChannelFactory {
-    fn new(
-        pack: Arc<ModelPackage>,
-        frontend: Arc<FrontendProcessor>,
-        scheduler: Arc<ExecutionScheduler>,
-        intra_threads: Option<NonZeroUsize>,
-    ) -> Self {
+    fn new(capabilities: &crate::context::ServiceCapabilities) -> Self {
         Self {
-            pack,
-            frontend,
-            scheduler,
-            intra_threads,
+            pack: Arc::clone(&capabilities.pack),
+            frontend: Arc::clone(&capabilities.frontend),
+            scheduler: Arc::clone(&capabilities.ctc),
+            intra_threads: capabilities.intra_threads,
+            native_runtime: capabilities.native_runtime.clone(),
         }
     }
 }
@@ -488,10 +485,15 @@ impl StreamChannelFactory for ServiceStreamChannelFactory {
         let control = ExecutionControl::without_deadline();
         let decoder = self.scheduler.tick_channel(control.clone());
         let detector = match config.endpoint_source() {
+            EndpointSource::Manual => EndpointDetector::Manual,
             EndpointSource::Blank => EndpointDetector::Blank,
-            EndpointSource::Vad => {
-                EndpointDetector::Vad(Vad::from_pack(&self.pack, self.intra_threads)?)
-            }
+            EndpointSource::Vad => EndpointDetector::Vad(Vad::from_pack(
+                &self.pack,
+                self.native_runtime
+                    .as_ref()
+                    .ok_or_else(|| "native runtime capability is required for VAD".to_owned())?,
+                self.intra_threads,
+            )?),
         };
         Ok(StreamSetup {
             frontend: Arc::clone(&self.frontend),
@@ -950,12 +952,7 @@ async fn handle(
         true => Some(prepared.setup.stream_config().clone()),
         false => None,
     };
-    let factory = ServiceStreamChannelFactory::new(
-        Arc::clone(&state.context.capabilities.pack),
-        Arc::clone(&state.context.capabilities.frontend),
-        Arc::clone(&state.context.capabilities.ctc),
-        state.context.capabilities.intra_threads,
-    );
+    let factory = ServiceStreamChannelFactory::new(&state.context.capabilities);
     let initialization = tokio::task::spawn_blocking(move || {
         let mut factory = factory;
         MultiChannelSession::new(prepared.setup, &mut factory)
@@ -1341,6 +1338,9 @@ mod tests {
     struct RefusalPathDecoder;
 
     impl WindowDecoder for RefusalPathDecoder {
+        fn silence_capability(&self) -> gigaam_recognition::SilenceCapability {
+            gigaam_recognition::SilenceCapability::LegacyBlank
+        }
         fn frame_rate(&self) -> FrameRate {
             FrameRate::new(25.0).expect("the controlled refusal decoder frame rate is positive")
         }
@@ -1358,6 +1358,7 @@ mod tests {
         telemetry: TelemetryProducer,
     ) -> Result<WsState, String> {
         let capabilities = ServiceCapabilities::new(ServiceCapabilitiesParameters {
+            native_runtime: None,
             pack: Arc::clone(&fixture.pack),
             frontend: Arc::clone(&fixture.frontend),
             ctc: Arc::new(ExecutionScheduler::spawn(RefusalPathDecoder)),
@@ -1384,6 +1385,9 @@ mod tests {
     struct WarmupSucceedsDecoder;
 
     impl WindowDecoder for WarmupSucceedsDecoder {
+        fn silence_capability(&self) -> gigaam_recognition::SilenceCapability {
+            gigaam_recognition::SilenceCapability::LegacyBlank
+        }
         fn frame_rate(&self) -> FrameRate {
             FrameRate::new(25.0).expect("the controlled warmup decoder frame rate is positive")
         }
@@ -1407,6 +1411,7 @@ mod tests {
         telemetry: TelemetryProducer,
     ) -> Result<WsState, String> {
         let capabilities = ServiceCapabilities::new(ServiceCapabilitiesParameters {
+            native_runtime: None,
             pack: Arc::clone(&fixture.pack),
             frontend: Arc::clone(&fixture.frontend),
             ctc: Arc::new(ExecutionScheduler::spawn(WarmupSucceedsDecoder)),
@@ -3374,6 +3379,9 @@ mod tests {
     }
 
     impl WindowDecoder for SerializerDecoder {
+        fn silence_capability(&self) -> gigaam_recognition::SilenceCapability {
+            gigaam_recognition::SilenceCapability::LegacyBlank
+        }
         fn frame_rate(&self) -> FrameRate {
             FrameRate::new(100.0).expect("the fixed serializer decoder frame rate is positive")
         }

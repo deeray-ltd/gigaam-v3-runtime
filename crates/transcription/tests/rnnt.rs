@@ -20,12 +20,13 @@ use gigaam_transcription::{
 
 #[test]
 fn rnnt_reproduces_golden_text() {
-    common::init_ort();
+    let native = common::init_ort();
     let root = common::root();
     let pack = ModelPackage::open(&root.join("model")).expect("the test model pack must open");
     for clip in ["example", "long_example"] {
-        let decoder = DirectRecognizer::rnnt(&pack, &common::cpu_plan(), EncoderPrecision::Fp32)
-            .expect("the RNNT decoder must match the test pack");
+        let decoder =
+            DirectRecognizer::rnnt(&pack, &native, &common::cpu_plan(), EncoderPrecision::Fp32)
+                .expect("the RNNT decoder must match the test pack");
         let frontend = common::frontend(&pack);
         let sample_rate = frontend.sample_rate();
         let mut batch = BatchTranscriber::new(BatchSetup {

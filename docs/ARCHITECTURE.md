@@ -150,7 +150,12 @@ through a changed observed assignment; it does not independently hash model or r
 Service and CLI parse their applicable command-line and environment values before package,
 frontend, scheduler, or native-runtime construction. The model rate is then bound to
 time-based transcription configuration, preventing adapters from maintaining a parallel
-unvalidated sample-rate value.
+unvalidated sample-rate value. Recognition returns an owned `NativeRuntime` from explicit
+initialization; native constructors receive that capability and their sessions retain the
+underlying environment. CLI retains it through command completion. Service shares it with
+lazy VAD construction and returns from post-initialization errors only after owned resources
+unwind; scheduler workers join after physically executing work finishes. Synthetic Service
+facades may omit the runtime, but a request selecting native VAD then refuses.
 
 HTTP batch work receives a shared execution control. When its deadline publishes a 504,
 queued or successor windows cannot start after cancellation is observed; the admission
@@ -215,3 +220,8 @@ real-provider acceptance, a published image, or a stable pre-1.0 protocol. Those
 are not established by the current implementation and are not part of its public contract.
 Deferred product work and what unlocks it is recorded in [ROADMAP.md](ROADMAP.md);
 real-provider acceptance and image publication are release steps outside that document.
+
+Recognition decoders declare an immutable silence-mask capability. Transcription admits the
+legacy blank heuristic only for decoders declaring it; non-legacy VAD sessions accumulate
+newly observed source samples across bounded windows. Core manual sessions commit on flush.
+The process adapters expose only the endpoint selectors listed in the API documentation.

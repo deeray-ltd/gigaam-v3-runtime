@@ -45,6 +45,7 @@ enum JobEvent {
 struct ScheduledRecognizerParts {
     shared: Arc<(Mutex<Queue>, Condvar)>,
     frame_rate: FrameRate,
+    silence_capability: crate::SilenceCapability,
     priority: Priority,
     pending: Arc<AtomicU64>,
     control: ExecutionControl,
@@ -85,6 +86,7 @@ fn send_event(sender: Sender<JobEvent>, event: JobEvent) {
 pub struct ExecutionScheduler {
     shared: Arc<(Mutex<Queue>, Condvar)>,
     frame_rate: FrameRate,
+    silence_capability: crate::SilenceCapability,
     pending: Arc<AtomicU64>,
     handle: Option<JoinHandle<()>>,
 }
@@ -93,6 +95,7 @@ impl ExecutionScheduler {
     /// Starts a dedicated thread for one `WindowDecoder` instance.
     pub fn spawn<D: WindowDecoder + Send + 'static>(mut decoder: D) -> Self {
         let frame_rate = decoder.frame_rate();
+        let silence_capability = decoder.silence_capability();
         let shared = Arc::new((Mutex::new(Queue::default()), Condvar::new()));
         let scheduler_shared = Arc::clone(&shared);
         let pending = Arc::new(AtomicU64::new(0));
@@ -163,6 +166,7 @@ impl ExecutionScheduler {
         Self {
             shared,
             frame_rate,
+            silence_capability,
             pending,
             handle: Some(handle),
         }
@@ -182,6 +186,7 @@ impl ExecutionScheduler {
         ScheduledRecognizerParts {
             shared: Arc::clone(&self.shared),
             frame_rate: self.frame_rate,
+            silence_capability: self.silence_capability,
             priority,
             pending: Arc::clone(&self.pending),
             control,
@@ -258,6 +263,7 @@ fn stop_after_panic(shared: &Arc<(Mutex<Queue>, Condvar)>, pending: &AtomicU64) 
 pub struct ScheduledRecognizer {
     shared: Arc<(Mutex<Queue>, Condvar)>,
     frame_rate: FrameRate,
+    silence_capability: crate::SilenceCapability,
     priority: Priority,
     pending: Arc<AtomicU64>,
     control: ExecutionControl,
@@ -268,6 +274,7 @@ impl ScheduledRecognizer {
         Self {
             shared: parts.shared,
             frame_rate: parts.frame_rate,
+            silence_capability: parts.silence_capability,
             priority: parts.priority,
             pending: parts.pending,
             control: parts.control,
@@ -316,6 +323,10 @@ impl ScheduledRecognizer {
 }
 
 impl WindowDecoder for ScheduledRecognizer {
+    fn silence_capability(&self) -> crate::SilenceCapability {
+        self.silence_capability
+    }
+
     fn frame_rate(&self) -> FrameRate {
         self.frame_rate
     }
@@ -445,6 +456,9 @@ mod tests {
     }
 
     impl WindowDecoder for BlockingFake {
+        fn silence_capability(&self) -> crate::SilenceCapability {
+            crate::SilenceCapability::LegacyBlank
+        }
         fn frame_rate(&self) -> FrameRate {
             FrameRate::new(25.0).expect("test frame rate is valid")
         }
@@ -465,6 +479,75 @@ mod tests {
             }
             decoded(marker)
         }
+    }
+
+    #[test]
+    fn scheduler_drop_waits_for_physical_decode_before_releasing_decoder() {
+        struct ObservedDecoder {
+            inner: BlockingFake,
+            dropped: SyncSender<()>,
+        }
+        impl WindowDecoder for ObservedDecoder {
+            fn silence_capability(&self) -> crate::SilenceCapability {
+                self.inner.silence_capability()
+            }
+            fn frame_rate(&self) -> FrameRate {
+                self.inner.frame_rate()
+            }
+            fn decode(&mut self, features: FeatureMatrixView<'_>) -> Result<Decoded, String> {
+                self.inner.decode(features)
+            }
+        }
+        impl Drop for ObservedDecoder {
+            fn drop(&mut self) {
+                self.dropped
+                    .send(())
+                    .expect("the test observes decoder destruction");
+            }
+        }
+        let (started_tx, started_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let (dropped_tx, dropped_rx) = mpsc::sync_channel(1);
+        let scheduler = ExecutionScheduler::spawn(ObservedDecoder {
+            inner: BlockingFake {
+                log: Arc::new(Mutex::new(Vec::new())),
+                first_started: started_tx,
+                release_first: release_rx,
+            },
+            dropped: dropped_tx,
+        });
+        let mut channel = scheduler.window_channel(ExecutionControl::without_deadline());
+        let decode = thread::spawn(move || channel.decode(features(1).view()));
+        started_rx.recv().expect("decode starts before shutdown");
+        let (done_tx, done_rx) = mpsc::sync_channel(1);
+        let shutdown = thread::spawn(move || {
+            drop(scheduler);
+            done_tx
+                .send(())
+                .expect("the test observes scheduler shutdown");
+        });
+        assert!(matches!(
+            done_rx.recv_timeout(Duration::from_millis(50)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        assert!(matches!(
+            dropped_rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        release_tx
+            .send(())
+            .expect("the test releases native-like work");
+        decode
+            .join()
+            .expect("decode thread must finish")
+            .expect("decode must succeed");
+        done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("scheduler must join the completed worker");
+        dropped_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("decoder must drop after work completes");
+        shutdown.join().expect("shutdown thread must finish");
     }
 
     #[test]
@@ -645,6 +728,9 @@ mod tests {
     }
 
     impl WindowDecoder for PanicAfterRelease {
+        fn silence_capability(&self) -> crate::SilenceCapability {
+            crate::SilenceCapability::LegacyBlank
+        }
         fn frame_rate(&self) -> FrameRate {
             FrameRate::new(25.0).expect("test frame rate is valid")
         }
@@ -752,6 +838,9 @@ mod tests {
     fn ordinary_routing_preserves_the_decoder_frame_rate_and_result() {
         struct Fake;
         impl WindowDecoder for Fake {
+            fn silence_capability(&self) -> crate::SilenceCapability {
+                crate::SilenceCapability::LegacyBlank
+            }
             fn frame_rate(&self) -> FrameRate {
                 FrameRate::new(50.0).expect("test frame rate is valid")
             }
@@ -769,5 +858,49 @@ mod tests {
             .expect("ordinary scheduled decoding must return its result");
         assert_eq!(decoded.output_frames(), 7);
         assert_eq!(scheduler.frame_rate().get(), 50.0);
+    }
+}
+
+#[cfg(test)]
+mod capability_tests {
+    use super::ExecutionScheduler;
+    use crate::{Decoded, ExecutionControl, FrameRate, SilenceCapability, WindowDecoder};
+    use gigaam_audio::FeatureMatrixView;
+
+    struct Declared(SilenceCapability);
+    impl WindowDecoder for Declared {
+        fn silence_capability(&self) -> SilenceCapability {
+            self.0
+        }
+        fn frame_rate(&self) -> FrameRate {
+            FrameRate::new(25.0).expect("valid rate")
+        }
+        fn decode(&mut self, _: FeatureMatrixView<'_>) -> Result<Decoded, String> {
+            Err("not invoked".into())
+        }
+    }
+    #[test]
+    fn box_and_both_scheduler_channels_preserve_each_declaration() {
+        for capability in [
+            SilenceCapability::LegacyBlank,
+            SilenceCapability::TokenAbsence,
+            SilenceCapability::Unknown,
+        ] {
+            let boxed: Box<dyn WindowDecoder> = Box::new(Declared(capability));
+            assert_eq!(boxed.silence_capability(), capability);
+            let scheduler = ExecutionScheduler::spawn(Declared(capability));
+            assert_eq!(
+                scheduler
+                    .window_channel(ExecutionControl::without_deadline())
+                    .silence_capability(),
+                capability
+            );
+            assert_eq!(
+                scheduler
+                    .tick_channel(ExecutionControl::without_deadline())
+                    .silence_capability(),
+                capability
+            );
+        }
     }
 }

@@ -101,6 +101,9 @@ mod tests {
     struct IdleDecoder;
 
     impl WindowDecoder for IdleDecoder {
+        fn silence_capability(&self) -> gigaam_recognition::SilenceCapability {
+            gigaam_recognition::SilenceCapability::LegacyBlank
+        }
         fn frame_rate(&self) -> FrameRate {
             FrameRate::new(25.0).expect("the health probe test decoder frame rate is positive")
         }
@@ -119,6 +122,9 @@ mod tests {
     struct PanicDecoder;
 
     impl WindowDecoder for PanicDecoder {
+        fn silence_capability(&self) -> gigaam_recognition::SilenceCapability {
+            gigaam_recognition::SilenceCapability::LegacyBlank
+        }
         fn frame_rate(&self) -> FrameRate {
             FrameRate::new(25.0).expect("the health probe test decoder frame rate is positive")
         }

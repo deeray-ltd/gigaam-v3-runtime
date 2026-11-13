@@ -11,29 +11,21 @@
 
 use gigaam_audio::{FrontendMode, FrontendProcessor};
 use gigaam_model_package::ModelPackage;
-use gigaam_recognition::{Device, OrtConfig, ProviderPlan, init_runtime};
+use gigaam_recognition::{Device, NativeRuntime, OrtConfig, ProviderPlan, init_runtime};
 use std::path::PathBuf;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 #[path = "../../../../tests/support/mod.rs"]
 mod external_artifacts;
 
 pub use external_artifacts::external_artifact_root as root;
 
-pub fn init_ort() {
-    static INIT: OnceLock<Result<(), String>> = OnceLock::new();
-    let result = INIT.get_or_init(|| {
-        let value = std::env::var("ORT_DYLIB_PATH").map_err(|error| {
-            format!("ORT_DYLIB_PATH must name the ONNX Runtime library: {error}")
-        })?;
-        if value.is_empty() {
-            return Err("ORT_DYLIB_PATH must not be empty".into());
-        }
-        init_runtime(&PathBuf::from(value))
-    });
-    if let Err(error) = result {
-        panic!("initialize ORT: {error}");
-    }
+/// Initializes the one scoped environment owned by a model-backed test suite.
+pub fn init_ort() -> NativeRuntime {
+    let value =
+        std::env::var("ORT_DYLIB_PATH").expect("ORT_DYLIB_PATH must name the ONNX Runtime library");
+    assert!(!value.is_empty(), "ORT_DYLIB_PATH must not be empty");
+    init_runtime(&PathBuf::from(value)).expect("the ORT environment must initialize")
 }
 
 pub fn frontend(pack: &ModelPackage) -> Arc<FrontendProcessor> {

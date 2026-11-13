@@ -340,8 +340,12 @@ pub(crate) struct RnntDecoder {
     frame_rate: FrameRate,
 }
 
-fn head_session(path: &Path, plan: &ProviderPlan) -> Result<Session, String> {
-    let mut builder = Session::builder().map_err(|error| error.to_string())?;
+fn head_session(
+    path: &Path,
+    runtime: &crate::NativeRuntime,
+    plan: &ProviderPlan,
+) -> Result<Session, String> {
+    let mut builder = Session::builder(runtime.environment()).map_err(|error| error.to_string())?;
     if let Some(threads) = plan.config.intra_threads {
         builder = builder
             .with_intra_threads(threads.get())
@@ -404,17 +408,18 @@ impl RnntDecoder {
     /// Creates an RNN-T decoder; `precision` applies to the encoder only.
     pub(crate) fn from_pack(
         pack: &ModelPackage,
-        plan: &ProviderPlan,
+        context: (&crate::NativeRuntime, &ProviderPlan),
         precision: EncoderPrecision,
         full_fp16: bool,
     ) -> Result<Self, String> {
+        let (runtime, plan) = context;
         if !full_fp16 && precision == EncoderPrecision::Fp16 {
             return Err("native FP16 encoder requires FP16 RNN-T heads".into());
         }
         if full_fp16 && plan.device() == Device::Cpu {
             return Err("full RNN-T FP16 requires CUDA or TensorRT".into());
         }
-        let encoder = OrtEncoder::rnnt(pack, plan, precision)?;
+        let encoder = OrtEncoder::rnnt(pack, runtime, plan, precision)?;
         let assets = pack
             .rnnt_assets(if full_fp16 {
                 precision
@@ -422,8 +427,8 @@ impl RnntDecoder {
                 EncoderPrecision::Fp32
             })
             .map_err(|error| error.to_string())?;
-        let prediction = head_session(assets.decoder().path(), plan)?;
-        let joint = head_session(assets.joint().path(), plan)?;
+        let prediction = head_session(assets.decoder().path(), runtime, plan)?;
+        let joint = head_session(assets.joint().path(), runtime, plan)?;
         let vocabulary = assets
             .load_vocabulary()
             .map_err(|error| error.to_string())?;
@@ -485,6 +490,10 @@ impl RnntDecoder {
 }
 
 impl WindowDecoder for RnntDecoder {
+    fn silence_capability(&self) -> crate::SilenceCapability {
+        crate::SilenceCapability::TokenAbsence
+    }
+
     fn frame_rate(&self) -> FrameRate {
         self.frame_rate
     }

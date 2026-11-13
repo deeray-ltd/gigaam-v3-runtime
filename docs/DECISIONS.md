@@ -59,10 +59,15 @@ failure order, reuse, and testability ambiguous.
 **Decision.** Service and CLI parse their own arguments and environment once. They bind
 time-based application configuration to Audio's validated model sample rate before
 initializing the runtime. Audio owns frontend modes; Transcription owns observation ports;
-neither reads process environment or writes process streams.
+neither reads process environment or writes process streams. Recognition returns an owned
+native runtime capability; direct session constructors accept it explicitly. Service retains
+it for lazy VAD, and native sessions keep their environment alive through their actual
+lifetimes. Post-initialization Service errors unwind owned work before terminal exit.
 
 **Cost.** Startup has a strict validation order and refuses invalid inputs early. A caller
-cannot rely on a hidden default after providing an invalid value.
+cannot rely on a hidden default after providing an invalid value. Library callers must pass
+the returned native runtime to recognizer, encoder and VAD constructors, and keep an owner
+while they may construct further sessions.
 
 ## 5. Validate audio at the boundary
 
@@ -181,3 +186,18 @@ Grouping can process more audio than independent spans, and it does not guarante
 for short or quiet speech or correct CTC acoustic timestamps. Revisit the decision if its
 source-time or grouping invariants fail, representative recognition quality regresses, or
 comparable evidence supports a better bounded approach.
+
+## Decoder silence meaning and streaming acoustic time
+
+**Context.** RNN-T token absence is not acoustic silence, and a VAD window alone cannot
+measure a silence threshold longer than that window.
+
+**Decision.** Require each `WindowDecoder` implementor to declare its immutable silence
+capability. Preserve legacy CTC blank and VAD behavior. Other capabilities use bounded,
+independent VAD windows and accumulate only previously unobserved source samples; overlapping
+context cannot reclassify already accepted observations. Manual core sessions have no automatic
+endpoint and commit on flush. Public process selectors remain separately defined.
+
+**Cost.** Existing downstream decoder implementations must declare their capability. VAD
+classifications may depend on the independent window context; sample accounting does not imply
+partition-invariant model output.

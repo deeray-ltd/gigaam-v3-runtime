@@ -12,7 +12,7 @@
 use crate::admission::{RequestBodyLimit, ServiceAdmission};
 use gigaam_audio::{FrontendProcessor, SampleRate};
 use gigaam_model_package::ModelPackage;
-use gigaam_recognition::{Device, ExecutionScheduler};
+use gigaam_recognition::{Device, ExecutionScheduler, NativeRuntime};
 use gigaam_transcription::{BatchConfig, ObservationMode, PadPolicy, StreamConfig};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -29,6 +29,8 @@ pub struct ServiceCapabilitiesParameters {
     pub frontend: Arc<FrontendProcessor>,
     pub ctc: Arc<ExecutionScheduler>,
     pub rnnt: Option<Arc<ExecutionScheduler>>,
+    /// Runtime required for lazily constructed native VAD sessions.
+    pub native_runtime: Option<NativeRuntime>,
     pub provider: Device,
     /// Intra-op thread count applied to every ONNX Runtime session this application constructs
     /// lazily after startup, such as a per-connection VAD session. `None` keeps the library
@@ -42,11 +44,18 @@ pub struct ServiceCapabilities {
     pub(crate) frontend: Arc<FrontendProcessor>,
     pub(crate) ctc: Arc<ExecutionScheduler>,
     pub(crate) rnnt: Option<Arc<ExecutionScheduler>>,
+    pub(crate) native_runtime: Option<NativeRuntime>,
     pub(crate) provider: Device,
     pub(crate) intra_threads: Option<NonZeroUsize>,
 }
 
 impl ServiceCapabilities {
+    pub(crate) fn native_runtime(&self) -> Result<&NativeRuntime, String> {
+        self.native_runtime
+            .as_ref()
+            .ok_or_else(|| "native runtime capability is required for VAD".to_owned())
+    }
+
     /// Validates that the supplied frontend and model package describe the same model-rate input.
     pub fn new(parameters: ServiceCapabilitiesParameters) -> Result<Self, String> {
         let ServiceCapabilitiesParameters {
@@ -55,6 +64,7 @@ impl ServiceCapabilities {
             ctc,
             rnnt,
             provider,
+            native_runtime,
             intra_threads,
         } = parameters;
         let package_rate = model_sample_rate(pack.frontend().sample_rate())?;
@@ -67,6 +77,7 @@ impl ServiceCapabilities {
             ctc,
             rnnt,
             provider,
+            native_runtime,
             intra_threads,
         })
     }
