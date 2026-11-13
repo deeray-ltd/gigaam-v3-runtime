@@ -215,3 +215,8 @@ real-provider acceptance, a published image, or a stable pre-1.0 protocol. Those
 are not established by the current implementation and are not part of its public contract.
 Deferred product work and what unlocks it is recorded in [ROADMAP.md](ROADMAP.md);
 real-provider acceptance and image publication are release steps outside that document.
+
+Recognition decoders declare an immutable silence-mask capability. Transcription admits the
+legacy blank heuristic only for decoders declaring it; non-legacy VAD sessions accumulate
+newly observed source samples across bounded windows. Core manual sessions commit on flush.
+The process adapters expose only the endpoint selectors listed in the API documentation.

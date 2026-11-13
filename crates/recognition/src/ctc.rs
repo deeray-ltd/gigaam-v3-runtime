@@ -306,6 +306,10 @@ impl<E: Encoder> CtcDecoder<E> {
 }
 
 impl<E: Encoder> WindowDecoder for CtcDecoder<E> {
+    fn silence_capability(&self) -> crate::SilenceCapability {
+        crate::SilenceCapability::LegacyBlank
+    }
+
     fn frame_rate(&self) -> FrameRate {
         self.frame_rate
     }

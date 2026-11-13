@@ -488,6 +488,7 @@ impl StreamChannelFactory for ServiceStreamChannelFactory {
         let control = ExecutionControl::without_deadline();
         let decoder = self.scheduler.tick_channel(control.clone());
         let detector = match config.endpoint_source() {
+            EndpointSource::Manual => EndpointDetector::Manual,
             EndpointSource::Blank => EndpointDetector::Blank,
             EndpointSource::Vad => {
                 EndpointDetector::Vad(Vad::from_pack(&self.pack, self.intra_threads)?)
@@ -1341,6 +1342,9 @@ mod tests {
     struct RefusalPathDecoder;
 
     impl WindowDecoder for RefusalPathDecoder {
+        fn silence_capability(&self) -> gigaam_recognition::SilenceCapability {
+            gigaam_recognition::SilenceCapability::LegacyBlank
+        }
         fn frame_rate(&self) -> FrameRate {
             FrameRate::new(25.0).expect("the controlled refusal decoder frame rate is positive")
         }
@@ -1384,6 +1388,9 @@ mod tests {
     struct WarmupSucceedsDecoder;
 
     impl WindowDecoder for WarmupSucceedsDecoder {
+        fn silence_capability(&self) -> gigaam_recognition::SilenceCapability {
+            gigaam_recognition::SilenceCapability::LegacyBlank
+        }
         fn frame_rate(&self) -> FrameRate {
             FrameRate::new(25.0).expect("the controlled warmup decoder frame rate is positive")
         }
@@ -3374,6 +3381,9 @@ mod tests {
     }
 
     impl WindowDecoder for SerializerDecoder {
+        fn silence_capability(&self) -> gigaam_recognition::SilenceCapability {
+            gigaam_recognition::SilenceCapability::LegacyBlank
+        }
         fn frame_rate(&self) -> FrameRate {
             FrameRate::new(100.0).expect("the fixed serializer decoder frame rate is positive")
         }

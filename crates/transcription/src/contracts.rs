@@ -589,6 +589,8 @@ pub enum StreamEvent {
 /// The endpoint source selected by a process adapter.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EndpointSource {
+    /// Disable automatic endpointing; flush commits the remaining words.
+    Manual,
     Blank,
     Vad,
 }
@@ -1299,6 +1301,9 @@ mod tests {
     struct BlankHistoryDetector;
 
     impl WindowDecoder for HistoryDecoder {
+        fn silence_capability(&self) -> gigaam_recognition::SilenceCapability {
+            gigaam_recognition::SilenceCapability::LegacyBlank
+        }
         fn frame_rate(&self) -> FrameRate {
             FrameRate::new(8.0).expect("the fixed history decoder frame rate is positive")
         }

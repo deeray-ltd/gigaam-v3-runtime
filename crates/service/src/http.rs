@@ -1790,6 +1790,9 @@ mod tests {
     struct TerminalDecoder;
 
     impl WindowDecoder for TerminalDecoder {
+        fn silence_capability(&self) -> gigaam_recognition::SilenceCapability {
+            gigaam_recognition::SilenceCapability::LegacyBlank
+        }
         fn frame_rate(&self) -> FrameRate {
             FrameRate::new(25.0).expect("the controlled terminal decoder frame rate is valid")
         }
@@ -2108,6 +2111,9 @@ mod tests {
     }
 
     impl WindowDecoder for ControlledDecoder {
+        fn silence_capability(&self) -> gigaam_recognition::SilenceCapability {
+            gigaam_recognition::SilenceCapability::LegacyBlank
+        }
         fn frame_rate(&self) -> FrameRate {
             FrameRate::new(100.0).expect("the controlled decoder frame rate is valid")
         }
