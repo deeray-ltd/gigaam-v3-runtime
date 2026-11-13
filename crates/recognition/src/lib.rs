@@ -18,6 +18,7 @@ mod scheduler;
 
 mod assembly;
 pub mod ctc;
+pub mod ctc_beam;
 mod ort_assignment;
 mod ort_encoder;
 mod ort_rnnt;
