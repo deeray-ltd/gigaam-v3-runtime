@@ -650,6 +650,9 @@ mod tests {
     }
 
     impl WindowDecoder for FrameRateProbe {
+        fn silence_capability(&self) -> gigaam_recognition::SilenceCapability {
+            gigaam_recognition::SilenceCapability::LegacyBlank
+        }
         fn frame_rate(&self) -> FrameRate {
             self.frame_rate_calls.fetch_add(1, Ordering::SeqCst);
             FrameRate::new(8.0).expect("test decoder frame rate is positive")
@@ -680,6 +683,9 @@ mod tests {
     }
 
     impl WindowDecoder for DeterministicDecoder {
+        fn silence_capability(&self) -> gigaam_recognition::SilenceCapability {
+            gigaam_recognition::SilenceCapability::LegacyBlank
+        }
         fn frame_rate(&self) -> FrameRate {
             FrameRate::new(8.0).expect("test decoder frame rate is positive")
         }
@@ -710,6 +716,9 @@ mod tests {
     }
 
     impl WindowDecoder for EvidenceDecoder {
+        fn silence_capability(&self) -> gigaam_recognition::SilenceCapability {
+            gigaam_recognition::SilenceCapability::LegacyBlank
+        }
         fn frame_rate(&self) -> FrameRate {
             FrameRate::new(8.0).expect("test decoder frame rate is positive")
         }
@@ -884,6 +893,9 @@ mod tests {
     struct FeatureRecorder(Arc<Mutex<Vec<Vec<f32>>>>);
 
     impl WindowDecoder for FeatureRecorder {
+        fn silence_capability(&self) -> gigaam_recognition::SilenceCapability {
+            gigaam_recognition::SilenceCapability::LegacyBlank
+        }
         fn frame_rate(&self) -> FrameRate {
             FrameRate::new(8.0).expect("test decoder frame rate is positive")
         }
@@ -1525,6 +1537,9 @@ mod tests {
         use gigaam_recognition::ScoreDetail;
         struct ScoredDecoder(f32);
         impl WindowDecoder for ScoredDecoder {
+            fn silence_capability(&self) -> gigaam_recognition::SilenceCapability {
+                gigaam_recognition::SilenceCapability::LegacyBlank
+            }
             fn frame_rate(&self) -> FrameRate {
                 match FrameRate::new(50.0) {
                     Ok(rate) => rate,

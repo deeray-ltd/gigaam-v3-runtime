@@ -111,6 +111,13 @@ impl DirectRecognizer {
 }
 
 impl WindowDecoder for DirectRecognizer {
+    fn silence_capability(&self) -> crate::SilenceCapability {
+        match &self.0 {
+            Implementation::Ctc { decoder, .. } => decoder.silence_capability(),
+            Implementation::Rnnt(decoder) => decoder.silence_capability(),
+        }
+    }
+
     fn frame_rate(&self) -> FrameRate {
         match &self.0 {
             Implementation::Ctc { decoder, .. } => decoder.frame_rate(),

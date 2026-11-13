@@ -485,6 +485,10 @@ impl RnntDecoder {
 }
 
 impl WindowDecoder for RnntDecoder {
+    fn silence_capability(&self) -> crate::SilenceCapability {
+        crate::SilenceCapability::TokenAbsence
+    }
+
     fn frame_rate(&self) -> FrameRate {
         self.frame_rate
     }

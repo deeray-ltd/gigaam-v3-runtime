@@ -84,6 +84,7 @@ pub(crate) fn run(invocation: StreamInvocation) -> Result<(), String> {
         .map_err(|error| format!("batch transcription: {error}"))?;
     let decoder = batch_transcriber.into_decoder();
     let detector = match config.endpoint_source() {
+        gigaam_transcription::EndpointSource::Manual => EndpointDetector::Manual,
         gigaam_transcription::EndpointSource::Blank => EndpointDetector::Blank,
         gigaam_transcription::EndpointSource::Vad => EndpointDetector::Vad(
             composition::vad(&package, runtime.plan().intra_threads())

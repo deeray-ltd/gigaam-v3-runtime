@@ -14,7 +14,7 @@ use crate::contracts::{
     StreamConfig, StreamEvent, StreamLockPolicy, StreamWord, TranscriptWord, WordFinality,
     WordStability, WordsEvent, checkpoint,
 };
-use crate::endpoint::{Endpoint, SpeechState, detect};
+use crate::endpoint::{AcousticEndpointState, Endpoint, SpeechState, detect};
 use crate::padding::pad_noise;
 use crate::stitch::{Window, WindowWords, seam, stitch_aligned};
 use crate::text::normalize_word;
@@ -23,12 +23,15 @@ use gigaam_audio::{
 };
 use gigaam_primitives::{trunc_f32_to_usize, usize_to_f32};
 use gigaam_recognition::vad::{VAD_FPS, VAD_SR, mask};
-use gigaam_recognition::{ExecutionControl, FrameRate, SpeechProbabilityDetector, WindowDecoder};
+use gigaam_recognition::{
+    ExecutionControl, FrameRate, SilenceCapability, SpeechProbabilityDetector, WindowDecoder,
+};
 use std::sync::Arc;
 use std::time::Instant;
 
 /// The explicitly selected endpoint capability for a streaming session.
 pub enum EndpointDetector<D> {
+    Manual,
     Blank,
     Vad(D),
 }
@@ -48,6 +51,9 @@ pub struct StreamSession<D: WindowDecoder, V: SpeechProbabilityDetector> {
     frontend: Arc<FrontendProcessor>,
     decoder: D,
     detector: EndpointDetector<V>,
+    acoustic: AcousticEndpointState,
+    acoustic_mode: bool,
+    buffer_start_sample: usize,
     control: ExecutionControl,
     sample_rate: usize,
     frame_rate: FrameRate,
@@ -125,7 +131,12 @@ impl<D: WindowDecoder, V: SpeechProbabilityDetector> StreamSession<D, V> {
         }
         let sample_rate = config.sample_rate().as_usize()?;
         match (config.endpoint_source(), &detector) {
-            (EndpointSource::Blank, EndpointDetector::Blank) => {}
+            (EndpointSource::Manual, EndpointDetector::Manual) => {}
+            (EndpointSource::Blank, EndpointDetector::Blank) => {
+                if decoder.silence_capability() != SilenceCapability::LegacyBlank {
+                    return Err("decoder does not support blank stream endpointing".into());
+                }
+            }
             (EndpointSource::Vad, EndpointDetector::Vad(_)) => {
                 if sample_rate != VAD_SR {
                     return Err(format!(
@@ -133,8 +144,7 @@ impl<D: WindowDecoder, V: SpeechProbabilityDetector> StreamSession<D, V> {
                     ));
                 }
             }
-            (EndpointSource::Blank, EndpointDetector::Vad(_))
-            | (EndpointSource::Vad, EndpointDetector::Blank) => {
+            _ => {
                 return Err(
                     "stream endpoint configuration does not match its injected detector".into(),
                 );
@@ -154,11 +164,15 @@ impl<D: WindowDecoder, V: SpeechProbabilityDetector> StreamSession<D, V> {
         let mel_bins = frontend.mel_bins();
         let fft_length = frontend.fft_length();
         let frame_rate = decoder.frame_rate();
+        let acoustic_mode = decoder.silence_capability() != SilenceCapability::LegacyBlank;
         Ok(Self {
             config,
             frontend,
             decoder,
             detector,
+            acoustic: AcousticEndpointState::default(),
+            acoustic_mode,
+            buffer_start_sample: 0,
             control,
             sample_rate,
             frame_rate,
@@ -443,6 +457,10 @@ impl<D: WindowDecoder, V: SpeechProbabilityDetector> StreamSession<D, V> {
         let dropped = length
             .checked_sub(retain)
             .ok_or_else(|| "stream retained sample count exceeds its buffer".to_owned())?;
+        self.buffer_start_sample = self
+            .buffer_start_sample
+            .checked_add(dropped)
+            .ok_or("stream source position overflows")?;
         self.start_time += usize_to_f32(dropped) / usize_to_f32(self.sample_rate);
         self.buffer.drain(..dropped);
         self.mel.copy_from_slice(&self.noise_mel);
@@ -512,6 +530,21 @@ impl<D: WindowDecoder, V: SpeechProbabilityDetector> StreamSession<D, V> {
         let mut events = Vec::new();
         let length = self.buffer.len();
         if length == 0 {
+            if progress == StreamProgress::Flush
+                && (self.acoustic_mode || matches!(self.detector, EndpointDetector::Manual))
+            {
+                if let Some(previous) = self.previous.take() {
+                    self.commit(previous.words());
+                }
+                self.emit(
+                    &[],
+                    self.now(),
+                    Some(FinalReason::ForcedOrLocked),
+                    &mut events,
+                )?;
+                self.acoustic.clear_turn();
+                self.cut_time = self.start_time;
+            }
             return Ok(events);
         }
         let length_seconds = usize_to_f32(length) / usize_to_f32(self.sample_rate);
@@ -543,21 +576,36 @@ impl<D: WindowDecoder, V: SpeechProbabilityDetector> StreamSession<D, V> {
         } else {
             SpeechState::Absent
         };
+        let mut acoustic = self.acoustic;
         let endpoint = match &mut self.detector {
             EndpointDetector::Vad(detector) => {
                 let audio = ChannelAudioView::new(&self.buffer)?;
                 checkpoint(&self.control)?;
                 let probabilities = detector.probabilities(audio)?;
                 checkpoint(&self.control)?;
-                let silence_mask = mask(&probabilities, self.config.vad_threshold().get())?;
-                detect(
-                    self.config.rules(),
-                    &silence_mask,
-                    silence_mask.len(),
-                    VAD_FPS,
-                    speech_state,
-                )?
+                if self.acoustic_mode {
+                    let (next, endpoint) = acoustic.observe_window(
+                        self.buffer_start_sample,
+                        length,
+                        &probabilities,
+                        self.config.vad_threshold().get(),
+                        self.config.rules(),
+                        self.sample_rate,
+                    )?;
+                    acoustic = next;
+                    endpoint
+                } else {
+                    let silence_mask = mask(&probabilities, self.config.vad_threshold().get())?;
+                    detect(
+                        self.config.rules(),
+                        &silence_mask,
+                        silence_mask.len(),
+                        VAD_FPS,
+                        speech_state,
+                    )?
+                }
             }
+            EndpointDetector::Manual => Endpoint::None,
             EndpointDetector::Blank => detect(
                 self.config.rules(),
                 &silence,
@@ -566,7 +614,9 @@ impl<D: WindowDecoder, V: SpeechProbabilityDetector> StreamSession<D, V> {
                 speech_state,
             )?,
         };
+        checkpoint(&self.control)?;
         self.commit_decode(accounting)?;
+        self.acoustic = acoustic;
         self.current = words;
         let full = length >= self.full_samples;
         let resolves_seam = match progress {
@@ -595,6 +645,15 @@ impl<D: WindowDecoder, V: SpeechProbabilityDetector> StreamSession<D, V> {
         }
         let open = self.open_line()?;
         match progress {
+            StreamProgress::Flush
+                if self.acoustic_mode || matches!(self.detector, EndpointDetector::Manual) =>
+            {
+                self.commit(&open);
+                self.emit(&[], now, Some(FinalReason::ForcedOrLocked), &mut events)?;
+                self.reset_buffer(0)?;
+                self.acoustic.clear_turn();
+                self.cut_time = self.start_time;
+            }
             StreamProgress::Flush => match speech_state {
                 SpeechState::Present => {
                     self.commit(&open);
@@ -609,19 +668,23 @@ impl<D: WindowDecoder, V: SpeechProbabilityDetector> StreamSession<D, V> {
                 }
             },
             StreamProgress::Advance => match (endpoint, speech_state) {
-                (Endpoint::AfterSpeech, SpeechState::Present) => {
+                (Endpoint::AfterSpeech, _)
+                    if self.acoustic_mode || speech_state == SpeechState::Present =>
+                {
                     self.commit(&open);
                     self.emit(&[], now, Some(FinalReason::Endpoint), &mut events)?;
                     self.reset_buffer(self.config.retained_silence_samples().get())?;
+                    self.acoustic.clear_turn();
                     self.cut_time = self.start_time;
                 }
                 (Endpoint::NoSpeech, SpeechState::Absent)
                 | (Endpoint::NoSpeech, SpeechState::Present) => {
                     self.emit(&open, now, None, &mut events)?;
                     self.reset_buffer(self.config.retained_silence_samples().get())?;
+                    self.acoustic.clear_turn();
                     self.cut_time = self.start_time;
                 }
-                (Endpoint::AfterSpeech, SpeechState::Absent)
+                (Endpoint::AfterSpeech, _)
                 | (Endpoint::None, SpeechState::Absent)
                 | (Endpoint::None, SpeechState::Present) => {
                     if full {
@@ -665,6 +728,9 @@ mod tests {
     }
 
     impl WindowDecoder for FrameRateProbe {
+        fn silence_capability(&self) -> gigaam_recognition::SilenceCapability {
+            gigaam_recognition::SilenceCapability::LegacyBlank
+        }
         fn frame_rate(&self) -> FrameRate {
             self.frame_rate_calls.fetch_add(1, Ordering::SeqCst);
             FrameRate::new(8.0).expect("the fixed test frame rate is valid")
@@ -676,6 +742,9 @@ mod tests {
     }
 
     impl WindowDecoder for CandidateDecoder {
+        fn silence_capability(&self) -> gigaam_recognition::SilenceCapability {
+            gigaam_recognition::SilenceCapability::LegacyBlank
+        }
         fn frame_rate(&self) -> FrameRate {
             FrameRate::new(8.0).expect("the fixed test frame rate is valid")
         }
@@ -919,5 +988,299 @@ mod tests {
             assert!(session.committed().is_empty());
             assert!(session.transcript().is_empty());
         }
+    }
+}
+
+#[cfg(test)]
+mod acoustic_stream_tests {
+    use super::{EndpointDetector, StreamSession, StreamSetup};
+    use crate::{EndpointRules, EndpointSource, StreamConfig, StreamEvent};
+    use gigaam_audio::{ChannelAudio, ChannelAudioView, FeatureMatrixView, SampleRate};
+    use gigaam_recognition::{
+        Decoded, ExecutionControl, FrameRate, SilenceCapability, SpeechProbabilityDetector,
+        WindowDecoder, Word,
+    };
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    struct Decoder {
+        capability: SilenceCapability,
+        calls: Arc<AtomicUsize>,
+    }
+    impl WindowDecoder for Decoder {
+        fn silence_capability(&self) -> SilenceCapability {
+            self.capability
+        }
+        fn frame_rate(&self) -> FrameRate {
+            FrameRate::new(25.0).expect("valid rate")
+        }
+        fn decode(&mut self, features: FeatureMatrixView<'_>) -> Result<Decoded, String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Decoded::new(
+                vec![Word::new("speech".into(), 0.0, 0.01)?],
+                vec![true; features.frames()],
+                features.frames(),
+                0.0,
+            )
+        }
+    }
+    struct Wave;
+    impl SpeechProbabilityDetector for Wave {
+        fn probabilities(&mut self, audio: ChannelAudioView<'_>) -> Result<Vec<f32>, String> {
+            Ok(audio
+                .samples()
+                .chunks(512)
+                .map(|chunk| {
+                    if chunk.iter().any(|v| *v > 0.5) {
+                        1.0
+                    } else {
+                        0.0
+                    }
+                })
+                .collect())
+        }
+    }
+    fn config(source: EndpointSource) -> Result<StreamConfig, String> {
+        StreamConfig::timing_changes()
+            .with_window_sec(0.128)?
+            .with_overlap_sec(0.032)?
+            .with_step_sec(0.032)?
+            .with_keep_silence_sec(0.0)?
+            .apply(StreamConfig::checked_default(SampleRate::new(16_000)?)?)?
+            .with_endpoint_source(source)?
+            .with_rules(EndpointRules::new(0.320, 0.320)?)
+    }
+    #[test]
+    fn incompatible_blank_refuses_before_decoder_calls() -> Result<(), String> {
+        for capability in [SilenceCapability::Unknown, SilenceCapability::TokenAbsence] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            assert!(
+                StreamSession::new(StreamSetup {
+                    frontend: crate::test_support::frontend_at_sample_rate(16_000),
+                    decoder: Decoder {
+                        capability,
+                        calls: Arc::clone(&calls)
+                    },
+                    config: config(EndpointSource::Blank)?,
+                    detector: EndpointDetector::<Wave>::Blank,
+                    control: ExecutionControl::without_deadline()
+                })
+                .is_err()
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+        }
+        Ok(())
+    }
+    #[test]
+    fn acoustic_turn_crosses_windows_and_manual_flush_commits() -> Result<(), String> {
+        for capability in [SilenceCapability::Unknown, SilenceCapability::TokenAbsence] {
+            let mut session = StreamSession::new(StreamSetup {
+                frontend: crate::test_support::frontend_at_sample_rate(16_000),
+                decoder: Decoder {
+                    capability,
+                    calls: Arc::new(AtomicUsize::new(0)),
+                },
+                config: config(EndpointSource::Vad)?,
+                detector: EndpointDetector::Vad(Wave),
+                control: ExecutionControl::without_deadline(),
+            })?;
+            let events = session.push(&ChannelAudio::new(vec![1.0; 4096])?)?;
+            assert!(!events.iter().any(
+                |e| matches!(e, StreamEvent::Final(f) if f.reason() == crate::FinalReason::Endpoint)
+            ));
+            session.push(&ChannelAudio::new(vec![0.0; 5632])?)?;
+            assert_eq!(session.buffer_start_sample, 9216);
+            assert_eq!(session.buffer.len(), 512);
+        }
+        let mut session = StreamSession::new(StreamSetup {
+            frontend: crate::test_support::frontend_at_sample_rate(16_000),
+            decoder: Decoder {
+                capability: SilenceCapability::TokenAbsence,
+                calls: Arc::new(AtomicUsize::new(0)),
+            },
+            config: config(EndpointSource::Manual)?,
+            detector: EndpointDetector::<Wave>::Manual,
+            control: ExecutionControl::without_deadline(),
+        })?;
+        session.push(&ChannelAudio::new(vec![0.0; 4096])?)?;
+        session.flush()?;
+        assert!(session.buffer.is_empty());
+        assert_eq!(session.final_sent, session.committed.len());
+        assert!(!session.committed.is_empty());
+        assert!(session.flush()?.is_empty());
+        Ok(())
+    }
+    struct CancelsSecond {
+        control: ExecutionControl,
+        calls: usize,
+    }
+    impl SpeechProbabilityDetector for CancelsSecond {
+        fn probabilities(&mut self, audio: ChannelAudioView<'_>) -> Result<Vec<f32>, String> {
+            self.calls += 1;
+            if self.calls == 2 {
+                self.control.request_cancellation();
+            }
+            Ok(vec![1.0; audio.samples().len().div_ceil(512)])
+        }
+    }
+
+    #[test]
+    fn cancellation_during_nonlegacy_vad_preserves_accepted_candidate_state() -> Result<(), String>
+    {
+        for capability in [SilenceCapability::Unknown, SilenceCapability::TokenAbsence] {
+            let control = ExecutionControl::without_deadline();
+            let mut session = StreamSession::new(StreamSetup {
+                frontend: crate::test_support::frontend_at_sample_rate(16_000),
+                decoder: Decoder {
+                    capability,
+                    calls: Arc::new(AtomicUsize::new(0)),
+                },
+                config: config(EndpointSource::Vad)?,
+                detector: EndpointDetector::Vad(CancelsSecond {
+                    control: control.clone(),
+                    calls: 0,
+                }),
+                control,
+            })?;
+            session.push(&ChannelAudio::new(vec![1.0; 512])?)?;
+            let acoustic = session.acoustic;
+            let decodes = session.decodes;
+            let decode_seconds = session.decode_seconds;
+            let encoder_seconds = session.encoder_seconds;
+            let words = session.current.clone();
+            let transcript = session.transcript().to_vec();
+            assert!(session.push(&ChannelAudio::new(vec![1.0; 512])?).is_err());
+            assert_eq!(session.acoustic, acoustic);
+            assert_eq!(session.decodes, decodes);
+            assert_eq!(session.decode_seconds, decode_seconds);
+            assert_eq!(session.encoder_seconds, encoder_seconds);
+            assert_eq!(session.current, words);
+            assert_eq!(session.transcript(), transcript);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn retained_silence_does_not_retrigger_after_acoustic_endpoint() -> Result<(), String> {
+        let mut session = StreamSession::new(StreamSetup {
+            frontend: crate::test_support::frontend_at_sample_rate(16_000),
+            decoder: Decoder {
+                capability: SilenceCapability::TokenAbsence,
+                calls: Arc::new(AtomicUsize::new(0)),
+            },
+            config: StreamConfig::timing_changes()
+                .with_keep_silence_sec(0.064)?
+                .apply(config(EndpointSource::Vad)?)?,
+            detector: EndpointDetector::Vad(Wave),
+            control: ExecutionControl::without_deadline(),
+        })?;
+        session.push(&ChannelAudio::new(vec![1.0; 4096])?)?;
+        session.push(&ChannelAudio::new(vec![0.0; 5120])?)?;
+        assert_eq!(session.buffer_start_sample, 8192);
+        assert_eq!(session.buffer.len(), 1024);
+        let events = session.push(&ChannelAudio::new(vec![0.0; 512])?)?;
+        assert!(!events.iter().any(|event| matches!(event, StreamEvent::Final(final_event) if final_event.reason() == crate::FinalReason::Endpoint)));
+        assert_eq!(session.buffer_start_sample, 8192);
+        assert_eq!(session.buffer.len(), 1536);
+        Ok(())
+    }
+    struct Wordless;
+    impl WindowDecoder for Wordless {
+        fn silence_capability(&self) -> SilenceCapability {
+            SilenceCapability::TokenAbsence
+        }
+        fn frame_rate(&self) -> FrameRate {
+            FrameRate::new(25.0).expect("valid rate")
+        }
+        fn decode(&mut self, features: FeatureMatrixView<'_>) -> Result<Decoded, String> {
+            Decoded::new(
+                Vec::new(),
+                vec![true; features.frames()],
+                features.frames(),
+                0.0,
+            )
+        }
+    }
+
+    #[test]
+    fn empty_buffer_flush_commits_zero_overlap_seam_once() -> Result<(), String> {
+        for (capability, source) in [
+            (SilenceCapability::LegacyBlank, EndpointSource::Manual),
+            (SilenceCapability::TokenAbsence, EndpointSource::Manual),
+            (SilenceCapability::TokenAbsence, EndpointSource::Vad),
+        ] {
+            let mut session = StreamSession::new(StreamSetup {
+                frontend: crate::test_support::frontend_at_sample_rate(16_000),
+                decoder: Decoder {
+                    capability,
+                    calls: Arc::new(AtomicUsize::new(0)),
+                },
+                config: StreamConfig::timing_changes()
+                    .with_overlap_sec(0.0)?
+                    .apply(config(source)?)?,
+                detector: if source == EndpointSource::Vad {
+                    EndpointDetector::Vad(Wave)
+                } else {
+                    EndpointDetector::Manual
+                },
+                control: ExecutionControl::without_deadline(),
+            })?;
+            let full = session.full_samples;
+            session.push(&ChannelAudio::new(vec![1.0; full])?)?;
+            assert!(session.buffer.is_empty());
+            assert!(session.previous.is_some());
+            let clock = session.buffer_start_sample;
+            let events = session.flush()?;
+            assert!(events.iter().any(|event| matches!(event, StreamEvent::Final(final_event) if final_event.reason() == crate::FinalReason::ForcedOrLocked)));
+            assert!(session.previous.is_none());
+            assert_eq!(session.buffer_start_sample, clock);
+            assert!(session.flush()?.is_empty());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn wordless_acoustic_speech_survives_rollovers_and_closes_without_final() -> Result<(), String>
+    {
+        let mut session = StreamSession::new(StreamSetup {
+            frontend: crate::test_support::frontend_at_sample_rate(16_000),
+            decoder: Wordless,
+            config: config(EndpointSource::Vad)?.with_rules(EndpointRules::new(0.320, 0.128)?)?,
+            detector: EndpointDetector::Vad(Wave),
+            control: ExecutionControl::without_deadline(),
+        })?;
+        // A 2048-sample window with 512 samples of overlap drops 1536 per rollover.
+        // 8192 voiced samples therefore cause five rollovers, leaving 512 samples.
+        let events = session.push(&ChannelAudio::new(vec![1.0; 8192])?)?;
+        assert_eq!(session.buffer_start_sample, 7680);
+        assert_eq!(session.buffer.len(), 512);
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, StreamEvent::Final(_)))
+        );
+        // 2560 silent samples exceed the no-speech rule, but not the after-speech rule.
+        // One normal rollover has occurred, retaining the still-open acoustic turn.
+        let events = session.push(&ChannelAudio::new(vec![0.0; 2560])?)?;
+        assert_eq!(session.buffer_start_sample, 9216);
+        assert_eq!(session.buffer.len(), 1536);
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, StreamEvent::Final(_)))
+        );
+        // At 5120 silent samples the after-speech rule closes and drops the buffer.
+        let events = session.push(&ChannelAudio::new(vec![0.0; 2560])?)?;
+        assert!(session.buffer.is_empty());
+        assert_eq!(session.buffer_start_sample, 13_312);
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, StreamEvent::Final(_)))
+        );
+        assert!(session.transcript().is_empty());
+        Ok(())
     }
 }

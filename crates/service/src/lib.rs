@@ -428,6 +428,9 @@ pub(crate) mod tests {
     struct IdleDecoder;
 
     impl WindowDecoder for IdleDecoder {
+        fn silence_capability(&self) -> gigaam_recognition::SilenceCapability {
+            gigaam_recognition::SilenceCapability::LegacyBlank
+        }
         fn frame_rate(&self) -> FrameRate {
             FrameRate::new(25.0).expect("the fixed assembly decoder frame rate is positive")
         }

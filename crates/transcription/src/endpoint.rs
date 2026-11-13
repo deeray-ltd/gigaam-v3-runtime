@@ -141,6 +141,82 @@ fn validate_duration(value: f32, name: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Sample clock for the non-legacy acoustic endpoint policy.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct AcousticEndpointState {
+    observed_end: usize,
+    speech_seen: bool,
+    trailing_silent_samples: usize,
+}
+
+impl AcousticEndpointState {
+    pub(crate) fn clear_turn(&mut self) {
+        self.speech_seen = false;
+        self.trailing_silent_samples = 0;
+    }
+
+    pub(crate) fn observe_window(
+        self,
+        start: usize,
+        length: usize,
+        probabilities: &[f32],
+        threshold: f32,
+        rules: EndpointRules,
+        sample_rate: usize,
+    ) -> Result<(Self, Endpoint), String> {
+        let end = start
+            .checked_add(length)
+            .ok_or("acoustic source position overflows")?;
+        if start > self.observed_end || end < self.observed_end {
+            return Err("acoustic observation has a source coverage gap".into());
+        }
+        if probabilities.len() != length.div_ceil(512)
+            || probabilities
+                .iter()
+                .any(|p| !p.is_finite() || !(0.0..=1.0).contains(p))
+        {
+            return Err("invalid acoustic probability frames".into());
+        }
+        if end == self.observed_end {
+            return Ok((self, Endpoint::None));
+        }
+        let mut next = self;
+        for (i, probability) in probabilities.iter().enumerate() {
+            let offset = i
+                .checked_mul(512)
+                .ok_or("acoustic frame offset overflows")?;
+            let frame_start = start
+                .checked_add(offset)
+                .ok_or("acoustic frame position overflows")?;
+            let frame_end = frame_start.saturating_add(512).min(end);
+            let unseen_start = frame_start.max(self.observed_end);
+            if unseen_start >= frame_end {
+                continue;
+            }
+            if *probability >= threshold {
+                next.speech_seen = true;
+                next.trailing_silent_samples = 0;
+            } else {
+                next.trailing_silent_samples = next
+                    .trailing_silent_samples
+                    .checked_add(frame_end - unseen_start)
+                    .ok_or("acoustic silence duration overflows")?;
+            }
+        }
+        next.observed_end = end;
+        let seconds = gigaam_primitives::usize_to_f64(next.trailing_silent_samples)
+            / gigaam_primitives::usize_to_f64(sample_rate);
+        let endpoint = if next.speech_seen && seconds >= f64::from(rules.after_speech_seconds()) {
+            Endpoint::AfterSpeech
+        } else if !next.speech_seen && seconds >= f64::from(rules.without_speech_seconds()) {
+            Endpoint::NoSpeech
+        } else {
+            Endpoint::None
+        };
+        Ok((next, endpoint))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{Endpoint, EndpointRules, SpeechState, detect, segments, trailing_silence};
@@ -220,5 +296,93 @@ mod tests {
         assert!(EndpointRules::new(f32::NAN, 1.0).is_err());
         let rules = EndpointRules::default();
         assert!(detect(rules, &[], 0, 0.0, SpeechState::Absent).is_err());
+    }
+}
+
+#[cfg(test)]
+mod acoustic_tests {
+    use super::{AcousticEndpointState, Endpoint, EndpointRules};
+
+    #[test]
+    fn overlapping_frames_count_only_unseen_samples_and_cross_long_threshold() -> Result<(), String>
+    {
+        let rules = EndpointRules::new(0.03125, 0.03125)?;
+        let (state, decision) =
+            AcousticEndpointState::default().observe_window(0, 512, &[1.0], 0.5, rules, 16_384)?;
+        assert_eq!(decision, Endpoint::None);
+        let (state, decision) = state.observe_window(256, 767, &[0.0, 0.0], 0.5, rules, 16_384)?;
+        assert_eq!(decision, Endpoint::None);
+        let (state, decision) = state.observe_window(511, 513, &[1.0, 0.0], 0.5, rules, 16_384)?;
+        assert_eq!(decision, Endpoint::AfterSpeech);
+        let mut state = state;
+        state.clear_turn();
+        let (state, decision) = state.observe_window(512, 512, &[1.0], 0.5, rules, 16_384)?;
+        assert_eq!(decision, Endpoint::None);
+        let (_, decision) = state.observe_window(1024, 512, &[0.0], 0.5, rules, 16_384)?;
+        assert_eq!(decision, Endpoint::NoSpeech);
+        Ok(())
+    }
+
+    #[test]
+    fn long_silence_and_resumption_use_final_run_and_validate_input() -> Result<(), String> {
+        let rules = EndpointRules::new(0.320, 0.320)?;
+        let (mut state, _) =
+            AcousticEndpointState::default().observe_window(0, 512, &[1.0], 0.5, rules, 16_000)?;
+        for n in 1..10 {
+            let (next, decision) =
+                state.observe_window(n * 512, 512, &[0.0], 0.5, rules, 16_000)?;
+            assert_eq!(decision, Endpoint::None);
+            state = next;
+        }
+        let (next, decision) = state.observe_window(5120, 512, &[0.0], 0.5, rules, 16_000)?;
+        assert_eq!(decision, Endpoint::AfterSpeech);
+        assert!(
+            next.observe_window(6000, 1, &[0.0], 0.5, rules, 16_000)
+                .is_err()
+        );
+        assert!(
+            next.observe_window(5632, 1, &[], 0.5, rules, 16_000)
+                .is_err()
+        );
+        assert!(
+            next.observe_window(5632, 1, &[1.1], 0.5, rules, 16_000)
+                .is_err()
+        );
+        let (_, decision) = state.observe_window(5120, 1024, &[0.0, 1.0], 0.5, rules, 16_000)?;
+        assert_eq!(decision, Endpoint::None);
+        Ok(())
+    }
+    #[test]
+    fn zero_and_huge_rules_and_no_speech_carry() -> Result<(), String> {
+        let zero = EndpointRules::new(0.0, 0.0)?;
+        let (state, decision) =
+            AcousticEndpointState::default().observe_window(0, 1, &[0.0], 0.5, zero, 16_000)?;
+        assert_eq!(decision, Endpoint::NoSpeech);
+        let (_, decision) = state.observe_window(0, 1, &[0.0], 0.5, zero, 16_000)?;
+        assert_eq!(decision, Endpoint::None);
+        let (_, decision) =
+            AcousticEndpointState::default().observe_window(0, 1, &[1.0], 0.5, zero, 16_000)?;
+        assert_eq!(decision, Endpoint::AfterSpeech);
+        let huge = EndpointRules::new(f32::MAX, f32::MAX)?;
+        let (_, decision) =
+            AcousticEndpointState::default().observe_window(0, 512, &[0.0], 0.5, huge, 16_000)?;
+        assert_eq!(decision, Endpoint::None);
+        let rules = EndpointRules::new(0.320, 0.320)?;
+        let mut state = AcousticEndpointState::default();
+        for n in 0..9 {
+            let (next, decision) =
+                state.observe_window(n * 512, 512, &[0.0], 0.5, rules, 16_000)?;
+            assert_eq!(decision, Endpoint::None);
+            state = next;
+        }
+        let (mut state, decision) = state.observe_window(4608, 512, &[0.0], 0.5, rules, 16_000)?;
+        assert_eq!(decision, Endpoint::NoSpeech);
+        state.clear_turn();
+        let (state, decision) =
+            state.observe_window(4096, 1024, &[1.0, 1.0], 0.5, rules, 16_000)?;
+        assert_eq!(decision, Endpoint::None);
+        let (_, decision) = state.observe_window(4608, 1024, &[1.0, 0.0], 0.5, rules, 16_000)?;
+        assert_eq!(decision, Endpoint::None);
+        Ok(())
     }
 }

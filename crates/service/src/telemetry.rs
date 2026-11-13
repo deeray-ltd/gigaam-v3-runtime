@@ -913,6 +913,9 @@ mod tests {
     struct ObservationDecoder;
 
     impl WindowDecoder for ObservationDecoder {
+        fn silence_capability(&self) -> gigaam_recognition::SilenceCapability {
+            gigaam_recognition::SilenceCapability::LegacyBlank
+        }
         fn frame_rate(&self) -> FrameRate {
             FrameRate::new(25.0).expect("the controlled observation frame rate is positive")
         }
