@@ -48,10 +48,10 @@ pub(crate) fn run(invocation: StreamInvocation) -> Result<(), String> {
     .map_err(|error| format!("batch configuration: {error}"))?;
     let chunk = stream_chunk(invocation.chunk_milliseconds, config.sample_rate())?;
 
-    composition::initialize_runtime(&runtime)?;
+    let native = composition::initialize_runtime(&runtime)?;
     let frontend = composition::frontend_for_package(&package, frontend_mode)
         .map_err(|error| format!("frontend: {error}"))?;
-    let recognizer = composition::ctc_recognizer(&package, &runtime, invocation.precision)
+    let recognizer = composition::ctc_recognizer(&package, &runtime, &native, invocation.precision)
         .map_err(|error| format!("decoder: {error}"))?;
     projection::emit_ctc_construction_notice(&recognizer);
     projection::emit_unverified_cuda_assignment(
@@ -87,7 +87,7 @@ pub(crate) fn run(invocation: StreamInvocation) -> Result<(), String> {
         gigaam_transcription::EndpointSource::Manual => EndpointDetector::Manual,
         gigaam_transcription::EndpointSource::Blank => EndpointDetector::Blank,
         gigaam_transcription::EndpointSource::Vad => EndpointDetector::Vad(
-            composition::vad(&package, runtime.plan().intra_threads())
+            composition::vad(&package, &native, runtime.plan().intra_threads())
                 .map_err(|error| format!("vad: {error}"))?,
         ),
     };

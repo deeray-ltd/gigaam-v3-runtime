@@ -9,6 +9,7 @@
 
 //! CPU-only ONNX Runtime speech-probability execution for the selected VAD artifact.
 
+use crate::NativeRuntime;
 use crate::contracts::SpeechProbabilityDetector;
 use crate::native_output::{ExpectedCardinality, NativeOutputRole, validate_f32_output};
 use gigaam_audio::ChannelAudioView;
@@ -36,11 +37,13 @@ impl Vad {
     /// Opens the selected VAD artifact with ONNX Runtime's built-in CPU provider.
     pub fn from_pack(
         pack: &ModelPackage,
+        runtime: &NativeRuntime,
         intra_threads: Option<NonZeroUsize>,
     ) -> Result<Self, String> {
         let artifact = pack.vad_model().map_err(|error| error.to_string())?;
         let path = artifact.path();
-        let mut builder = Session::builder().map_err(|error| error.to_string())?;
+        let mut builder =
+            Session::builder(runtime.environment()).map_err(|error| error.to_string())?;
         if let Some(threads) = intra_threads {
             builder = builder
                 .with_intra_threads(threads.get())

@@ -9,7 +9,7 @@ use crate::projection;
 use gigaam_audio::{FrontendMode, FrontendProcessor, SampleRate, resample_audio};
 use gigaam_model_package::{EncoderPrecision, ModelPackage};
 use gigaam_recognition::{
-    DirectRecognizer, ExecutionControl, OrtEncoder, ProviderPlan, Vad, init_runtime,
+    DirectRecognizer, ExecutionControl, NativeRuntime, OrtEncoder, ProviderPlan, Vad, init_runtime,
 };
 use gigaam_transcription::{
     EndpointDetector, EndpointSource, OriginalChannel, StreamChannelFactory, StreamConfig,
@@ -30,7 +30,7 @@ pub(crate) fn package_sample_rate(package: &ModelPackage) -> Result<SampleRate, 
 }
 
 /// Initializes the requested dynamic ONNX Runtime library after every applicable policy check.
-pub(crate) fn initialize_runtime(runtime: &RuntimeConfig) -> Result<(), String> {
+pub(crate) fn initialize_runtime(runtime: &RuntimeConfig) -> Result<NativeRuntime, String> {
     init_runtime(runtime.dylib())
 }
 
@@ -61,23 +61,25 @@ pub(crate) fn resample_to(
 pub(crate) fn ctc_recognizer(
     package: &ModelPackage,
     runtime: &RuntimeConfig,
+    native: &NativeRuntime,
     precision: EncoderPrecision,
 ) -> Result<DirectRecognizer, String> {
-    DirectRecognizer::ctc(package, runtime.plan(), precision)
+    DirectRecognizer::ctc(package, native, runtime.plan(), precision)
 }
 
 /// Builds one exact direct RNN-T recognizer for the selected provider and precision.
 pub(crate) fn rnnt_recognizer(
     package: &ModelPackage,
-    runtime: &RuntimeConfig,
+    context: (&RuntimeConfig, &NativeRuntime),
     precision: EncoderPrecision,
     selection: Option<gigaam_recognition::RnntPrecisionSelection>,
 ) -> Result<DirectRecognizer, String> {
+    let (runtime, native) = context;
     match selection {
         Some(selection) => {
-            DirectRecognizer::rnnt_with_precision(package, runtime.plan(), selection)
+            DirectRecognizer::rnnt_with_precision(package, native, runtime.plan(), selection)
         }
-        None => DirectRecognizer::rnnt(package, runtime.plan(), precision),
+        None => DirectRecognizer::rnnt(package, native, runtime.plan(), precision),
     }
 }
 
@@ -85,23 +87,26 @@ pub(crate) fn rnnt_recognizer(
 pub(crate) fn ctc_encoder(
     package: &ModelPackage,
     runtime: &RuntimeConfig,
+    native: &NativeRuntime,
     precision: EncoderPrecision,
 ) -> Result<OrtEncoder, String> {
-    OrtEncoder::ctc(package, runtime.plan(), precision)
+    OrtEncoder::ctc(package, native, runtime.plan(), precision)
 }
 
 /// Builds the package-selected CPU-only VAD capability.
 pub(crate) fn vad(
     package: &ModelPackage,
+    native: &NativeRuntime,
     intra_threads: Option<NonZeroUsize>,
 ) -> Result<Vad, String> {
-    Vad::from_pack(package, intra_threads)
+    Vad::from_pack(package, native, intra_threads)
 }
 
 /// Creates channel-local direct-recognition stream capabilities for offline dialog execution.
 pub(crate) struct DialogStreamFactory<'a> {
     package: &'a ModelPackage,
     plan: &'a ProviderPlan,
+    native: &'a NativeRuntime,
     frontend: Arc<FrontendProcessor>,
 }
 
@@ -111,11 +116,13 @@ impl<'a> DialogStreamFactory<'a> {
         package: &'a ModelPackage,
         runtime: &'a RuntimeConfig,
         frontend: Arc<FrontendProcessor>,
+        native: &'a NativeRuntime,
     ) -> Self {
         Self {
             package,
             plan: runtime.plan(),
             frontend,
+            native,
         }
     }
 }
@@ -129,8 +136,9 @@ impl StreamChannelFactory for DialogStreamFactory<'_> {
         _channel: OriginalChannel,
         config: StreamConfig,
     ) -> Result<StreamSetup<Self::Decoder, Self::Detector>, String> {
-        let decoder = DirectRecognizer::ctc(self.package, self.plan, EncoderPrecision::Fp32)
-            .map_err(|error| format!("decoder: {error}"))?;
+        let decoder =
+            DirectRecognizer::ctc(self.package, self.native, self.plan, EncoderPrecision::Fp32)
+                .map_err(|error| format!("decoder: {error}"))?;
         projection::emit_ctc_construction_notice(&decoder);
         projection::emit_unverified_cuda_assignment(
             self.plan,
@@ -141,7 +149,7 @@ impl StreamChannelFactory for DialogStreamFactory<'_> {
             EndpointSource::Manual => EndpointDetector::Manual,
             EndpointSource::Blank => EndpointDetector::Blank,
             EndpointSource::Vad => EndpointDetector::Vad(
-                Vad::from_pack(self.package, self.plan.intra_threads())
+                Vad::from_pack(self.package, self.native, self.plan.intra_threads())
                     .map_err(|error| format!("vad: {error}"))?,
             ),
         };

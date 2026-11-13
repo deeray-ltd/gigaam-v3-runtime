@@ -482,6 +482,75 @@ mod tests {
     }
 
     #[test]
+    fn scheduler_drop_waits_for_physical_decode_before_releasing_decoder() {
+        struct ObservedDecoder {
+            inner: BlockingFake,
+            dropped: SyncSender<()>,
+        }
+        impl WindowDecoder for ObservedDecoder {
+            fn silence_capability(&self) -> crate::SilenceCapability {
+                self.inner.silence_capability()
+            }
+            fn frame_rate(&self) -> FrameRate {
+                self.inner.frame_rate()
+            }
+            fn decode(&mut self, features: FeatureMatrixView<'_>) -> Result<Decoded, String> {
+                self.inner.decode(features)
+            }
+        }
+        impl Drop for ObservedDecoder {
+            fn drop(&mut self) {
+                self.dropped
+                    .send(())
+                    .expect("the test observes decoder destruction");
+            }
+        }
+        let (started_tx, started_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let (dropped_tx, dropped_rx) = mpsc::sync_channel(1);
+        let scheduler = ExecutionScheduler::spawn(ObservedDecoder {
+            inner: BlockingFake {
+                log: Arc::new(Mutex::new(Vec::new())),
+                first_started: started_tx,
+                release_first: release_rx,
+            },
+            dropped: dropped_tx,
+        });
+        let mut channel = scheduler.window_channel(ExecutionControl::without_deadline());
+        let decode = thread::spawn(move || channel.decode(features(1).view()));
+        started_rx.recv().expect("decode starts before shutdown");
+        let (done_tx, done_rx) = mpsc::sync_channel(1);
+        let shutdown = thread::spawn(move || {
+            drop(scheduler);
+            done_tx
+                .send(())
+                .expect("the test observes scheduler shutdown");
+        });
+        assert!(matches!(
+            done_rx.recv_timeout(Duration::from_millis(50)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        assert!(matches!(
+            dropped_rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        release_tx
+            .send(())
+            .expect("the test releases native-like work");
+        decode
+            .join()
+            .expect("decode thread must finish")
+            .expect("decode must succeed");
+        done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("scheduler must join the completed worker");
+        dropped_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("decoder must drop after work completes");
+        shutdown.join().expect("shutdown thread must finish");
+    }
+
+    #[test]
     fn tick_precedes_queued_window_after_a_blocked_call() {
         let log = Arc::new(Mutex::new(Vec::new()));
         let (first_started_tx, first_started_rx) = mpsc::sync_channel(1);
