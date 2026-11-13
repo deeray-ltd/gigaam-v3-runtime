@@ -201,3 +201,13 @@ and release material describe the same behavior in more detail and do not contra
   refusal behavior agree with its declared CPU, CUDA, or TensorRT artifact identity.
 - Scope: Rust features, runtime initialization, image payloads, health state, and artifact
   verification.
+
+### STREAM-ENDPOINT-001 · Decoder silence and acoustic endpointing
+
+- Requirement: Each window decoder explicitly declares its immutable silence-mask meaning.
+  Blank endpointing admits only the legacy CTC heuristic. For other decoder meanings, VAD
+  endpointing measures newly observed source samples across overlapping windows, and manual
+  endpointing commits remaining words on flush without automatic endpoints. Invalid acoustic
+  observations and cancellation refuse before their candidate state is accepted.
+- Scope: Recognition decoder implementors and Transcription streaming sessions; process
+  adapters expose only their separately documented endpoint selectors.

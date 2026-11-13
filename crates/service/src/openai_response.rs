@@ -218,6 +218,9 @@ mod tests {
 
         struct Decoder;
         impl WindowDecoder for Decoder {
+            fn silence_capability(&self) -> gigaam_recognition::SilenceCapability {
+                gigaam_recognition::SilenceCapability::LegacyBlank
+            }
             fn frame_rate(&self) -> FrameRate {
                 match FrameRate::new(50.0) {
                     Ok(value) => value,

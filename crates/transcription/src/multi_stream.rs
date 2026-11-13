@@ -1482,6 +1482,9 @@ mod tests {
     }
 
     impl WindowDecoder for RecordingDecoder {
+        fn silence_capability(&self) -> gigaam_recognition::SilenceCapability {
+            gigaam_recognition::SilenceCapability::LegacyBlank
+        }
         fn frame_rate(&self) -> FrameRate {
             FrameRate::new(8.0).expect("the fixed test frame rate is positive")
         }

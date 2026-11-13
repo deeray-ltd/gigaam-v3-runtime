@@ -138,6 +138,7 @@ impl StreamChannelFactory for DialogStreamFactory<'_> {
             decoder.assignment_evidence(),
         );
         let detector = match config.endpoint_source() {
+            EndpointSource::Manual => EndpointDetector::Manual,
             EndpointSource::Blank => EndpointDetector::Blank,
             EndpointSource::Vad => EndpointDetector::Vad(
                 Vad::from_pack(self.package, self.plan.intra_threads())
