@@ -104,6 +104,10 @@ impl RelativeAsset {
         })
     }
 
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
     pub(crate) fn fixed(key: &'static str, value: &'static str) -> Self {
         Self {
             key,
