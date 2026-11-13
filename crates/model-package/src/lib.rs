@@ -19,6 +19,7 @@ mod compatibility;
 mod definition;
 mod error;
 mod schema;
+mod variant;
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -30,6 +31,10 @@ pub use definition::{
     VadDefinition,
 };
 pub use error::PackageError;
+pub use variant::{
+    ModelFamily, TokenizerDefinition, TokenizerKind, VariantArtifacts, VariantCtcDefinition,
+    VariantId, VariantPackage, VariantRnntDefinition,
+};
 
 use assets::validate_regular_asset;
 use definition::PackageDefinition;

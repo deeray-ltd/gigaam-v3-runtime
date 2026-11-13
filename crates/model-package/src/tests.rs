@@ -401,3 +401,194 @@ fn v2_selects_native_fp16_and_format() {
             .is_err()
     );
 }
+
+fn valid_v3(variant: &str, sentencepiece: bool, rnnt: bool) -> String {
+    let mut lines = vec![
+        "format_version=3".to_string(),
+        format!("variant={variant}"),
+        "artifact_format=onnx".into(),
+        "sample_rate=16000".into(),
+        "n_mels=64".into(),
+        "hop_length=160".into(),
+        "n_fft=320".into(),
+        "win_length=320".into(),
+        "center=false".into(),
+        "log_clamp_min=0.000000001".into(),
+        "log_clamp_max=1000000000".into(),
+        "frames_per_sec=25".into(),
+        "subsampling_factor=4".into(),
+        "frontend.window=window.f32".into(),
+        "frontend.filterbank=filter.f32".into(),
+        format!(
+            "tokenizer.kind={}",
+            if sentencepiece {
+                "sentencepiece"
+            } else {
+                "characters"
+            }
+        ),
+        "tokenizer.vocab=vocab.txt".into(),
+        "tokenizer.vocab_size=2".into(),
+        "tokenizer.blank_id=2".into(),
+    ];
+    if sentencepiece {
+        lines.push("tokenizer.model=tokenizer.model".into());
+    }
+    let family = if rnnt { "rnnt" } else { "ctc" };
+    lines.extend([
+        format!("{family}.encoder_fp32=encoder.onnx"),
+        format!("{family}.input_names=x,length"),
+        format!("{family}.output_names=y,length"),
+        format!("{family}.out_dim={}", if rnnt { 7 } else { 3 }),
+        format!("{family}.out_layout=t_d"),
+    ]);
+    if rnnt {
+        lines.extend(
+            [
+                "rnnt.decoder_fp32=decoder.onnx",
+                "rnnt.joint_fp32=joint.onnx",
+                "rnnt.pred_hidden=5",
+                "rnnt.pred_layers=2",
+                "rnnt.max_symbols_per_step=3",
+                "rnnt.decoder_inputs=x,h,c",
+                "rnnt.decoder_outputs=y,h,c",
+                "rnnt.joint_inputs=e,d",
+                "rnnt.joint_outputs=y",
+            ]
+            .into_iter()
+            .map(String::from),
+        );
+    }
+    lines.join("\n")
+}
+
+#[test]
+fn v3_variants_admit_one_family_and_selected_assets() {
+    use super::{ModelFamily, TokenizerKind, VariantId, VariantPackage};
+    for (name, sp, rnnt, id) in [
+        ("v3_ctc", false, false, VariantId::V3Ctc),
+        ("v3_rnnt", false, true, VariantId::V3Rnnt),
+        ("v3_e2e_ctc", true, false, VariantId::V3E2eCtc),
+        ("v3_e2e_rnnt", true, true, VariantId::V3E2eRnnt),
+    ] {
+        let pack = TempPack::new(&valid_v3(name, sp, rnnt));
+        let package =
+            VariantPackage::open(pack.path()).expect("valid V3 metadata opens without assets");
+        assert_eq!(package.variant(), id);
+        assert_eq!(
+            id.family(),
+            if rnnt {
+                ModelFamily::Rnnt
+            } else {
+                ModelFamily::Ctc
+            }
+        );
+        assert_eq!(
+            package.tokenizer().kind(),
+            if sp {
+                TokenizerKind::SentencePiece
+            } else {
+                TokenizerKind::Characters
+            }
+        );
+        assert!(package.encoder(EncoderPrecision::Fp32).is_err());
+        pack.write_asset("encoder.onnx", b"graph");
+        assert!(package.encoder(EncoderPrecision::Fp32).is_ok());
+        assert!(package.encoder(EncoderPrecision::Fp16).is_err());
+        pack.write_asset("vocab.txt", b" \na\n");
+        assert_eq!(
+            package.vocabulary().expect("selected vocabulary is valid"),
+            [" ", "a"]
+        );
+        pack.write_asset("vocab.txt", b" \na\nextra\n");
+        assert!(package.vocabulary().is_err());
+        if sp {
+            assert!(package.tokenizer_model().is_err());
+        } else {
+            assert!(
+                package
+                    .tokenizer_model()
+                    .expect("character tokenizer has no model")
+                    .is_none()
+            );
+        }
+        assert!(ModelPackage::open(pack.path()).is_err());
+    }
+    let legacy = TempPack::new(&valid_v1());
+    assert!(super::VariantPackage::open(legacy.path()).is_err());
+}
+
+#[test]
+fn v3_refuses_inconsistent_or_open_metadata() {
+    use super::VariantPackage;
+    let base = valid_v3("v3_ctc", false, false);
+    for invalid in [
+        base.replace("tokenizer.blank_id=2", "tokenizer.blank_id=1"),
+        base.replace("ctc.out_dim=3", "ctc.out_dim=4"),
+        base.replace("tokenizer.kind=characters", "tokenizer.kind=sentencepiece"),
+        format!("{base}\nunknown=value"),
+        format!("{base}\nvariant=v3_ctc"),
+        format!("{base}\nrnnt.encoder_fp32=x"),
+        format!("{base}\ntokenizer.model=x"),
+        base.replace("hop_length=160", "hop_length=0"),
+        base.replace(
+            "tokenizer.vocab_size=2",
+            "tokenizer.vocab_size=999999999999999999999999999999999999999",
+        ),
+        base.replace("ctc.out_layout=t_d", "ctc.out_layout=invalid"),
+        base.replace("ctc.input_names=x,length", "ctc.input_names=x,x"),
+        base.replace("ctc.encoder_fp32=encoder.onnx", ""),
+        format!("{base}\nmalformed"),
+        base.replace("frames_per_sec=25", "frames_per_sec=26"),
+        base.replace(
+            "ctc.encoder_fp32=encoder.onnx",
+            "ctc.encoder_fp32=../escape",
+        ),
+    ] {
+        let pack = TempPack::new(&invalid);
+        assert!(VariantPackage::open(pack.path()).is_err());
+    }
+    let rate = base
+        .replace("subsampling_factor=4", "subsampling_factor=3")
+        .replace("frames_per_sec=25", "frames_per_sec=33.33333206176758");
+    assert!(VariantPackage::open(TempPack::new(&rate).path()).is_ok());
+    let wrong = rate.replace("33.33333206176758", "33.33334");
+    assert!(VariantPackage::open(TempPack::new(&wrong).path()).is_err());
+}
+
+#[test]
+fn v3_rnnt_precision_requires_complete_declared_heads() {
+    use super::VariantPackage;
+    let base = valid_v3("v3_rnnt", false, true);
+    let partial = format!("{base}\nrnnt.decoder_fp16=decoder16.onnx");
+    assert!(VariantPackage::open(TempPack::new(&partial).path()).is_err());
+    let complete =
+        format!("{partial}\nrnnt.joint_fp16=joint16.onnx\nrnnt.encoder_fp16=encoder16.onnx");
+    let pack = TempPack::new(&complete);
+    let package =
+        VariantPackage::open(pack.path()).expect("complete declarations need no assets at open");
+    pack.write_asset("vocab.txt", b" \na\n");
+    pack.write_asset("decoder16.onnx", b"decoder");
+    pack.write_asset("joint16.onnx", b"joint");
+    assert!(package.rnnt_assets(EncoderPrecision::Fp16).is_ok());
+    assert!(package.encoder(EncoderPrecision::Fp16).is_err());
+    pack.write_asset("vocab.txt", b"wrong\n");
+    assert!(package.rnnt_assets(EncoderPrecision::Fp16).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn v3_selected_asset_cannot_escape_through_symlink() {
+    use std::os::unix::fs::symlink;
+    let pack = TempPack::new(&valid_v3("v3_ctc", false, false));
+    symlink(
+        pack.path()
+            .parent()
+            .expect("temporary package has a parent"),
+        pack.path().join("encoder.onnx"),
+    )
+    .expect("test symlink must be creatable");
+    let package =
+        super::VariantPackage::open(pack.path()).expect("metadata does not select an asset");
+    assert!(package.encoder(EncoderPrecision::Fp32).is_err());
+}

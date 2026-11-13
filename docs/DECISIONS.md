@@ -29,7 +29,10 @@ retained keys. V2 retains the runtime keys, requires `artifact_format=onnx|trt_e
 and makes `ctc.encoder_fp16` and `rnnt.encoder_fp16` required native-FP16 artifact paths.
 Those two keys retain their opaque meaning in V1. FP16Io32 paths retain FP32 tensor I/O.
 Parse and compatibility-check configuration before selecting assets or creating a native
-session; actual tensor/engine compatibility is checked when the session loads.
+session; actual tensor/engine compatibility is checked when the session loads. V3 is a separate
+metadata API for exactly one explicit variant, tokenizer, and family with optional VAD.
+Legacy V1/V2 remain the runtime input until a later explicit composition migration; V3
+admission alone does not establish source identity or recognition support.
 
 **Cost.** Unversioned packages refuse and a future key or changed meaning needs an explicit
 schema branch and migration. Hashes, provenance, compatibility ranges, offline verification,

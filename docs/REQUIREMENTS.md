@@ -60,11 +60,16 @@ and release material describe the same behavior in more detail and do not contra
 
 ### PACK-SCHEMA-001 · Explicit closed package schema
 
-- Requirement: `format_version` is required and selects the supported closed V1 or V2 schema.
+- Requirement: `format_version` is required and selects a supported closed schema. The legacy `ModelPackage` accepts V1 or V2; the
+  separate `VariantPackage` accepts V3 metadata only. Service and CLI still use the legacy API.
   Version 1 admits exactly 36 required entries, including 35 typed runtime keys, and eight optional opaque retained keys.
   Version 2 retains the V1 runtime keys and adds required `artifact_format=onnx|trt_ep_context`
   plus typed `ctc.encoder_fp16` and `rnnt.encoder_fp16` paths for native FP16 I/O. Those
   paths remain opaque optional metadata in V1; FP16Io32 retains FP32 I/O in both versions.
+  V3 declares one explicit variant, its matching tokenizer and one family, with optional VAD.
+  Its nonblank vocabulary count equals the external blank index; CTC classes equal count plus one.
+  Its declared frame rate must equal the frontend-derived rate at finite positive f32 precision.
+  Selected assets alone are checked for containment and regular files.
   Missing, malformed, duplicate, unknown, or unsupported configuration refuses before asset
   resolution or native-session construction. No unversioned legacy path exists; a new key or
   changed meaning needs an explicitly supported schema version and migration rule.

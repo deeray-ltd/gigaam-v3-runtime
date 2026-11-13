@@ -152,3 +152,37 @@ python scripts/prepare_gpu_model.py build-python encoder.onnx encoder.plan \
 
 Fixed-shape models do not need a profile. Parser and engine build errors stop
 preparation; this command does not fall back to another builder.
+
+
+## Version 3 single-variant metadata
+
+`VariantPackage` accepts V3 metadata for one explicit variant; the current Service and CLI
+continue to use V1/V2 and do not run V3 packages. `variant` is exactly `v3_ctc`, `v3_rnnt`,
+`v3_e2e_ctc`, or `v3_e2e_rnnt`. Base variants declare `tokenizer.kind=characters`;
+end-to-end variants declare `tokenizer.kind=sentencepiece` and require `tokenizer.model`.
+
+All V3 keys are closed. Common required keys are `format_version=3`, `variant`,
+`artifact_format`, `sample_rate`, `n_mels`, `hop_length`, `n_fft`, `win_length`, `center`,
+`log_clamp_min`, `log_clamp_max`, `frames_per_sec`, `subsampling_factor`,
+`frontend.window`, `frontend.filterbank`, `tokenizer.kind`, `tokenizer.vocab`,
+`tokenizer.vocab_size`, and `tokenizer.blank_id`. Optional keys are `vad.model`, `source`,
+and `exported`; the latter two are informational.
+
+CTC requires `ctc.encoder_fp32`, `ctc.input_names`, `ctc.output_names`, `ctc.out_dim`,
+and `ctc.out_layout`; `ctc.encoder_fp16io32` and `ctc.encoder_fp16` are optional. RNN-T
+requires `rnnt.encoder_fp32`, `rnnt.decoder_fp32`, `rnnt.joint_fp32`, `rnnt.input_names`,
+`rnnt.output_names`, `rnnt.out_dim`, `rnnt.out_layout`, `rnnt.pred_hidden`,
+`rnnt.pred_layers`, `rnnt.max_symbols_per_step`, `rnnt.decoder_inputs`,
+`rnnt.decoder_outputs`, `rnnt.joint_inputs`, and `rnnt.joint_outputs`. Its optional keys
+are `rnnt.encoder_fp16io32`, `rnnt.encoder_fp16`, `rnnt.decoder_fp16`, and
+`rnnt.joint_fp16`; the FP16 heads must be declared together. Opposite-family keys and a
+character tokenizer model are forbidden. Required paths need not exist until selected.
+
+The vocabulary contains exactly the declared number of nonempty, nonblank rows in token-ID
+order, including any literal-space row. Blank is external at that count; CTC output dimension
+is count plus one. Positive dimensions, ordered positive clamps, a window no longer than FFT,
+and the frame-rate relation are validated from declarations. The declared f64 rate and
+`sample_rate / (hop_length * subsampling_factor)` must map to the same finite positive f32.
+Native compatibility and source/tokenizer consistency need separate evidence. To migrate a
+legacy pack, export a sibling V3 package from the actual selected source and preserve all
+nonblank token indices; do not infer identity from filenames or vocabulary size.

@@ -66,41 +66,7 @@ const V1_RETAINED_KEYS: &[&str] = &[
 ];
 
 pub(crate) fn parse(text: &str) -> Result<PackageDefinition, PackageError> {
-    let mut values = BTreeMap::new();
-    let mut line_numbers = BTreeMap::new();
-    for (index, raw_line) in text.lines().enumerate() {
-        let line_number = index + 1;
-        let line = raw_line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let (raw_key, raw_value) = line.split_once('=').ok_or(PackageError::MalformedLine {
-            line: line_number,
-            reason: "expected key=value",
-        })?;
-        let key = raw_key.trim();
-        let value = raw_value.trim();
-        if key.is_empty() {
-            return Err(PackageError::MalformedLine {
-                line: line_number,
-                reason: "key is empty",
-            });
-        }
-        if value.is_empty() {
-            return Err(PackageError::MalformedLine {
-                line: line_number,
-                reason: "value is empty",
-            });
-        }
-        if values.contains_key(key) {
-            return Err(PackageError::DuplicateKey {
-                line: line_number,
-                key: key.to_string(),
-            });
-        }
-        values.insert(key.to_string(), value.to_string());
-        line_numbers.insert(key.to_string(), line_number);
-    }
+    let (mut values, line_numbers) = parse_lines(text)?;
     let version = values
         .get("format_version")
         .cloned()
@@ -253,11 +219,55 @@ pub(crate) fn parse(text: &str) -> Result<PackageDefinition, PackageError> {
     ))
 }
 
-fn take(values: &mut BTreeMap<String, String>, key: &'static str) -> Result<String, PackageError> {
+pub(crate) type ParsedLines = (BTreeMap<String, String>, BTreeMap<String, usize>);
+
+pub(crate) fn parse_lines(text: &str) -> Result<ParsedLines, PackageError> {
+    let mut values = BTreeMap::new();
+    let mut line_numbers = BTreeMap::new();
+    for (index, raw_line) in text.lines().enumerate() {
+        let line_number = index + 1;
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let (raw_key, raw_value) = line.split_once('=').ok_or(PackageError::MalformedLine {
+            line: line_number,
+            reason: "expected key=value",
+        })?;
+        let key = raw_key.trim();
+        let value = raw_value.trim();
+        if key.is_empty() {
+            return Err(PackageError::MalformedLine {
+                line: line_number,
+                reason: "key is empty",
+            });
+        }
+        if value.is_empty() {
+            return Err(PackageError::MalformedLine {
+                line: line_number,
+                reason: "value is empty",
+            });
+        }
+        if values.contains_key(key) {
+            return Err(PackageError::DuplicateKey {
+                line: line_number,
+                key: key.to_string(),
+            });
+        }
+        values.insert(key.to_string(), value.to_string());
+        line_numbers.insert(key.to_string(), line_number);
+    }
+    Ok((values, line_numbers))
+}
+
+pub(crate) fn take(
+    values: &mut BTreeMap<String, String>,
+    key: &'static str,
+) -> Result<String, PackageError> {
     values.remove(key).ok_or(PackageError::MissingKey { key })
 }
 
-fn parse_usize(
+pub(crate) fn parse_usize(
     values: &mut BTreeMap<String, String>,
     key: &'static str,
 ) -> Result<usize, PackageError> {
@@ -278,7 +288,7 @@ fn parse_usize(
         })
 }
 
-fn parse_f64(
+pub(crate) fn parse_f64(
     values: &mut BTreeMap<String, String>,
     key: &'static str,
 ) -> Result<f64, PackageError> {
@@ -300,7 +310,7 @@ fn parse_f64(
     Ok(parsed)
 }
 
-fn parse_bool(
+pub(crate) fn parse_bool(
     values: &mut BTreeMap<String, String>,
     key: &'static str,
 ) -> Result<bool, PackageError> {
@@ -316,14 +326,17 @@ fn parse_bool(
     }
 }
 
-fn parse_asset(
+pub(crate) fn parse_asset(
     values: &mut BTreeMap<String, String>,
     key: &'static str,
 ) -> Result<RelativeAsset, PackageError> {
     RelativeAsset::parse(key, take(values, key)?)
 }
 
-fn take_optional(values: &mut BTreeMap<String, String>, key: &'static str) -> Option<String> {
+pub(crate) fn take_optional(
+    values: &mut BTreeMap<String, String>,
+    key: &'static str,
+) -> Option<String> {
     values.remove(key)
 }
 
@@ -359,7 +372,7 @@ fn parse_name_value(key: &'static str, value: String) -> Result<Vec<String>, Pac
     Ok(names)
 }
 
-fn parse_names_array<const N: usize>(
+pub(crate) fn parse_names_array<const N: usize>(
     values: &mut BTreeMap<String, String>,
     key: &'static str,
 ) -> Result<[String; N], PackageError> {
@@ -372,7 +385,7 @@ fn parse_names_array<const N: usize>(
     })
 }
 
-fn parse_encoder_tensor_contract(
+pub(crate) fn parse_encoder_tensor_contract(
     values: &mut BTreeMap<String, String>,
     input_key: &'static str,
     output_key: &'static str,
@@ -382,7 +395,7 @@ fn parse_encoder_tensor_contract(
     Ok(EncoderTensorContract::new(inputs, outputs))
 }
 
-fn parse_single_name(
+pub(crate) fn parse_single_name(
     values: &mut BTreeMap<String, String>,
     key: &'static str,
 ) -> Result<String, PackageError> {
@@ -397,7 +410,7 @@ fn parse_single_name(
     }
 }
 
-fn parse_layout(
+pub(crate) fn parse_layout(
     values: &mut BTreeMap<String, String>,
     key: &'static str,
 ) -> Result<OutputLayout, PackageError> {
