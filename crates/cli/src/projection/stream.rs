@@ -636,7 +636,9 @@ mod tests {
         assert_eq!(
             lines,
             vec![
-                String::from("# stream: 2.0 s, chunk 100 ms, step 500 ms, H=4 s, lock=true, fp16"),
+                String::from(
+                    "# stream: 2.0 s, chunk 100 ms, step 500 ms, H=4 s, lock=true, fp16io32"
+                ),
                 String::from(
                     "# decodes 2 | mean 200.0 ms (encoder 100.0) | total 0.40 s, RTF 0.2000 | wall 0.70 s"
                 ),

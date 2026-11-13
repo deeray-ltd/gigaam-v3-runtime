@@ -48,6 +48,7 @@ struct CliOptions {
     provider: Option<String>,
     ort_dylib: Option<PathBuf>,
     ctc_fp16: bool,
+    ctc_precision: Option<String>,
     no_rnnt: bool,
     rnnt_fp16: bool,
     rnnt_precision: Option<String>,
@@ -59,7 +60,7 @@ pub(crate) struct Startup {
     pub(crate) port: u16,
     pub(crate) plan: ProviderPlan,
     pub(crate) ort_dylib: PathBuf,
-    pub(crate) ctc_fp16: bool,
+    pub(crate) ctc_precision: EncoderPrecision,
     pub(crate) with_rnnt: bool,
     pub(crate) rnnt_fp16: bool,
     pub(crate) rnnt_precision: Option<RnntPrecisionSelection>,
@@ -69,6 +70,7 @@ pub(crate) struct Startup {
 
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct StartupEnvironment<'a> {
+    pub(crate) ctc_precision: Option<&'a str>,
     pub(crate) rnnt_precision: Option<&'a str>,
     pub(crate) encoder_ep: Option<&'a str>,
     pub(crate) ort_dylib: Option<&'a str>,
@@ -89,6 +91,7 @@ pub(crate) struct StartupEnvironment<'a> {
 impl Startup {
     pub(crate) fn from_process() -> Result<Self, String> {
         let args: Vec<String> = std::env::args().skip(1).collect();
+        let ctc_precision = process_env("ASR_CTC_PRECISION")?;
         let rnnt_precision = process_env("ASR_RNNT_PRECISION")?;
         let encoder_ep = process_env("ASR_ENCODER_EP")?;
         let ort_dylib = process_env("ORT_DYLIB_PATH")?;
@@ -107,6 +110,7 @@ impl Startup {
         Self::parse(
             &args,
             StartupEnvironment {
+                ctc_precision: ctc_precision.as_deref(),
                 rnnt_precision: rnnt_precision.as_deref(),
                 encoder_ep: encoder_ep.as_deref(),
                 ort_dylib: ort_dylib.as_deref(),
@@ -144,6 +148,11 @@ impl Startup {
                 "--rnnt-fp16 conflicts with --rnnt-precision and ASR_RNNT_PRECISION".into(),
             );
         }
+        let ctc_precision = resolve_ctc_precision(
+            cli.ctc_precision.as_deref(),
+            cli.ctc_fp16,
+            environment.ctc_precision,
+        )?;
         let provider =
             Device::resolve_with_config(cli.provider.as_deref(), environment.encoder_ep)?;
         let ort_config = OrtConfig::from_environment(OrtEnvironment {
@@ -191,13 +200,40 @@ impl Startup {
             port: cli.port.unwrap_or(DEFAULT_PORT),
             plan,
             ort_dylib,
-            ctc_fp16: cli.ctc_fp16,
+            ctc_precision,
             with_rnnt: !cli.no_rnnt,
             rnnt_fp16: cli.rnnt_fp16,
             rnnt_precision,
             frontend_mode,
             trace_enabled,
         })
+    }
+}
+
+fn resolve_ctc_precision(
+    cli: Option<&str>,
+    legacy: bool,
+    environment: Option<&str>,
+) -> Result<EncoderPrecision, String> {
+    fn parse(value: &str) -> Result<EncoderPrecision, String> {
+        match value {
+            "fp32" => Ok(EncoderPrecision::Fp32),
+            "fp16io32" => Ok(EncoderPrecision::Fp16Io32),
+            "fp16" => Ok(EncoderPrecision::Fp16),
+            _ => Err("CTC precision must be fp32, fp16io32 or fp16".into()),
+        }
+    }
+    let cli = cli.map(parse).transpose()?;
+    let environment = environment.map(parse).transpose()?;
+    if legacy && (cli.is_some() || environment.is_some()) {
+        return Err("--ctc-fp16 conflicts with --ctc-precision and ASR_CTC_PRECISION".into());
+    }
+    match (cli, environment) {
+        (Some(a), Some(b)) if a != b => {
+            Err("--ctc-precision conflicts with ASR_CTC_PRECISION".into())
+        }
+        (Some(value), _) | (_, Some(value)) => Ok(value),
+        (None, None) => Ok(encoder_precision(legacy)),
     }
 }
 
@@ -260,6 +296,11 @@ fn parse_cli(args: &[String]) -> Result<CliOptions, String> {
                 &mut options.ort_dylib,
                 PathBuf::from(next_value(args, &mut position, "--ort-dylib")?),
                 "--ort-dylib",
+            )?,
+            "--ctc-precision" => set_once(
+                &mut options.ctc_precision,
+                next_value(args, &mut position, "--ctc-precision")?,
+                "--ctc-precision",
             )?,
             "--ctc-fp16" => set_flag(&mut options.ctc_fp16, "--ctc-fp16")?,
             "--no-rnnt" => set_flag(&mut options.no_rnnt, "--no-rnnt")?,
@@ -679,6 +720,84 @@ mod tests {
         {
             StartupEnvironment::default()
         }
+    }
+
+    #[test]
+    fn ctc_precision_resolves_all_choices_and_conflicts() {
+        use gigaam_model_package::EncoderPrecision;
+        let choices = [
+            ("fp32", EncoderPrecision::Fp32),
+            ("fp16io32", EncoderPrecision::Fp16Io32),
+            ("fp16", EncoderPrecision::Fp16),
+        ];
+        assert_eq!(
+            super::resolve_ctc_precision(None, false, None),
+            Ok(EncoderPrecision::Fp32)
+        );
+        assert_eq!(
+            super::resolve_ctc_precision(None, true, None),
+            Ok(EncoderPrecision::Fp16Io32)
+        );
+        for (text, choice) in choices {
+            assert_eq!(
+                super::resolve_ctc_precision(Some(text), false, None),
+                Ok(choice)
+            );
+            assert_eq!(
+                super::resolve_ctc_precision(None, false, Some(text)),
+                Ok(choice)
+            );
+            assert_eq!(
+                super::resolve_ctc_precision(Some(text), false, Some(text)),
+                Ok(choice)
+            );
+            assert!(super::resolve_ctc_precision(Some(text), true, None).is_err());
+            assert!(super::resolve_ctc_precision(None, true, Some(text)).is_err());
+            for (other_text, other_choice) in choices {
+                if choice != other_choice {
+                    assert!(
+                        super::resolve_ctc_precision(Some(text), false, Some(other_text)).is_err()
+                    );
+                }
+            }
+        }
+        for invalid in ["", "FP16", " fp16", "fp16 ", "other"] {
+            assert!(super::resolve_ctc_precision(None, false, Some(invalid)).is_err());
+        }
+    }
+
+    #[test]
+    fn ctc_selector_startup_parses_and_rejects_duplicate_and_missing_values() {
+        use gigaam_model_package::EncoderPrecision;
+        let env = default_provider_environment();
+        for (text, precision) in [
+            ("fp32", EncoderPrecision::Fp32),
+            ("fp16io32", EncoderPrecision::Fp16Io32),
+            ("fp16", EncoderPrecision::Fp16),
+        ] {
+            let args = arguments(&[
+                "--ort-dylib",
+                "/runtime/libonnxruntime.so",
+                "--ctc-precision",
+                text,
+            ]);
+            assert_eq!(
+                Startup::parse(&args, env)
+                    .expect("valid CTC selection must parse")
+                    .ctc_precision,
+                precision
+            );
+            let duplicate = arguments(&[
+                "--ort-dylib",
+                "/runtime/libonnxruntime.so",
+                "--ctc-precision",
+                text,
+                "--ctc-precision",
+                text,
+            ]);
+            assert!(Startup::parse(&duplicate, env).is_err());
+        }
+        assert!(Startup::parse(&arguments(&["--ctc-precision"]), env).is_err());
     }
 
     #[test]

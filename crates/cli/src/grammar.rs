@@ -77,6 +77,7 @@ pub(crate) struct TranscribeInvocation {
     pub(crate) model: PathBuf,
     pub(crate) runtime: RuntimeRequest,
     pub(crate) precision: EncoderPrecision,
+    pub(crate) ctc_precision: Option<EncoderPrecision>,
     pub(crate) decoder: DecoderChoice,
     pub(crate) rnnt_precision: Option<RnntPrecisionSelection>,
     pub(crate) window_seconds: f32,
@@ -110,6 +111,7 @@ pub(crate) struct BenchInvocation {
     pub(crate) model: PathBuf,
     pub(crate) runtime: RuntimeRequest,
     pub(crate) precision: EncoderPrecision,
+    pub(crate) ctc_precision: Option<EncoderPrecision>,
     pub(crate) window_seconds: f32,
     pub(crate) iterations: usize,
     pub(crate) gap_milliseconds: u64,
@@ -185,6 +187,7 @@ pub(crate) struct StreamInvocation {
     pub(crate) model: PathBuf,
     pub(crate) runtime: RuntimeRequest,
     pub(crate) precision: EncoderPrecision,
+    pub(crate) ctc_precision: Option<EncoderPrecision>,
     pub(crate) chunk_milliseconds: usize,
     pub(crate) stream_policy: StreamPolicyArguments,
     pub(crate) reference: Option<PathBuf>,
@@ -269,6 +272,7 @@ impl VadChannels {
 /// Validated offline-dialog input and command choices.
 #[derive(Clone, Debug)]
 pub(crate) struct DialogInvocation {
+    pub(crate) ctc_precision: Option<EncoderPrecision>,
     pub(crate) input: PathBuf,
     pub(crate) model: PathBuf,
     pub(crate) runtime: RuntimeRequest,
@@ -305,6 +309,12 @@ impl Command {
     }
 
     fn value_option(self, option: &str) -> bool {
+        if option == "--ctc-precision" {
+            return match self {
+                Self::Transcribe | Self::Bench | Self::Stream | Self::Dialog => true,
+                Self::Vad => false,
+            };
+        }
         match self {
             Self::Transcribe => matches!(
                 option,
@@ -444,6 +454,16 @@ impl ParsedArguments {
         }
     }
 
+    fn ctc_precision(&self) -> Result<Option<EncoderPrecision>, String> {
+        match self.value("--ctc-precision") {
+            None => Ok(None),
+            Some("fp32") => Ok(Some(EncoderPrecision::Fp32)),
+            Some("fp16io32") => Ok(Some(EncoderPrecision::Fp16Io32)),
+            Some("fp16") => Ok(Some(EncoderPrecision::Fp16)),
+            Some(_) => Err("--ctc-precision must be fp32, fp16io32 or fp16".into()),
+        }
+    }
+
     fn precision(&self) -> EncoderPrecision {
         match self.has_flag("--fp16") {
             true => EncoderPrecision::Fp16Io32,
@@ -567,6 +587,9 @@ fn transcribe(parsed: ParsedArguments) -> Result<Invocation, String> {
         true => DecoderChoice::Rnnt,
         false => DecoderChoice::Ctc,
     };
+    if decoder == DecoderChoice::Rnnt && parsed.value("--ctc-precision").is_some() {
+        return Err("--ctc-precision does not apply to --rnnt".into());
+    }
     let rnnt_precision = match parsed.value("--rnnt-precision") {
         None => None,
         Some("fp32") => Some(RnntPrecisionSelection::Fp32),
@@ -604,6 +627,7 @@ fn transcribe(parsed: ParsedArguments) -> Result<Invocation, String> {
         model: parsed.model(),
         runtime: parsed.runtime(),
         precision: parsed.precision(),
+        ctc_precision: parsed.ctc_precision()?,
         decoder,
         rnnt_precision,
         window_seconds,
@@ -635,6 +659,7 @@ fn bench(parsed: ParsedArguments) -> Result<Invocation, String> {
         model: parsed.model(),
         runtime: parsed.runtime(),
         precision: parsed.precision(),
+        ctc_precision: parsed.ctc_precision()?,
         window_seconds: positive_f32(&parsed, "--window", 30.0)?,
         iterations: positive_usize(&parsed, "--iters", 20)?,
         gap_milliseconds: nonnegative_u64(&parsed, "--gap-ms", 0)?,
@@ -705,6 +730,7 @@ fn stream(parsed: ParsedArguments) -> Result<Invocation, String> {
         model: parsed.model(),
         runtime: parsed.runtime(),
         precision: parsed.precision(),
+        ctc_precision: parsed.ctc_precision()?,
         chunk_milliseconds: positive_usize(&parsed, "--chunk-ms", 100)?,
         stream_policy,
         reference: parsed.value("--ref").map(PathBuf::from),
@@ -834,6 +860,7 @@ fn dialog(parsed: ParsedArguments) -> Result<Invocation, String> {
         false => OfflineChannelPolicy::DialogDeduplication,
     };
     Ok(Invocation::Dialog(DialogInvocation {
+        ctc_precision: parsed.ctc_precision()?,
         input: parsed.required_input("dialog")?,
         model: parsed.model(),
         runtime: parsed.runtime(),
@@ -956,6 +983,43 @@ mod tests {
             Invocation::Dialog(value) => (value.stream_policy, value.applied_config),
             other => panic!("a streaming command must produce stream or dialog: {other:?}"),
         }
+    }
+
+    #[test]
+    fn ctc_selector_grammar_is_scoped_and_strict() {
+        for command in ["transcribe", "bench", "stream", "dialog"] {
+            let mut base = vec![command];
+            if command != "bench" {
+                base.push("audio.wav");
+            }
+            for value in ["fp32", "fp16io32", "fp16"] {
+                let mut args = base.clone();
+                args.extend(["--ctc-precision", value]);
+                assert!(parse_text(&arguments(&args)).is_ok());
+                args.extend(["--ctc-precision", value]);
+                assert!(parse_text(&arguments(&args)).is_err());
+            }
+            for value in ["", "FP16", " fp16", "unknown"] {
+                let mut args = base.clone();
+                args.extend(["--ctc-precision", value]);
+                assert!(parse_text(&arguments(&args)).is_err());
+            }
+            let mut missing = base.clone();
+            missing.push("--ctc-precision");
+            assert!(parse_text(&arguments(&missing)).is_err());
+        }
+        assert!(
+            parse_text(&arguments(&[
+                "transcribe",
+                "audio.wav",
+                "--rnnt",
+                "--ctc-precision",
+                "fp32"
+            ]))
+            .is_err()
+        );
+        assert!(parse_text(&arguments(&["vad", "audio.wav", "--ctc-precision", "fp32"])).is_err());
+        assert!(parse_text(&arguments(&["dialog", "audio.wav", "--fp16"])).is_err());
     }
 
     #[test]

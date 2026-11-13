@@ -187,7 +187,7 @@ impl OrtEncoder {
         cuda
     }
 
-    /// The selected encoder graph precision. Graph I/O remains f32 through its exported casts.
+    /// The selected encoder graph precision, including its native I/O boundary.
     pub const fn precision(&self) -> EncoderPrecision {
         self.precision
     }

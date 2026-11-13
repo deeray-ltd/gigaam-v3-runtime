@@ -362,11 +362,31 @@ fn v2_selects_native_fp16_and_format() {
     );
     let pack = TempPack::new(&config);
     std::fs::write(pack.path().join("rnnt-half.onnx"), b"graph").expect("write selected graph");
+    assert!(
+        ModelPackage::open(pack.path())
+            .expect("V2 must open")
+            .ctc_encoder(EncoderPrecision::Fp16)
+            .is_err()
+    );
+    pack.write_asset("ctc-half.onnx", b"native");
+    pack.write_asset("ctc_fp32_encoder.onnx", b"fp32");
+    pack.write_asset("ctc_fp16io32_encoder.onnx", b"io32");
     let opened = ModelPackage::open(pack.path()).expect("V2 must open");
     assert_eq!(
         opened.artifact_format(),
         crate::ArtifactFormat::TrtEpContext
     );
+    for (precision, path) in [
+        (EncoderPrecision::Fp32, "ctc_fp32_encoder.onnx"),
+        (EncoderPrecision::Fp16Io32, "ctc_fp16io32_encoder.onnx"),
+        (EncoderPrecision::Fp16, "ctc-half.onnx"),
+    ] {
+        let selected = opened
+            .ctc_encoder(precision)
+            .expect("selected CTC asset exists");
+        assert_eq!(selected.precision(), precision);
+        assert!(selected.artifact().path().ends_with(path));
+    }
     let selected = opened
         .rnnt_encoder(crate::EncoderPrecision::Fp16)
         .expect("select native FP16");
@@ -374,6 +394,7 @@ fn v2_selects_native_fp16_and_format() {
     let v1 = TempPack::new(&valid_v1());
     let opened_v1 = ModelPackage::open(v1.path()).expect("V1 must open");
     assert_eq!(opened_v1.artifact_format(), crate::ArtifactFormat::Onnx);
+    assert!(opened_v1.ctc_encoder(EncoderPrecision::Fp16).is_err());
     assert!(
         opened_v1
             .rnnt_encoder(crate::EncoderPrecision::Fp16)

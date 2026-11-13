@@ -219,9 +219,8 @@ pub(super) fn run_process(
             .unwrap_or_else(|error| fatal(&format!("frontend: {error}"))),
     );
 
-    let ctc_decoder =
-        DirectRecognizer::ctc(&pack, &startup.plan, encoder_precision(startup.ctc_fp16))
-            .unwrap_or_else(|error| fatal(&format!("CTC decoder: {error}")));
+    let ctc_decoder = DirectRecognizer::ctc(&pack, &startup.plan, startup.ctc_precision)
+        .unwrap_or_else(|error| fatal(&format!("CTC decoder: {error}")));
     let ctc_precision = precision_name(ctc_decoder.encoder_precision());
     emit_ctc_construction_notice(&ctc_decoder);
     emit_unverified_cuda_assignment(

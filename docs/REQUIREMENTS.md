@@ -75,7 +75,11 @@ and release material describe the same behavior in more detail and do not contra
 
 - Requirement: Service and CLI read applicable command-line and process-environment values once,
   validate them before runtime/model construction, and pass typed choices to capability
-  constructors. For `asr bench`, the selected Model Package supplies the validated SampleRate
+  constructors. Service and CTC CLI transcribe, bench, stream, and dialog resolve
+  `--ctc-precision` and `ASR_CTC_PRECISION` as exact fp32, fp16io32, or fp16;
+  both must agree and either conflicts with the applicable legacy CTC flag. RNN-T
+  transcribe and VAD ignore the CTC environment setting, and reject the CTC option.
+  Native fp16 selects native FP16 graph I/O without substitution. For `asr bench`, the selected Model Package supplies the validated SampleRate
   used to derive the --window and optional --alt-window plan; Audio resamples decoded WAV input
   to that rate before native runtime initialization. Audio defines frontend modes but never reads
   ASR_FRONTEND; Transcription defines the observation port but never reads ASR_TRACE or writes

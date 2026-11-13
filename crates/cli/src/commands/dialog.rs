@@ -17,6 +17,7 @@ use gigaam_transcription::{
 
 /// Executes offline dialogue reconstruction using direct channel-local recognition composition.
 pub(crate) fn run(invocation: DialogInvocation) -> Result<(), String> {
+    let precision = configuration::ctc_precision(invocation.ctc_precision, false)?;
     let runtime = configuration::runtime(&invocation.runtime, RequiredEncoderRoles::ctc())
         .map_err(|error| format!("runtime configuration: {error}"))?;
     let turn_gap = TurnGap::new(invocation.turn_gap_seconds)
@@ -45,7 +46,8 @@ pub(crate) fn run(invocation: DialogInvocation) -> Result<(), String> {
     let audio = composition::resample_to(loaded, frontend.sample_rate())
         .map_err(|error| format!("resample: {error}"))?;
     let channels = audio.channels().len();
-    let mut factory = composition::DialogStreamFactory::new(&package, &runtime, frontend);
+    let mut factory =
+        composition::DialogStreamFactory::new(&package, &runtime, frontend, precision);
     let result = transcribe_offline_dialog(setup, &mut factory, audio.channels())
         .map_err(|failure| projection::dialog_failure_message(&failure))?;
     projection::dialog(&result, channels);
