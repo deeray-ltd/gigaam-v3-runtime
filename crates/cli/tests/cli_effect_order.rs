@@ -11,7 +11,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT_TEMPORARY_ROOT: AtomicU64 = AtomicU64::new(0);
 
-const PRODUCT_ENVIRONMENT_KEYS: [&str; 16] = [
+const PRODUCT_ENVIRONMENT_KEYS: [&str; 17] = [
+    "ASR_MODEL_VARIANT",
     "ASR_ENCODER_EP",
     "ASR_CTC_PRECISION",
     "ASR_RNNT_PRECISION",
@@ -660,4 +661,22 @@ fn ctc_selection_conflicts_refuse_before_package_open() {
             );
         }
     }
+}
+
+#[test]
+fn selected_rnnt_controls_precision_before_package_and_needs_no_redundant_flag() {
+    let root = CliWitnessRoot::new();
+    let mut legacy = root.command("transcribe", root.missing_model());
+    legacy.args(["--rnnt-precision", "fp16"]);
+    assert_exact_failure(run(legacy), "--rnnt-precision requires RNN-T", "legacy CTC");
+    let mut selected = root.command("transcribe", root.missing_model());
+    selected.args(["--variant", "v3_e2e_rnnt", "--rnnt-precision", "fp16"]);
+    assert_missing_package_refusal(run(selected), &root, "selected RNN-T without assertion");
+    let mut conflicting = root.command("transcribe", root.missing_model());
+    conflicting.args(["--variant", "v3_ctc", "--rnnt"]);
+    assert_exact_failure(
+        run(conflicting),
+        "--rnnt conflicts with CTC variant",
+        "conflicting variant assertion",
+    );
 }

@@ -61,7 +61,9 @@ and release material describe the same behavior in more detail and do not contra
 ### PACK-SCHEMA-001 · Explicit closed package schema
 
 - Requirement: `format_version` is required and selects a supported closed schema. The legacy `ModelPackage` accepts V1 or V2; the
-  separate `VariantPackage` accepts V3 metadata only. Service and CLI still use the legacy API.
+  separate `VariantPackage` accepts V3 metadata only. Service requires a V3 package and one
+  explicitly matching selected variant; CLI accepts an explicit V3 variant and retains V1/V2
+  behavior when no variant is selected. Service constructs one family and one scheduler.
   Version 1 admits exactly 36 required entries, including 35 typed runtime keys, and eight optional opaque retained keys.
   Version 2 retains the V1 runtime keys and adds required `artifact_format=onnx|trt_ep_context`
   plus typed `ctc.encoder_fp16` and `rnnt.encoder_fp16` paths for native FP16 I/O. Those
@@ -85,7 +87,11 @@ and release material describe the same behavior in more detail and do not contra
   retains the capability for lazy VAD and drains physical native work before normal process
   return, including post-initialization error paths. A service facade without that capability
   refuses selected native VAD construction.
-  Service and CTC CLI transcribe, bench, stream, and dialog resolve
+  Service resolves `--variant` and `ASR_MODEL_VARIANT` as exact matching V3 identities and
+  refuses missing or conflicting selection before model/native construction. CLI accepts the same
+  optional selection; in V3 mode it determines the family and `--rnnt` asserts RNN-T. Service
+  readiness, model listing and requests reflect its single loaded variant. RNN-T-only Service
+  refuses native WebSocket streaming before upgrade. Service and CTC CLI transcribe, bench, stream, and dialog resolve
   `--ctc-precision` and `ASR_CTC_PRECISION` as exact fp32, fp16io32, or fp16;
   both must agree and either conflicts with the applicable legacy CTC flag. RNN-T
   transcribe and VAD ignore the CTC environment setting, and reject the CTC option.

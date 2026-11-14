@@ -41,6 +41,7 @@ pub(crate) struct ResponseInput<'a> {
     pub source_channels: SourceChannelCount,
     pub duplicate: DuplicateClassification,
     pub model: &'a str,
+    pub variant: &'a str,
     pub rtf: f32,
 }
 
@@ -123,12 +124,12 @@ impl TranscribeErrorCode {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct HealthProjection {
     provider: Device,
-    has_rnnt: bool,
+    variant: gigaam_model_package::VariantId,
 }
 
 impl HealthProjection {
-    pub(crate) const fn new(provider: Device, has_rnnt: bool) -> Self {
-        Self { provider, has_rnnt }
+    pub(crate) const fn new(provider: Device, variant: gigaam_model_package::VariantId) -> Self {
+        Self { provider, variant }
     }
 }
 
@@ -194,6 +195,7 @@ pub(crate) fn transcribe_response(input: ResponseInput<'_>) -> Json {
         source_channels,
         duplicate,
         model,
+        variant,
         rtf,
     } = input;
     let mut f: Vec<(&str, Json)> = vec![
@@ -209,6 +211,7 @@ pub(crate) fn transcribe_response(input: ResponseInput<'_>) -> Json {
     ];
     if contract.version == ResponseVersion::V2 {
         f.push(("schema_version", Json::Int(2)));
+        f.push(("variant", Json::str(variant)));
         f.push(("applied", obj(vec![("vad", contract.applied_vad())])));
     }
 
@@ -295,10 +298,7 @@ pub(crate) fn transcribe_error_response(
 }
 
 pub(crate) fn health_response(projection: HealthProjection) -> Response {
-    let mut models = vec![Json::str("ctc")];
-    if projection.has_rnnt {
-        models.push(Json::str("rnnt"));
-    }
+    let models = vec![Json::str(projection.variant.as_str())];
     json_ok(
         obj(vec![
             ("status", Json::str("ok")),
@@ -377,6 +377,7 @@ mod tests {
             source_channels: SourceChannelCount::new(1).expect("one source channel is valid"),
             duplicate: DuplicateClassification::NotDualMono,
             model: "ctc",
+            variant: "v3_ctc",
             rtf: 0.01,
         });
         assert_eq!(
@@ -411,6 +412,7 @@ mod tests {
             source_channels: SourceChannelCount::new(2).expect("two source channels are valid"),
             duplicate: DuplicateClassification::NotDualMono,
             model: "ctc",
+            variant: "v3_ctc",
             rtf: 0.02,
         });
         assert_eq!(
@@ -447,6 +449,7 @@ mod tests {
             source_channels: SourceChannelCount::new(2).expect("two source channels are valid"),
             duplicate: DuplicateClassification::NotDualMono,
             model: "ctc",
+            variant: "v3_ctc",
             rtf: 0.01,
         })
         .to_string();

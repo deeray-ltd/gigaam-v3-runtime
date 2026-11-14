@@ -38,6 +38,7 @@ pub(crate) enum Invocation {
 #[derive(Clone, Debug)]
 pub(crate) struct RuntimeRequest {
     pub(crate) provider: Option<String>,
+    pub(crate) variant: Option<String>,
     pub(crate) ort_dylib: Option<PathBuf>,
 }
 
@@ -79,6 +80,7 @@ pub(crate) struct TranscribeInvocation {
     pub(crate) precision: EncoderPrecision,
     pub(crate) ctc_precision: Option<EncoderPrecision>,
     pub(crate) decoder: DecoderChoice,
+    pub(crate) rnnt_asserted: bool,
     pub(crate) rnnt_precision: Option<RnntPrecisionSelection>,
     pub(crate) window_seconds: f32,
     pub(crate) overlap_seconds: f32,
@@ -309,6 +311,9 @@ impl Command {
     }
 
     fn value_option(self, option: &str) -> bool {
+        if option == "--variant" {
+            return true;
+        }
         if option == "--ctc-precision" {
             return match self {
                 Self::Transcribe | Self::Bench | Self::Stream | Self::Dialog => true,
@@ -443,6 +448,7 @@ impl ParsedArguments {
     fn runtime(&self) -> RuntimeRequest {
         RuntimeRequest {
             provider: self.value("--ep").map(str::to_owned),
+            variant: self.value("--variant").map(str::to_owned),
             ort_dylib: self.value("--ort-dylib").map(PathBuf::from),
         }
     }
@@ -596,9 +602,6 @@ fn transcribe(parsed: ParsedArguments) -> Result<Invocation, String> {
         Some("fp16") => Some(RnntPrecisionSelection::Fp16),
         Some(_) => return Err("--rnnt-precision must be fp32 or fp16".into()),
     };
-    if rnnt_precision.is_some() && decoder != DecoderChoice::Rnnt {
-        return Err("--rnnt-precision requires --rnnt".into());
-    }
     if rnnt_precision.is_some() && parsed.has_flag("--fp16") {
         return Err("--rnnt-precision conflicts with --fp16".into());
     }
@@ -629,6 +632,7 @@ fn transcribe(parsed: ParsedArguments) -> Result<Invocation, String> {
         precision: parsed.precision(),
         ctc_precision: parsed.ctc_precision()?,
         decoder,
+        rnnt_asserted: parsed.has_flag("--rnnt"),
         rnnt_precision,
         window_seconds,
         overlap_seconds,
@@ -1041,7 +1045,7 @@ mod tests {
                 "--rnnt-precision",
                 "fp16"
             ]))
-            .is_err()
+            .is_ok()
         );
         assert!(
             parse_text(&arguments(&[

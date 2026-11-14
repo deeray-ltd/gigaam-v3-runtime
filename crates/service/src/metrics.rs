@@ -22,7 +22,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 pub(crate) struct RuntimeGaugeSnapshot {
     pub(crate) available_http: usize,
     pub(crate) available_ws: usize,
-    pub(crate) ctc_pending: u64,
+    pub(crate) ctc_pending: Option<u64>,
     pub(crate) rnnt_pending: Option<u64>,
 }
 
@@ -326,7 +326,7 @@ impl Metrics {
         &self,
         avail_http: usize,
         avail_ws: usize,
-        ctc_pending: u64,
+        ctc_pending: Option<u64>,
         rnnt_pending: Option<u64>,
     ) -> String {
         let mut s = String::new();
@@ -383,7 +383,9 @@ impl Metrics {
         gauge!("asr_max_channels", self.max_ws);
         // GPU-worker queue depth by worker label: one TYPE line and labeled samples.
         let _ = writeln!(s, "# TYPE asr_worker_pending gauge");
-        let _ = writeln!(s, "asr_worker_pending{{worker=\"ctc\"}} {ctc_pending}");
+        if let Some(pending) = ctc_pending {
+            let _ = writeln!(s, "asr_worker_pending{{worker=\"ctc\"}} {pending}");
+        }
         if let Some(rp) = rnnt_pending {
             let _ = writeln!(s, "asr_worker_pending{{worker=\"rnnt\"}} {rp}");
         }
@@ -589,7 +591,7 @@ mod tests {
             RuntimeGaugeSnapshot {
                 available_http: self.admission.available_http(),
                 available_ws: self.admission.available_ws(),
-                ctc_pending: 7,
+                ctc_pending: Some(7),
                 rnnt_pending: None,
             }
         }
@@ -637,7 +639,7 @@ mod tests {
     #[test]
     fn telemetry_metric_families_start_at_zero_and_keep_their_fixed_labels() {
         let metrics = Metrics::new(1, 1);
-        let initial = metrics.render(1, 1, 0, None);
+        let initial = metrics.render(1, 1, Some(0), None);
         assert!(initial.contains("# TYPE asr_telemetry_dropped_total counter\n"));
         assert!(initial.contains("asr_telemetry_dropped_total{reason=\"queue_full\"} 0\n"));
         assert!(initial.contains("asr_telemetry_dropped_total{reason=\"sink_closed\"} 0\n"));
@@ -649,7 +651,7 @@ mod tests {
         metrics.telemetry_sink_closed(2);
         metrics.telemetry_stdout_failure();
         metrics.telemetry_stderr_failure();
-        let later = metrics.render(1, 1, 0, None);
+        let later = metrics.render(1, 1, Some(0), None);
         assert!(later.contains("asr_telemetry_dropped_total{reason=\"queue_full\"} 1\n"));
         assert!(later.contains("asr_telemetry_dropped_total{reason=\"sink_closed\"} 2\n"));
         assert!(later.contains("asr_telemetry_write_failures_total{destination=\"stdout\"} 1\n"));

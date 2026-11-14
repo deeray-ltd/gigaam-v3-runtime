@@ -24,7 +24,11 @@ pub(crate) fn run(invocation: BenchInvocation) -> Result<(), String> {
         .map_err(|error| format!("runtime configuration: {error}"))?;
     let frontend_mode =
         configuration::frontend_mode().map_err(|error| format!("frontend: {error}"))?;
-    let package = composition::open_package(&invocation.model)?;
+    let package = composition::open_package(
+        &invocation.model,
+        composition::resolve_variant(&invocation.runtime)?,
+    )?;
+    package.require_ctc()?;
     let sample_rate = composition::package_sample_rate(&package)?;
     let sample_plan = BenchmarkSamplePlan::new(
         sample_rate,

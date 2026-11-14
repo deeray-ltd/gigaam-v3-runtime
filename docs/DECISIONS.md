@@ -31,7 +31,8 @@ Those two keys retain their opaque meaning in V1. FP16Io32 paths retain FP32 ten
 Parse and compatibility-check configuration before selecting assets or creating a native
 session; actual tensor/engine compatibility is checked when the session loads. V3 is a separate
 metadata API for exactly one explicit variant, tokenizer, and family with optional VAD.
-Legacy V1/V2 remain the runtime input until a later explicit composition migration; V3
+Service composition requires one explicitly selected V3 variant and constructs only that family.
+CLI and library consumers retain V1/V2 compatibility when no V3 variant is selected. Metadata
 admission alone does not establish source identity or recognition support.
 
 **Cost.** Unversioned packages refuse and a future key or changed meaning needs an explicit

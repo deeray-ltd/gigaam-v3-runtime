@@ -7,28 +7,25 @@ asr-serve loads ONNX Runtime dynamically. Supply one regular ONNX Runtime librar
 when present. The process validates the selected file before model/session construction.
 LD_LIBRARY_PATH must make its selected sibling provider libraries visible. The service has no built-in authentication; the OpenAI-compatible SDK bearer token is ignored. Prefer binding Docker to `127.0.0.1:8080:8080` and do not expose the service publicly without an authenticated, TLS-protected ingress covering every route.
 
-The model package is external. Its directory must contain a valid version-1 config.kv and
+The model package is external. Its directory must contain a valid V3 config.kv for the selected variant and
 the artifacts selected by the process configuration. A missing or invalid package refuses
 startup; the runtime does not discover a substitute package or provider.
 
 ## Service command line
 
 ~~~text
-asr-serve [--model DIR] [--port 1..65535] [--ep cpu|cuda|tensorrt]
+asr-serve --variant v3_ctc|v3_rnnt|v3_e2e_ctc|v3_e2e_rnnt [--model DIR] [--port 1..65535] [--ep cpu|cuda|tensorrt]
           [--ort-dylib PATH] [--ctc-fp16] [--ctc-precision fp32|fp16io32|fp16] [--no-rnnt] [--rnnt-fp16] [--rnnt-precision fp32|fp16]
 ~~~
 
-model defaults to model and port defaults to 8080. Each option can occur once; positional
-arguments and unknown options refuse. --no-rnnt conflicts with --rnnt-fp16. CTC uses fp32
-unless --ctc-fp16 selects fp16io32. `--ctc-precision` or `ASR_CTC_PRECISION`
-selects fp32, fp16io32, or native-I/O fp16; equal CLI and environment settings are
-accepted, different ones refuse, and either conflicts with --ctc-fp16; RNN-T is loaded unless --no-rnnt, and --rnnt-fp16
-selects its fp16io32 encoder only. `--rnnt-precision fp32|fp16` or
-`ASR_RNNT_PRECISION=fp32|fp16` selects all RNN-T roles; fp16 requires compatible
-package assets and does not fall back to fp32. Both settings may be supplied only when
-they agree. They conflict with `--rnnt-fp16` and `--no-rnnt`. When absent, the legacy
-encoder choice and fp32 heads remain in effect. Full fp16 is intended for GPU providers.
-Precision selection may change model output.
+`--variant` or `ASR_MODEL_VARIANT` is required; when both are set they must agree exactly
+and must match the V3 package. Each process loads one selected family and one scheduler.
+Model defaults to `model` and port to 8080. Options occur at most once; unknown, empty and
+conflicting settings refuse. `--no-rnnt` asserts CTC. CTC uses fp32 unless `--ctc-fp16`
+selects fp16io32 or `--ctc-precision` / `ASR_CTC_PRECISION` selects fp32, fp16io32 or fp16.
+For RNN-T, `--rnnt-fp16` selects an fp16io32 encoder; `--rnnt-precision` /
+`ASR_RNNT_PRECISION` selects fp32 or full fp16. Explicit settings must agree, and selected
+assets and provider must support the chosen precision. No precision fallback occurs.
 
 ## Service limits and policy environment
 
@@ -105,7 +102,7 @@ relying on it, and prefer a CUDA or TensorRT provider for streaming.
 
 ## CUDA assignment verification
 
-The Service derives CTC and, unless `--no-rnnt` is present, RNN-T as required roles. CLI
+The Service derives only its selected variant's family as the required role. CLI
 derives CTC for ordinary transcribe, bench, stream, and dialog; RNN-T for RNN-T transcribe;
 and no encoder role for VAD. Process configuration requires one matching fingerprint for each
 of those roles before Model Package or native-runtime work. A direct CUDA encoder repeats role
@@ -170,11 +167,13 @@ the relevant ONNX Runtime and TensorRT notices, runs as uid/gid 10001 named giga
 ~~~
 
 The final images contain no model directory, repository source, Cargo state, Rust toolchain,
-or Python runtime. Mount a valid model read-only:
+or Python runtime. Mount a valid V3 model read-only and set `ASR_MODEL_VARIANT` to its
+exact declared variant (the example uses `v3_ctc`):
 
 ~~~sh
 docker buildx build --load --platform linux/amd64 -f Dockerfile.cpu -t gigaam-v3-runtime:cpu .
 docker run --rm -p 8080:8080 \
+  -e ASR_MODEL_VARIANT=v3_ctc \
   --mount type=bind,src="$PWD/model",dst=/app/model,readonly gigaam-v3-runtime:cpu
 ~~~
 
@@ -210,8 +209,8 @@ Telemetry adds:
 - asr_telemetry_write_failures_total with destination="stdout" or destination="stderr"
 
 The gauges are asr_active_transcribe, asr_active_streams, asr_max_transcribe,
-asr_max_channels, asr_worker_pending with worker="ctc" and, when RNN-T is loaded,
-worker="rnnt", and asr_build_info with version. asr_active_streams measures reserved
+asr_max_channels, asr_worker_pending with the single loaded worker label `ctc` or `rnnt`,
+and asr_build_info with version. asr_active_streams measures reserved
 WebSocket channel capacity, not an exact socket count.
 
 The histograms are asr_transcribe_latency_seconds, asr_frontend_seconds,

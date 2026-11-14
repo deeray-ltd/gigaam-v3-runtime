@@ -101,6 +101,37 @@ fn extension(filename: Option<&str>) -> Option<String> {
     .contains(&ext.as_str())
     .then_some(ext)
 }
+pub(crate) fn parse_fields_for_variant(
+    mut fields: Vec<(String, Option<String>, Vec<u8>)>,
+    variant: gigaam_model_package::VariantId,
+) -> Result<Input, ApiError> {
+    use gigaam_model_package::ModelFamily;
+    for (name, _, bytes) in &mut fields {
+        if name != "model" {
+            continue;
+        }
+        let value = std::str::from_utf8(bytes)
+            .map_err(|_| ApiError::bad("model must be UTF-8", Some("model")))?;
+        let matching = match variant.family() {
+            ModelFamily::Ctc => {
+                value == variant.as_str() || value == "gigaam-v3" || value == "gigaam-v3-ctc"
+            }
+            ModelFamily::Rnnt => value == variant.as_str() || value == "gigaam-v3-rnnt",
+        };
+        if !matching {
+            return Err(ApiError::bad(
+                "requested model is not loaded",
+                Some("model"),
+            ));
+        }
+        *bytes = match variant.family() {
+            ModelFamily::Ctc => b"gigaam-v3-ctc".to_vec(),
+            ModelFamily::Rnnt => b"gigaam-v3-rnnt".to_vec(),
+        };
+    }
+    parse_fields(fields, variant.family() == ModelFamily::Rnnt)
+}
+
 pub(crate) fn parse_fields(
     mut fields: Vec<(String, Option<String>, Vec<u8>)>,
     rnnt: bool,
@@ -268,6 +299,29 @@ pub(crate) fn parse_fields(
 #[cfg(test)]
 mod tests {
     use super::{Format, parse_fields};
+
+    #[test]
+    fn selected_variant_resolves_only_matching_aliases() {
+        use gigaam_model_package::VariantId;
+        let fields = |model: &str| {
+            vec![
+                ("model".to_string(), None, model.as_bytes().to_vec()),
+                ("file".to_string(), Some("a.wav".to_string()), vec![1]),
+            ]
+        };
+        assert!(super::parse_fields_for_variant(fields("gigaam-v3"), VariantId::V3E2eCtc).is_ok());
+        assert!(super::parse_fields_for_variant(fields("v3_e2e_ctc"), VariantId::V3E2eCtc).is_ok());
+        assert!(super::parse_fields_for_variant(fields("v3_ctc"), VariantId::V3E2eCtc).is_err());
+        assert!(
+            super::parse_fields_for_variant(fields("gigaam-v3"), VariantId::V3E2eRnnt).is_err()
+        );
+        assert!(
+            super::parse_fields_for_variant(fields("gigaam-v3-rnnt"), VariantId::V3E2eRnnt).is_ok()
+        );
+        assert!(
+            super::parse_fields_for_variant(fields("v3_e2e_rnnt"), VariantId::V3E2eRnnt).is_ok()
+        );
+    }
 
     fn fields(extra: &[(&str, &str)]) -> Vec<(String, Option<String>, Vec<u8>)> {
         let mut values = vec![

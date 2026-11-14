@@ -37,7 +37,11 @@ pub(crate) fn run(invocation: StreamInvocation) -> Result<(), String> {
         configuration::frontend_mode().map_err(|error| format!("frontend: {error}"))?;
     let observations = projection::observations(trace_mode);
 
-    let package = composition::open_package(&invocation.model)?;
+    let package = composition::open_package(
+        &invocation.model,
+        composition::resolve_variant(&invocation.runtime)?,
+    )?;
+    package.require_ctc()?;
     let sample_rate = composition::package_sample_rate(&package)?;
     let config = invocation
         .stream_policy
