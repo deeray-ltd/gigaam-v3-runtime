@@ -186,8 +186,7 @@ execution remains unverified. No performance claim follows from selection alone.
 ### Model variants and decoding
 
 V3 metadata admission now represents one explicit variant and family; the existing Service
-and CLI still use legacy packages. Native composition, actual tokenizer behavior and all four
-real-package recognition witnesses remain pending. Bind advertised model variants to their actual package assets, tokenizer, frontend,
+and CLI still use legacy packages. Recognition now exposes selected-family V3 native construction and tokenizer projection; Service and CLI composition and all four real-package recognition witnesses remain pending. Bind advertised model variants to their actual package assets, tokenizer, frontend,
 precision, and decoder capabilities. Plan explicit base and end-to-end CTC and RNN-T
 variants with compatible package evolution; support each variant's word boundaries and
 streaming contract. Evaluate beam decoding against greedy decoding using comparable quality

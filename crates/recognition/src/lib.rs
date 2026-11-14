@@ -29,7 +29,7 @@ mod provider;
 pub mod rnnt;
 pub mod vad;
 
-pub use assembly::{DirectRecognizer, RnntPrecisionSelection};
+pub use assembly::{DirectRecognizer, RnntPrecisionSelection, VariantPrecision};
 pub use contracts::{
     Decoded, DecodedTokensInput, Encoder, FrameRate, ScoreDetail, SilenceCapability,
     SpeechProbabilityDetector, Token, WindowDecoder, Word,

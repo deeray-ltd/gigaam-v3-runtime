@@ -11,7 +11,7 @@
 
 use crate::contracts::{Decoded, Encoder, FrameRate, WindowDecoder};
 use gigaam_audio::FeatureMatrixView;
-use gigaam_model_package::ModelPackage;
+use gigaam_model_package::{ModelPackage, VariantPackage};
 use gigaam_primitives::{f64_to_f32, usize_to_f32};
 use std::time::Instant;
 
@@ -270,10 +270,46 @@ fn word_from_token_range(
     )
 }
 
+pub(crate) struct ProjectedWords {
+    pub(crate) words: Vec<Word>,
+    pub(crate) spans: Vec<(usize, usize)>,
+}
+
+pub(crate) fn project_words(
+    tokens: &[Token],
+    vocabulary: &[String],
+    projector: Option<&crate::TokenTextProjector>,
+    frame_rate: FrameRate,
+) -> Result<ProjectedWords, String> {
+    match projector {
+        None => Ok(ProjectedWords {
+            words: tokens_to_words(tokens, vocabulary, frame_rate)?,
+            spans: word_token_spans(tokens, vocabulary),
+        }),
+        Some(projector) => {
+            let projection = projector.project(tokens)?;
+            let mut words = Vec::with_capacity(projection.words.len());
+            let mut spans = Vec::with_capacity(projection.words.len());
+            for word in projection.words {
+                let text = projection.text[word.text_range].to_string();
+                words.push(word_from_token_range(
+                    text,
+                    tokens[word.first_token].frame(),
+                    tokens[word.last_token].frame(),
+                    frame_rate,
+                )?);
+                spans.push((word.first_token, word.last_token));
+            }
+            Ok(ProjectedWords { words, spans })
+        }
+    }
+}
+
 /// CTC decoder over an injected encoder port.
 pub struct CtcDecoder<E: Encoder> {
     encoder: E,
     vocabulary: Vec<String>,
+    projector: Option<crate::TokenTextProjector>,
     blank: usize,
     silence_policy: CtcSilencePolicy,
     frame_rate: FrameRate,
@@ -305,6 +341,7 @@ impl<E: Encoder> CtcDecoder<E> {
         Ok(Self {
             encoder,
             vocabulary,
+            projector: None,
             blank,
             silence_policy,
             frame_rate,
@@ -316,6 +353,28 @@ impl<E: Encoder> CtcDecoder<E> {
         let vocabulary = pack.ctc_vocabulary().map_err(|error| error.to_string())?;
         let frame_rate = FrameRate::new(f64_to_f32(pack.frontend().frames_per_second()))?;
         Self::new(encoder, vocabulary, pack.ctc().blank_id(), frame_rate)
+    }
+
+    pub(crate) fn from_variant(
+        pack: &VariantPackage,
+        encoder: E,
+        projector: crate::TokenTextProjector,
+    ) -> Result<Self, String> {
+        if pack.variant().family() != gigaam_model_package::ModelFamily::Ctc {
+            return Err("selected variant is not CTC".into());
+        }
+        let vocabulary = pack.vocabulary().map_err(|error| error.to_string())?;
+        let frame_rate = FrameRate::new(f64_to_f32(pack.frontend().frames_per_second()))?;
+        let mut decoder = Self::new(encoder, vocabulary, pack.tokenizer().blank_id(), frame_rate)?;
+        if pack.tokenizer().kind() == gigaam_model_package::TokenizerKind::Characters {
+            decoder.silence_policy = match decoder.vocabulary.iter().position(|piece| piece == " ")
+            {
+                Some(space_token) => CtcSilencePolicy::BlankAndSpace { space_token },
+                None => CtcSilencePolicy::BlankOnly,
+            };
+        }
+        decoder.projector = Some(projector);
+        Ok(decoder)
     }
 
     pub const fn silence_policy(&self) -> CtcSilencePolicy {
@@ -370,8 +429,15 @@ impl<E: Encoder> WindowDecoder for CtcDecoder<E> {
             control,
         )?;
         control.checkpoint()?;
-        let word_spans = word_token_spans(&tokens, &self.vocabulary);
-        let words = tokens_to_words(&tokens, &self.vocabulary, self.frame_rate)?;
+        let ProjectedWords {
+            words,
+            spans: word_spans,
+        } = project_words(
+            &tokens,
+            &self.vocabulary,
+            self.projector.as_ref(),
+            self.frame_rate,
+        )?;
         control.checkpoint()?;
         Decoded::new_with_labels(
             words,
@@ -389,6 +455,30 @@ impl<E: Encoder> WindowDecoder for CtcDecoder<E> {
 mod tests {
     use super::*;
     use gigaam_audio::FeatureMatrix;
+
+    #[test]
+    fn selected_projector_maps_original_occurrences_to_words() {
+        let metadata = gigaam_model_package::TokenizerMetadata::Characters(vec![
+            "а".into(),
+            " ".into(),
+            "б".into(),
+        ]);
+        let projector = crate::TokenTextProjector::new(metadata).expect("valid tokenizer");
+        let tokens = vec![
+            Token::new(0, 2),
+            Token::new(1, 3),
+            Token::new(1, 4),
+            Token::new(2, 5),
+        ];
+        let ProjectedWords { words, spans } =
+            project_words(&tokens, &[], Some(&projector), frame_rate()).expect("valid projection");
+        assert_eq!(
+            words.iter().map(Word::text).collect::<Vec<_>>(),
+            vec!["а", "б"]
+        );
+        assert_eq!(spans, vec![(0, 0), (3, 3)]);
+        assert_eq!(tokens[3].frame(), 5);
+    }
 
     struct FakeEncoder {
         output: Vec<f32>,
