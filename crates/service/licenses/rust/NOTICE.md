@@ -14,9 +14,9 @@ locked Cargo metadata and checksum-verified local registry crate archives.
 - Selection: normal non-dev dependency edges only. Packages whose only library target
   is a procedural macro are excluded because their code is executed during compilation,
   not statically linked into `asr-serve`.
-- Registry packages: 109; the three selected closures are identical.
-- Cargo.lock SHA-256: `fccae6e98a652d96aac39906393ddd821dfbf7f06bbf2890a4a13b6eb05317e9`.
-- Closure SHA-256: `71798a6de7726ec9ed0f37e9b116e46bef0b61e4d715d26d137ca127998f02af`.
+- Registry packages: 111; the three selected closures are identical.
+- Cargo.lock SHA-256: `15f10f0e31fe28a0dfc37c52e89e725543896ef0e044885a639126833a55f326`.
+- Closure SHA-256: `58308d0dde4371edaded6ed1c6aa6a7a84767bedc1b8f756e85b4fb4695a06e2`.
 - Project workspace code is covered by the parent `COPYING` and `COPYING.LESSER` files.
 
 ## Package records
@@ -652,6 +652,15 @@ locked Cargo metadata and checksum-verified local registry crate archives.
   - `LICENSE-APACHE`: `texts/0218327e7a480793ffdd4eb792379a9709e5c135c7ba267f709d6f6d4d70af0a.txt` (SHA-256 `0218327e7a480793ffdd4eb792379a9709e5c135c7ba267f709d6f6d4d70af0a`).
   - `LICENSE-MIT`: `texts/4cada0bd02ea3692eee6f16400d86c6508bbd3bafb2b65fed0419f36d4f83e8f.txt` (SHA-256 `4cada0bd02ea3692eee6f16400d86c6508bbd3bafb2b65fed0419f36d4f83e8f`).
 
+### `prost` 0.13.5
+- License expression: `Apache-2.0`.
+- Locked crate archive SHA-256: `2796faa41db3ec313a31f7624d9286acf277b52de526150b7e69f3debf891ee5`.
+- Source archive: `https://static.crates.io/crates/prost/prost-0.13.5.crate`.
+- Repository declared by package metadata: `https://github.com/tokio-rs/prost`.
+- Authors declared by package metadata: `Dan Burkert <dan@danburkert.com>`; `Lucio Franco <luciofranco14@gmail.com>`; `Casper Meijn <casper@meijn.net>`; `Tokio Contributors <team@tokio.rs>`.
+- Packaged license, permission, and copyright notices:
+  - `LICENSE`: `texts/a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2.txt` (SHA-256 `a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2`).
+
 ### `rand` 0.9.5
 - License expression: `MIT OR Apache-2.0`.
 - Locked crate archive SHA-256: `b9ef1d0d795eb7d84685bca4f72f3649f064e6641543d3a8c415898726a57b41`.
@@ -704,6 +713,14 @@ locked Cargo metadata and checksum-verified local registry crate archives.
 - Packaged license, permission, and copyright notices:
   - `LICENSE-APACHE`: `texts/62c7a1e35f56406896d7aa7ca52d0cc0d272ac022b5d2796e7d6905db8a3636a.txt` (SHA-256 `62c7a1e35f56406896d7aa7ca52d0cc0d272ac022b5d2796e7d6905db8a3636a`).
   - `LICENSE-BOOST`: `texts/c9bff75738922193e67fa726fa225535870d2aa1059f91452c411736284ad566.txt` (SHA-256 `c9bff75738922193e67fa726fa225535870d2aa1059f91452c411736284ad566`).
+
+### `sentencepiece-model` 0.1.4
+- License expression: `BSD-2-Clause`.
+- Locked crate archive SHA-256: `40b87bf750a8322c3236d7aa63c1f4a6862187d00d2d8b038e1dfe263bfe43ec`.
+- Source archive: `https://static.crates.io/crates/sentencepiece-model/sentencepiece-model-0.1.4.crate`.
+- Repository declared by package metadata: `https://github.com/Systemcluster/sentencepiece-model`.
+- Authors declared by package metadata: `Christian Sdunek <me@systemcluster.me>`.
+- The locked crate archive contains no standalone license or notice file; its metadata and source archive above are retained without inventing text.
 
 ### `serde` 1.0.229
 - License expression: `MIT OR Apache-2.0`.

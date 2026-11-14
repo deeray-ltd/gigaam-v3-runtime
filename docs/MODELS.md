@@ -186,3 +186,13 @@ and the frame-rate relation are validated from declarations. The declared f64 ra
 Native compatibility and source/tokenizer consistency need separate evidence. To migrate a
 legacy pack, export a sibling V3 package from the actual selected source and preserve all
 nonblank token indices; do not infer identity from filenames or vocabulary size.
+
+### V3 tokenizer decoding
+
+The selected V3 tokenizer model is parsed as SentencePiece metadata and checked against
+the nonblank vocabulary in token-ID order. Character variants concatenate their declared
+entries exactly. SentencePiece decoding retains exact text and token-occurrence UTF-8
+byte ranges, including whitespace and empty control surfaces. The current word projection
+rejects byte pieces, active denormalization, and surfaces that can contribute to multiple
+words. Public transcript assembly continues to join recognized words with single spaces.
+This capability does not by itself enable V3 native recognition or establish model accuracy.

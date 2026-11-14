@@ -273,6 +273,26 @@ impl VariantPackage {
         }
         Ok(rows)
     }
+    /// Loads the selected tokenizer and validates its indexed vocabulary.
+    pub fn load_tokenizer(&self) -> Result<crate::TokenizerMetadata, PackageError> {
+        let vocabulary = self.vocabulary()?;
+        match self.tokenizer_model()? {
+            None => Ok(crate::TokenizerMetadata::characters(vocabulary)),
+            Some(artifact) => {
+                let path = artifact.path().to_path_buf();
+                let bytes = fs::read(&path).map_err(|error| {
+                    PackageError::io("read tokenizer model", path.clone(), error)
+                })?;
+                crate::tokenizer::read_sentencepiece(&bytes, vocabulary).map_err(|reason| {
+                    PackageError::InvalidAssetData {
+                        key: "tokenizer.model",
+                        path,
+                        reason,
+                    }
+                })
+            }
+        }
+    }
     pub fn tokenizer_model(&self) -> Result<Option<ValidatedArtifact>, PackageError> {
         self.tokenizer
             .model

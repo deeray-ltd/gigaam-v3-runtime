@@ -15,6 +15,7 @@ mod contracts;
 mod execution;
 mod native_output;
 mod scheduler;
+mod tokenizer;
 
 mod assembly;
 pub mod ctc;
@@ -43,3 +44,5 @@ pub use provider::{
     EncoderRole, MemoryPattern, OrtConfig, OrtEnvironment, ProviderPlan, RequiredEncoderRoles,
 };
 pub use scheduler::{ExecutionScheduler, ScheduledRecognizer};
+
+pub use tokenizer::{ProjectedWord, TokenTextProjection, TokenTextProjector};
