@@ -19,6 +19,7 @@ mod compatibility;
 mod definition;
 mod error;
 mod schema;
+mod tokenizer;
 mod variant;
 
 use std::fs;
@@ -165,3 +166,5 @@ impl ModelPackage {
 
 #[cfg(test)]
 mod tests;
+
+pub use tokenizer::{PieceKind, TokenizerMetadata, TokenizerPiece};

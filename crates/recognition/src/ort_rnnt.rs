@@ -19,7 +19,9 @@ use crate::ort_encoder::{EncodedRnntWindow, OrtEncoder};
 use crate::provider::{Device, ProviderPlan};
 use crate::rnnt::{self, RnntFrameSource, RnntTransition};
 use gigaam_audio::FeatureMatrixView;
-use gigaam_model_package::{EncoderPrecision, ModelPackage};
+use gigaam_model_package::{
+    EncoderPrecision, ModelPackage, RnntAssets, VariantArtifacts, VariantPackage,
+};
 use gigaam_primitives::{f64_to_f32, usize_to_i64};
 use ort::session::Session;
 use ort::value::Tensor;
@@ -334,10 +336,27 @@ pub(crate) struct RnntDecoder {
     encoder: OrtEncoder,
     transition: Transition,
     vocabulary: Vec<String>,
+    projector: Option<crate::TokenTextProjector>,
     blank: usize,
     encoder_dimension: usize,
     max_symbols_per_step: usize,
     frame_rate: FrameRate,
+}
+
+struct RnntParts {
+    encoder: OrtEncoder,
+    assets: RnntAssets,
+    vocabulary: Vec<String>,
+    projector: Option<crate::TokenTextProjector>,
+    blank: usize,
+    encoder_dimension: usize,
+    max_symbols_per_step: usize,
+    frame_rate: FrameRate,
+    prediction_hidden: usize,
+    prediction_inputs: [String; 3],
+    prediction_outputs: [String; 3],
+    joint_inputs: [String; 2],
+    joint_output: String,
 }
 
 fn head_session(
@@ -404,6 +423,40 @@ fn head_session(
     Ok(session)
 }
 
+fn validate_precision(
+    precision: EncoderPrecision,
+    full_fp16: bool,
+    device: Device,
+) -> Result<(), String> {
+    if full_fp16 && precision == EncoderPrecision::Fp32 {
+        return Err("FP16 RNN-T heads require an FP16 encoder selection".into());
+    }
+    if !full_fp16 && precision == EncoderPrecision::Fp16 {
+        return Err("native FP16 encoder requires FP16 RNN-T heads".into());
+    }
+    if full_fp16 && device == Device::Cpu {
+        return Err("full RNN-T FP16 requires CUDA or TensorRT".into());
+    }
+    Ok(())
+}
+
+fn preflight_variant(
+    pack: &VariantPackage,
+    precision: EncoderPrecision,
+    full_fp16: bool,
+    device: Device,
+) -> Result<crate::TokenTextProjector, String> {
+    let definition = match pack.artifacts() {
+        VariantArtifacts::Rnnt(definition) => definition,
+        VariantArtifacts::Ctc(_) => return Err("selected variant is not RNN-T".into()),
+    };
+    if definition.prediction_layers() != 1 {
+        return Err("RNN-T adapter requires one prediction layer".into());
+    }
+    validate_precision(precision, full_fp16, device)?;
+    crate::TokenTextProjector::new(pack.load_tokenizer().map_err(|error| error.to_string())?)
+}
+
 impl RnntDecoder {
     /// Creates an RNN-T decoder; `precision` applies to the encoder only.
     pub(crate) fn from_pack(
@@ -413,12 +466,7 @@ impl RnntDecoder {
         full_fp16: bool,
     ) -> Result<Self, String> {
         let (runtime, plan) = context;
-        if !full_fp16 && precision == EncoderPrecision::Fp16 {
-            return Err("native FP16 encoder requires FP16 RNN-T heads".into());
-        }
-        if full_fp16 && plan.device() == Device::Cpu {
-            return Err("full RNN-T FP16 requires CUDA or TensorRT".into());
-        }
+        validate_precision(precision, full_fp16, plan.device())?;
         let encoder = OrtEncoder::rnnt(pack, runtime, plan, precision)?;
         let assets = pack
             .rnnt_assets(if full_fp16 {
@@ -427,14 +475,88 @@ impl RnntDecoder {
                 EncoderPrecision::Fp32
             })
             .map_err(|error| error.to_string())?;
-        let prediction = head_session(assets.decoder().path(), runtime, plan)?;
-        let joint = head_session(assets.joint().path(), runtime, plan)?;
         let vocabulary = assets
             .load_vocabulary()
             .map_err(|error| error.to_string())?;
         let definition = pack.rnnt();
-        let blank = definition.blank_id();
-        let encoder_dimension = definition.output_dimension();
+        let parts = RnntParts {
+            encoder,
+            assets,
+            vocabulary,
+            projector: None,
+            blank: definition.blank_id(),
+            encoder_dimension: definition.output_dimension(),
+            max_symbols_per_step: definition.max_symbols_per_step(),
+            frame_rate: FrameRate::new(f64_to_f32(pack.frontend().frames_per_second()))?,
+            prediction_hidden: definition.prediction_hidden(),
+            prediction_inputs: definition.decoder_input_names().clone(),
+            prediction_outputs: definition.decoder_output_names().clone(),
+            joint_inputs: definition.joint_input_names().clone(),
+            joint_output: definition.joint_output_name().to_owned(),
+        };
+        Self::from_parts(parts, runtime, plan, full_fp16)
+    }
+
+    pub(crate) fn from_variant(
+        pack: &VariantPackage,
+        context: (&crate::NativeRuntime, &ProviderPlan),
+        precision: EncoderPrecision,
+        full_fp16: bool,
+    ) -> Result<Self, String> {
+        let (runtime, plan) = context;
+        let projector = preflight_variant(pack, precision, full_fp16, plan.device())?;
+        let definition = match pack.artifacts() {
+            VariantArtifacts::Rnnt(definition) => definition,
+            VariantArtifacts::Ctc(_) => return Err("selected variant is not RNN-T".into()),
+        };
+        let vocabulary = pack.vocabulary().map_err(|error| error.to_string())?;
+        let assets = pack
+            .rnnt_assets(if full_fp16 {
+                precision
+            } else {
+                EncoderPrecision::Fp32
+            })
+            .map_err(|error| error.to_string())?;
+        let encoder = OrtEncoder::variant(pack, runtime, plan, precision)?;
+        let parts = RnntParts {
+            encoder,
+            assets,
+            vocabulary,
+            projector: Some(projector),
+            blank: pack.tokenizer().blank_id(),
+            encoder_dimension: definition.output_dimension(),
+            max_symbols_per_step: definition.max_symbols_per_step(),
+            frame_rate: FrameRate::new(f64_to_f32(pack.frontend().frames_per_second()))?,
+            prediction_hidden: definition.prediction_hidden(),
+            prediction_inputs: definition.decoder_input_names().clone(),
+            prediction_outputs: definition.decoder_output_names().clone(),
+            joint_inputs: definition.joint_input_names().clone(),
+            joint_output: definition.joint_output_name().to_owned(),
+        };
+        Self::from_parts(parts, runtime, plan, full_fp16)
+    }
+
+    fn from_parts(
+        parts: RnntParts,
+        runtime: &crate::NativeRuntime,
+        plan: &ProviderPlan,
+        full_fp16: bool,
+    ) -> Result<Self, String> {
+        let RnntParts {
+            encoder,
+            assets,
+            vocabulary,
+            projector,
+            blank,
+            encoder_dimension,
+            max_symbols_per_step,
+            frame_rate,
+            prediction_hidden,
+            prediction_inputs,
+            prediction_outputs,
+            joint_inputs,
+            joint_output,
+        } = parts;
         if encoder.out_dim() != encoder_dimension {
             return Err(format!(
                 "RNNT: encoder out_dim {} ≠ rnnt.out_dim {encoder_dimension}",
@@ -447,16 +569,18 @@ impl RnntDecoder {
                 vocabulary.len()
             ));
         }
+        let prediction = head_session(assets.decoder().path(), runtime, plan)?;
+        let joint = head_session(assets.joint().path(), runtime, plan)?;
         macro_rules! make_transition {
             () => {
                 OrtRnntTransition {
                     prediction,
                     joint,
-                    prediction_inputs: definition.decoder_input_names().clone(),
-                    prediction_outputs: definition.decoder_output_names().clone(),
-                    joint_inputs: definition.joint_input_names().clone(),
-                    joint_output: definition.joint_output_name().to_owned(),
-                    prediction_hidden: definition.prediction_hidden(),
+                    prediction_inputs,
+                    prediction_outputs,
+                    joint_inputs,
+                    joint_output,
+                    prediction_hidden,
                     encoder_dimension,
                     blank,
                     prepared_frame: Vec::new(),
@@ -472,10 +596,11 @@ impl RnntDecoder {
             encoder,
             transition,
             vocabulary,
+            projector,
             blank,
             encoder_dimension,
-            max_symbols_per_step: definition.max_symbols_per_step(),
-            frame_rate: FrameRate::new(f64_to_f32(pack.frontend().frames_per_second()))?,
+            max_symbols_per_step,
+            frame_rate,
         })
     }
 
@@ -583,8 +708,12 @@ impl WindowDecoder for RnntDecoder {
             }
         };
         control.checkpoint()?;
-        let words = ctc::tokens_to_words(output.tokens(), &self.vocabulary, self.frame_rate)?;
-        let spans = ctc::word_token_spans(output.tokens(), &self.vocabulary);
+        let ctc::ProjectedWords { words, spans } = ctc::project_words(
+            output.tokens(),
+            &self.vocabulary,
+            self.projector.as_ref(),
+            self.frame_rate,
+        )?;
         control.checkpoint()?;
         Decoded::new_with_tokens(crate::contracts::DecodedTokensInput {
             words,
@@ -612,5 +741,32 @@ mod shape_tests {
         assert!(validate_vector_axes("joint", &[5, 1, 1, 1], 5, 4).is_err());
         assert!(validate_vector_axes("joint", &[1, 1, 5, 1], 5, 4).is_err());
         assert!(validate_vector_axes("joint", &[1, 1, 5], 5, 4).is_err());
+    }
+}
+
+#[cfg(test)]
+mod variant_precision_tests {
+    use super::*;
+    #[test]
+    fn variant_preflight_refuses_precision_before_missing_assets() {
+        let root =
+            std::env::temp_dir().join(format!("gigaam-rnnt-precision-{}", std::process::id()));
+        std::fs::create_dir(&root).expect("create isolated package");
+        let config = "format_version=3\nvariant=v3_rnnt\nartifact_format=onnx\nsample_rate=16000\nn_mels=64\nhop_length=160\nwin_length=320\nn_fft=320\ncenter=false\nlog_clamp_min=1e-09\nlog_clamp_max=1000000000\nsubsampling_factor=4\nframes_per_sec=25\nfrontend.window=window\nfrontend.filterbank=filter\ntokenizer.kind=characters\ntokenizer.vocab=missing-vocab\ntokenizer.vocab_size=2\ntokenizer.blank_id=2\nrnnt.encoder_fp32=missing-encoder\nrnnt.input_names=x,length\nrnnt.output_names=y,length\nrnnt.out_dim=7\nrnnt.out_layout=t_d\nrnnt.decoder_fp32=missing-decoder\nrnnt.joint_fp32=missing-joint\nrnnt.pred_hidden=5\nrnnt.pred_layers=1\nrnnt.max_symbols_per_step=3\nrnnt.decoder_inputs=x,h,c\nrnnt.decoder_outputs=y,h,c\nrnnt.joint_inputs=e,d\nrnnt.joint_outputs=joint\n";
+        std::fs::write(root.join("config.kv"), config).expect("write configuration");
+        let pack = VariantPackage::open(&root).expect("metadata admits missing unselected assets");
+        let error = preflight_variant(&pack, EncoderPrecision::Fp32, true, Device::Cuda)
+            .expect_err("precision must refuse");
+        assert_eq!(error, "FP16 RNN-T heads require an FP16 encoder selection");
+        std::fs::remove_dir_all(root).expect("remove test package");
+    }
+
+    #[test]
+    fn fp32_encoder_with_fp16_heads_refuses_before_assets_or_sessions() {
+        let error = validate_precision(EncoderPrecision::Fp32, true, Device::Cuda)
+            .expect_err("mixed selection must refuse");
+        assert_eq!(error, "FP16 RNN-T heads require an FP16 encoder selection");
+        assert!(validate_precision(EncoderPrecision::Fp16Io32, true, Device::Cuda).is_ok());
+        assert!(validate_precision(EncoderPrecision::Fp16, true, Device::Cuda).is_ok());
     }
 }

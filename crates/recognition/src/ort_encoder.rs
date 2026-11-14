@@ -19,7 +19,9 @@ use crate::ort_assignment::{self, CudaAssignmentEvidence};
 use crate::provider::CudaArena;
 use crate::provider::{Device, EncoderRole, ProviderPlan};
 use gigaam_audio::FeatureMatrixView;
-use gigaam_model_package::{EncoderArtifact, EncoderPrecision, ModelPackage, OutputLayout};
+use gigaam_model_package::{
+    EncoderArtifact, EncoderPrecision, ModelFamily, ModelPackage, OutputLayout, VariantPackage,
+};
 #[cfg(feature = "cuda")]
 use ort::ep::CUDA;
 #[cfg(feature = "cuda")]
@@ -47,7 +49,7 @@ impl OrtEncoder {
         plan: &ProviderPlan,
         precision: EncoderPrecision,
     ) -> Result<Self, String> {
-        check_artifact_format(pack, plan)?;
+        check_artifact_format(pack.artifact_format(), plan)?;
         let artifact = pack
             .ctc_encoder(precision)
             .map_err(|error| error.to_string())?;
@@ -61,11 +63,26 @@ impl OrtEncoder {
         plan: &ProviderPlan,
         precision: EncoderPrecision,
     ) -> Result<Self, String> {
-        check_artifact_format(pack, plan)?;
+        check_artifact_format(pack.artifact_format(), plan)?;
         let artifact = pack
             .rnnt_encoder(precision)
             .map_err(|error| error.to_string())?;
         Self::open(artifact, runtime, plan, EncoderRole::Rnnt)
+    }
+
+    pub(crate) fn variant(
+        pack: &VariantPackage,
+        runtime: &NativeRuntime,
+        plan: &ProviderPlan,
+        precision: EncoderPrecision,
+    ) -> Result<Self, String> {
+        check_artifact_format(pack.artifact_format(), plan)?;
+        let role = match pack.variant().family() {
+            ModelFamily::Ctc => EncoderRole::Ctc,
+            ModelFamily::Rnnt => EncoderRole::Rnnt,
+        };
+        let artifact = pack.encoder(precision).map_err(|error| error.to_string())?;
+        Self::open(artifact, runtime, plan, role)
     }
 
     /// Opens one typed encoder artifact only through its declared process role.
@@ -309,9 +326,12 @@ impl Encoder for OrtEncoder {
     }
 }
 
-fn check_artifact_format(pack: &ModelPackage, plan: &ProviderPlan) -> Result<(), String> {
+fn check_artifact_format(
+    format: gigaam_model_package::ArtifactFormat,
+    plan: &ProviderPlan,
+) -> Result<(), String> {
     use gigaam_model_package::ArtifactFormat;
-    match (plan.device(), pack.artifact_format()) {
+    match (plan.device(), format) {
         (Device::Tensorrt, ArtifactFormat::TrtEpContext) => Ok(()),
         (Device::Tensorrt, _) => Err("TensorRT requires a prepared EP context package".into()),
         (_, ArtifactFormat::TrtEpContext) => {

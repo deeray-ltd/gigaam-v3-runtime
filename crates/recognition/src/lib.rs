@@ -15,6 +15,7 @@ mod contracts;
 mod execution;
 mod native_output;
 mod scheduler;
+mod tokenizer;
 
 mod assembly;
 pub mod ctc;
@@ -29,7 +30,7 @@ pub mod rnnt;
 pub mod rnnt_beam;
 pub mod vad;
 
-pub use assembly::{DirectRecognizer, RnntPrecisionSelection};
+pub use assembly::{DirectRecognizer, RnntPrecisionSelection, VariantPrecision};
 pub use contracts::{
     Decoded, DecodedTokensInput, Encoder, FrameRate, ScoreDetail, SilenceCapability,
     SpeechProbabilityDetector, Token, WindowDecoder, Word,
@@ -44,3 +45,5 @@ pub use provider::{
     EncoderRole, MemoryPattern, OrtConfig, OrtEnvironment, ProviderPlan, RequiredEncoderRoles,
 };
 pub use scheduler::{ExecutionScheduler, ScheduledRecognizer};
+
+pub use tokenizer::{ProjectedWord, TokenTextProjection, TokenTextProjector};

@@ -11,3 +11,7 @@ publish = false
 
 [dependencies]
 gigaam-primitives = { path = "../primitives" }
+sentencepiece-model = "=0.1.4"
+
+[dev-dependencies]
+prost = "=0.13.5"
