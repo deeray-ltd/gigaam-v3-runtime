@@ -28,9 +28,9 @@ use gigaam_transcription::{
     BackchannelDuration, BackchannelPolicy, CorrelationThreshold, EndpointDetector, EndpointRules,
     EndpointSource, MultiChannelFailure, MultiChannelSession, MultiChannelStep,
     MultiChannelStreamOptions, MultiChannelStreamSetup, MultiChannelStreamSetupInput,
-    OriginalChannel, SelectionWindowSamples, SourceChannelCount, StreamChannelFactory,
-    StreamConfig, StreamEmissionMode, StreamLockPolicy, StreamSetup, StreamingChannelPolicy,
-    TranscriptionObservation, TurnGap, VadProbability,
+    OriginalChannel, SelectionWindowSamples, SilenceSkipPolicy, SourceChannelCount,
+    StreamChannelFactory, StreamConfig, StreamEmissionMode, StreamLockPolicy, StreamSetup,
+    StreamingChannelPolicy, TranscriptionObservation, TurnGap, VadProbability,
 };
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -129,6 +129,8 @@ impl StreamQuery {
             "emit",
             "endpoint",
             "vad_threshold",
+            "silence_skip",
+            "skip_vad_threshold",
             "silence_ms",
             "no_speech_ms",
             "window",
@@ -238,6 +240,18 @@ impl StreamQuery {
                 config.vad_threshold().get(),
             )?)?;
             config = config.with_vad_threshold(threshold)?;
+        }
+        let skip_enabled = query_bool(&parameters, "silence_skip", false)?;
+        if !skip_enabled && parameters.get("skip_vad_threshold").is_some() {
+            return Err("skip_vad_threshold requires silence_skip=true".into());
+        }
+        if skip_enabled {
+            let threshold = VadProbability::new(query_finite_f32(
+                &parameters,
+                "skip_vad_threshold",
+                VadProbability::DEFAULT.get(),
+            )?)?;
+            config = config.with_silence_skip(SilenceSkipPolicy::AcousticWindow { threshold })?;
         }
         let turn_gap = positive_f32(query_finite_f32(&parameters, "turn_gap", 0.8)?, "turn_gap")?;
         let backchannel_milliseconds = query_finite_f32(
@@ -484,16 +498,27 @@ impl StreamChannelFactory for ServiceStreamChannelFactory {
     ) -> Result<StreamSetup<Self::Decoder, Self::Detector>, String> {
         let control = ExecutionControl::without_deadline();
         let decoder = self.scheduler.tick_channel(control.clone());
-        let detector = match config.endpoint_source() {
-            EndpointSource::Manual => EndpointDetector::Manual,
-            EndpointSource::Blank => EndpointDetector::Blank,
-            EndpointSource::Vad => EndpointDetector::Vad(Vad::from_variant(
+        let needs_detector = config.endpoint_source() == EndpointSource::Vad
+            || config.silence_skip() != SilenceSkipPolicy::Off;
+        let detector = if needs_detector {
+            let vad = Vad::from_variant(
                 &self.pack,
                 self.native_runtime
                     .as_ref()
                     .ok_or_else(|| "native runtime capability is required for VAD".to_owned())?,
                 self.intra_threads,
-            )?),
+            )?;
+            match config.endpoint_source() {
+                EndpointSource::Manual => EndpointDetector::ManualWithVad(vad),
+                EndpointSource::Blank => EndpointDetector::BlankWithVad(vad),
+                EndpointSource::Vad => EndpointDetector::Vad(vad),
+            }
+        } else {
+            match config.endpoint_source() {
+                EndpointSource::Manual => EndpointDetector::Manual,
+                EndpointSource::Blank => EndpointDetector::Blank,
+                EndpointSource::Vad => return Err("VAD endpoint requires a detector".into()),
+            }
         };
         Ok(StreamSetup {
             frontend: Arc::clone(&self.frontend),
@@ -518,6 +543,12 @@ impl PreparedStream {
             query.config.endpoint_source(),
             context.capabilities.silence_capability(),
         )?;
+        if query.config.silence_skip() != SilenceSkipPolicy::Off {
+            preflight_skip_vad(
+                &context.capabilities.pack,
+                context.capabilities.native_runtime.is_some(),
+            )?;
+        }
         let setup = multi_channel_setup(&query, context)?;
         Ok(Self {
             setup,
@@ -534,6 +565,16 @@ fn validate_endpoint_capability(
         && capability != gigaam_recognition::SilenceCapability::LegacyBlank
     {
         return Err("selected decoder does not support blank stream endpointing".into());
+    }
+    Ok(())
+}
+
+fn preflight_skip_vad(pack: &VariantPackage, runtime_available: bool) -> Result<(), String> {
+    pack.vad_model()
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "selected variant has no VAD asset for silence skipping".to_owned())?;
+    if !runtime_available {
+        return Err("native runtime capability is required for silence skipping".into());
     }
     Ok(())
 }
@@ -1928,6 +1969,72 @@ mod tests {
             )
             .is_ok()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn silence_skip_query_requires_explicit_enable_and_valid_threshold() -> Result<(), String> {
+        use gigaam_transcription::{SilenceSkipPolicy, VadProbability};
+        let default = StreamQuery::parse(Some("rate=16000"), defaults())?;
+        assert_eq!(default.config.silence_skip(), SilenceSkipPolicy::Off);
+        let enabled = StreamQuery::parse(Some("rate=16000&silence_skip=true"), defaults())?;
+        assert_eq!(
+            enabled.config.silence_skip(),
+            SilenceSkipPolicy::AcousticWindow {
+                threshold: VadProbability::DEFAULT
+            }
+        );
+        let explicit = StreamQuery::parse(
+            Some("rate=16000&endpoint=vad&silence_skip=1&skip_vad_threshold=0.25"),
+            defaults(),
+        )?;
+        assert_eq!(
+            explicit.config.silence_skip(),
+            SilenceSkipPolicy::AcousticWindow {
+                threshold: VadProbability::new(0.25)?
+            }
+        );
+        for query in [
+            "rate=16000&skip_vad_threshold=0.5",
+            "rate=16000&silence_skip=false&skip_vad_threshold=0.5",
+            "rate=16000&silence_skip=other",
+            "rate=16000&silence_skip=true&skip_vad_threshold=NaN",
+            "rate=16000&silence_skip=true&skip_vad_threshold=1.1",
+            "rate=16000&silence_skip=true&silence_skip=true",
+            "rate=16000&silence_skip=true&skip_vad_threshold=",
+        ] {
+            assert!(
+                StreamQuery::parse(Some(query), defaults()).is_err(),
+                "accepted {query}"
+            );
+        }
+        let mut non16 = defaults();
+        non16.stream_base = StreamConfig::checked_default(SampleRate::new(8_000)?)?;
+        assert!(StreamQuery::parse(Some("rate=16000&silence_skip=true"), non16).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn enabled_skip_preflight_requires_native_vad_capability() -> Result<(), String> {
+        let fixture = crate::tests::assembly_fixture()?;
+        let settings = ServiceAdmission::new(1, 1, Duration::from_secs(1))?;
+        let telemetry = test_support::prepare(1, 1)?;
+        let admission = Arc::new(AdmissionState::new(&settings)?);
+        let state = refusal_path_state(
+            &fixture,
+            admission,
+            telemetry.metrics_arc(),
+            telemetry.producer(),
+        )?;
+        assert!(super::PreparedStream::parse(Some("rate=16000"), &state.context).is_ok());
+        assert!(
+            super::PreparedStream::parse(Some("rate=16000&silence_skip=true"), &state.context)
+                .is_err()
+        );
+        assert!(super::preflight_skip_vad(&fixture.pack, true).is_err());
+        fixture.write_injected_vad_asset()?;
+        assert!(super::preflight_skip_vad(&fixture.pack, false).is_err());
+        assert!(super::preflight_skip_vad(&fixture.pack, true).is_ok());
         Ok(())
     }
 

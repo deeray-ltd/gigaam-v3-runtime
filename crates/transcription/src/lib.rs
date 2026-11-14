@@ -35,9 +35,10 @@ pub use channel_selection::{
 };
 pub use contracts::{
     BackchannelMark, BatchConfig, ChannelSnapshot, ChannelWord, DialogTurn, EndpointSource,
-    FinalReason, PadPolicy, SnapshotWord, StageTimings, StreamConfig, StreamEmissionMode,
-    StreamEvent, StreamLockPolicy, StreamTimingChanges, StreamWord, StreamingChannelPolicy,
-    Transcript, TranscriptWord, Turn, TurnsPatch, VadProbability, WordFinality, WordStability,
+    FinalReason, PadPolicy, SilenceSkipPolicy, SnapshotWord, StageTimings, StreamConfig,
+    StreamEmissionMode, StreamEvent, StreamLockPolicy, StreamTimingChanges, StreamWord,
+    StreamingChannelPolicy, Transcript, TranscriptWord, Turn, TurnsPatch, VadProbability,
+    WordFinality, WordStability,
 };
 pub use dialog::{BackchannelDuration, BackchannelPolicy, DialogMerger};
 pub use endpoint::{Endpoint, EndpointRules, SpeechState, detect, segments, trailing_silence};

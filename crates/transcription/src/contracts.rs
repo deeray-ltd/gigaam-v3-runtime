@@ -595,6 +595,15 @@ pub enum EndpointSource {
     Vad,
 }
 
+/// Optional conservative acoustic gate for streaming recognition windows.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum SilenceSkipPolicy {
+    /// Decode every scheduled window as before.
+    Off,
+    /// Skip only wholly subthreshold windows with no pending transcript work.
+    AcousticWindow { threshold: VadProbability },
+}
+
 /// How the stable frontier affects the committed streaming prefix.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StreamLockPolicy {
@@ -631,6 +640,7 @@ pub struct StreamConfig {
     sample_rate: SampleRate,
     endpoint_source: EndpointSource,
     vad_threshold: VadProbability,
+    silence_skip: SilenceSkipPolicy,
     window_sec: f32,
     overlap_sec: f32,
     step_sec: f32,
@@ -650,6 +660,7 @@ pub struct StreamConfig {
 struct StreamConfigValues {
     endpoint_source: EndpointSource,
     vad_threshold: VadProbability,
+    silence_skip: SilenceSkipPolicy,
     window_sec: f32,
     overlap_sec: f32,
     step_sec: f32,
@@ -665,6 +676,7 @@ impl StreamConfigValues {
         Self {
             endpoint_source: config.endpoint_source,
             vad_threshold: config.vad_threshold,
+            silence_skip: config.silence_skip,
             window_sec: config.window_sec,
             overlap_sec: config.overlap_sec,
             step_sec: config.step_sec,
@@ -682,6 +694,7 @@ impl StreamConfig {
         let StreamConfigValues {
             endpoint_source,
             vad_threshold,
+            silence_skip,
             window_sec,
             overlap_sec,
             step_sec,
@@ -699,7 +712,9 @@ impl StreamConfig {
         finite_positive(horizon_sec, "stream horizon duration")?;
         finite_nonnegative(seam_after_sec, "stream seam delay")?;
         rules.validate()?;
-        if endpoint_source == EndpointSource::Vad {
+        if endpoint_source == EndpointSource::Vad
+            || matches!(silence_skip, SilenceSkipPolicy::AcousticWindow { .. })
+        {
             let model_rate = sample_rate
                 .as_usize()
                 .map_err(|error| format!("vad endpoint model rate: {error}"))?;
@@ -726,6 +741,7 @@ impl StreamConfig {
             sample_rate,
             endpoint_source,
             vad_threshold,
+            silence_skip,
             window_sec,
             overlap_sec,
             step_sec,
@@ -751,6 +767,7 @@ impl StreamConfig {
             StreamConfigValues {
                 endpoint_source: EndpointSource::Blank,
                 vad_threshold: VadProbability::DEFAULT,
+                silence_skip: SilenceSkipPolicy::Off,
                 window_sec: 30.0,
                 overlap_sec: 6.0,
                 step_sec: 0.5,
@@ -785,6 +802,18 @@ impl StreamConfig {
         self.vad_threshold = value;
         self.validate()?;
         Ok(self)
+    }
+
+    /// Selects the optional acoustic predecode gate.
+    pub fn with_silence_skip(mut self, value: SilenceSkipPolicy) -> Result<Self, String> {
+        self.silence_skip = value;
+        self.validate()?;
+        Ok(self)
+    }
+
+    /// Returns the configured acoustic predecode policy.
+    pub const fn silence_skip(&self) -> SilenceSkipPolicy {
+        self.silence_skip
     }
 
     pub fn with_rules(mut self, value: EndpointRules) -> Result<Self, String> {
@@ -916,6 +945,7 @@ impl StreamTimingChanges {
             sample_rate,
             endpoint_source,
             vad_threshold,
+            silence_skip,
             window_sec,
             overlap_sec,
             step_sec,
@@ -931,6 +961,7 @@ impl StreamTimingChanges {
             StreamConfigValues {
                 endpoint_source,
                 vad_threshold,
+                silence_skip,
                 window_sec: match self.window_sec {
                     Some(value) => value,
                     None => window_sec,
@@ -1286,8 +1317,8 @@ pub(crate) fn checkpoint(control: &ExecutionControl) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        BatchConfig, EndpointSource, PadPolicy, StreamConfig, StreamConfigValues, StreamEvent,
-        StreamLockPolicy, TranscriptWord, VadProbability,
+        BatchConfig, EndpointSource, PadPolicy, SilenceSkipPolicy, StreamConfig,
+        StreamConfigValues, StreamEvent, StreamLockPolicy, TranscriptWord, VadProbability,
     };
     use crate::endpoint::EndpointRules;
     use crate::stream::{EndpointDetector, StreamSession, StreamSetup};
@@ -1459,6 +1490,7 @@ mod tests {
             StreamConfigValues {
                 endpoint_source: EndpointSource::Blank,
                 vad_threshold: VadProbability::DEFAULT,
+                silence_skip: SilenceSkipPolicy::Off,
                 window_sec: 4.0,
                 overlap_sec: 1.0,
                 step_sec: 0.5,

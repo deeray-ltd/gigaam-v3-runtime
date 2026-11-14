@@ -239,3 +239,12 @@ per-frame greedy argmax or representative-path labels alongside original token o
 RNN-T carries occurrences without inventing a CTC alignment. An alignment-derived mask is not
 an acoustic silence declaration. Batch observations preserve the label kind and streaming
 requires an acoustic or manual endpoint when the decoder does not declare legacy blank silence.
+
+
+The optional streaming silence gate observes the complete retained real-audio window before an
+Advance decode. A channel owns one detector for both the gate and VAD endpointing, reusing the
+observation when both apply. Only all-subthreshold windows with no pending transcript work skip;
+they do not produce a synthetic decoder result. A processed-sample cursor is distinct from the
+feature cache and decoded position, and rollover retains real overlap and source time. Nonempty
+flush decodes normally. The native CTC WebSocket validates enabled policy and selected VAD
+capability before upgrade; non-deadline work still uses the existing execution ownership.
