@@ -13,8 +13,9 @@ use crate::json::{JSON_CONTENT_TYPE, Json, error_object, obj};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use gigaam_transcription::{
-    DialogTurn, EndpointSource, FinalReason, MultiChannelStep, SourceChannelCount, StreamConfig,
-    StreamEvent, StreamLockPolicy, StreamWord, TurnsPatch, WordFinality, WordStability,
+    DialogTurn, EndpointSource, FinalReason, MultiChannelStep, SilenceSkipPolicy,
+    SourceChannelCount, StreamConfig, StreamEvent, StreamLockPolicy, StreamWord, TurnsPatch,
+    WordFinality, WordStability,
 };
 
 /// Confirms the immutable policy bound to an active session without claiming channel activation.
@@ -37,7 +38,7 @@ pub(crate) fn applied_config_event(config: &StreamConfig) -> String {
         StreamLockPolicy::Advisory => "advisory",
         StreamLockPolicy::CommitStable => "commit_stable",
     };
-    obj(vec![
+    let mut fields = vec![
         ("type", Json::str("applied_stream_config")),
         ("schema_version", Json::Usize(1)),
         (
@@ -72,8 +73,17 @@ pub(crate) fn applied_config_event(config: &StreamConfig) -> String {
             ]),
         ),
         ("vad", vad),
-    ])
-    .to_string()
+    ];
+    if let SilenceSkipPolicy::AcousticWindow { threshold } = config.silence_skip() {
+        fields.push((
+            "silence_skip",
+            obj(vec![
+                ("enabled", Json::Bool(true)),
+                ("threshold", Json::Num(f64::from(threshold.get()))),
+            ]),
+        ));
+    }
+    obj(fields).to_string()
 }
 
 fn word_json(word: &StreamWord) -> Json {
@@ -233,10 +243,17 @@ mod tests {
                 "\"vad\":{\"enabled\":true,\"threshold\":0.699999988079071}}"
             )
         );
-        let blank = applied_config_event(&config.with_endpoint_source(EndpointSource::Blank)?);
+        let blank =
+            applied_config_event(&config.clone().with_endpoint_source(EndpointSource::Blank)?);
         assert!(blank.contains("\"endpoint\":\"blank\""));
         assert!(blank.ends_with("\"vad\":{\"enabled\":false}}"));
         assert!(!blank.contains("threshold"));
+        let enabled =
+            config.with_silence_skip(gigaam_transcription::SilenceSkipPolicy::AcousticWindow {
+                threshold: VadProbability::new(0.25)?,
+            })?;
+        let projected = applied_config_event(&enabled);
+        assert!(projected.contains("\"silence_skip\":{\"enabled\":true,\"threshold\":0.25}"));
         Ok(())
     }
 

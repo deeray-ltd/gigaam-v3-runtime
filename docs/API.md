@@ -223,6 +223,8 @@ validates this query:
 | emit | turns, words, both | turns |
 | endpoint | blank, vad | blank |
 | vad_threshold | Finite probability in [0, 1]; requires endpoint=vad | 0.5 |
+| silence_skip | true or false; optional acoustic predecode gate | false |
+| skip_vad_threshold | Finite probability in [0, 1]; requires silence_skip=true | 0.5 |
 | silence_ms | Finite nonnegative after-speech silence, milliseconds | 1200 |
 | no_speech_ms | Finite nonnegative silence without recognized speech, milliseconds | 2400 |
 | window | Finite positive seconds | 30 |
@@ -248,7 +250,15 @@ Overlap and retained silence may truncate to zero. Both blank and VAD endpointin
 silence rules, seam delay, and retained silence. Only an explicit `vad_threshold` requires
 `endpoint=vad`. Enabled VAD requires a 16000 Hz model/frontend; `rate` still describes the
 source audio, which is resampled normally. These controls preserve the existing endpoint
-algorithm and do not enable batch segmentation or skip recognition on silence.
+algorithm and do not enable batch segmentation. Optional `silence_skip=true` separately
+checks the entire retained real-audio window before an Advance decode. It skips frontend and
+recognition work only when every probability is below `skip_vad_threshold` and no words,
+seam or un-emitted update are pending. Equality counts as speech. Enabled skipping requires
+a 16000 Hz model and the selected package's VAD asset; it shares one detector per channel
+with VAD endpointing. Off requires no detector for skipping. Retained overlap and source time
+stay intact; a nonempty flush still decodes. Detection errors and cancellation refuse the
+tick rather than treating it as silence. This does not promise interruption of a VAD or
+recognition call, acoustic timestamp accuracy or a speedup.
 
 The connection reserves one streaming admission permit per requested source channel, not
 per socket. It cannot reserve more than the configured streaming limit even though the
@@ -291,7 +301,7 @@ The server sends JSON text frames:
 
 | Type | Fields | Meaning |
 | --- | --- | --- |
-| applied_stream_config | type, schema_version, model_sample_rate, endpoint, window_sec, overlap_sec, step_sec, horizon_sec, lock, seam_after_sec, keep_silence_sec, endpoint_rules, vad | Opt-in confirmation of the immutable policy bound to the active session. |
+| applied_stream_config | type, schema_version, model_sample_rate, endpoint, window_sec, overlap_sec, step_sec, horizon_sec, lock, seam_after_sec, keep_silence_sec, endpoint_rules, vad, optional silence_skip | Opt-in confirmation of the immutable policy bound to the active session. |
 | words | type, at, revise_from, words | Replace the channel word tail at revise_from. Each word has start, end, text, stable. |
 | stable | type, at, upto | Word order is settled through upto. |
 | final | type, at, upto, endpoint | Output is immutable through upto; endpoint indicates endpoint-caused finality. |
@@ -302,7 +312,9 @@ The server sends JSON text frames:
 `applied_config=1` or `true` requests one `applied_stream_config` event after successful
 active-session construction and before transcript events. Its version-1 object has the same
 fields and numeric semantics as the CLI applied-policy record below; the WebSocket horizon
-default remains 5 seconds. Values come from the setup bound to the actual session. The event
+default remains 5 seconds. When skipping is enabled, the event adds `silence_skip` with
+`enabled: true` and the effective `threshold`; when disabled that field is omitted and the
+existing event is unchanged. Values come from the setup bound to the actual session. The event
 does not assert completed inference or selected physical-channel identities: deduplication
 may defer channel activation until enough input arrives. No record is sent after failed
 construction or shutdown before opening. An already-ready active shutdown takes precedence

@@ -160,8 +160,15 @@ an actual model-specific streaming path and acceptance. WebRTC is deferred.
 Batch VAD groups consecutive padded detector spans within the configured recognition window;
 it retains intervening original audio and source time. CLI and native WebSocket expose the
 existing streaming endpoint controls, including optional confirmation of applied policy.
-Preserve independent detector thresholds, speech and silence durations, and padding, together
-with validated window, overlap, step, horizon, seam, and endpoint settings. Make supported
+The shared streaming core and native CTC WebSocket now provide opt-in conservative acoustic
+silence skipping with retained context and source time. Real-model quality and cost acceptance
+and the later Realtime interface join remain open. An existing empty-seam behavior can drop a
+leading word when skipping is off; [issue 39](https://github.com/deeray-ltd/gigaam-v3-runtime/issues/39)
+tracks that separately. On one short CTC boundary fixture, strict off/on equality failed because
+skipping retained the spoken word that the existing off-path seam discarded; matching decode
+inputs and outputs located the difference after decoding. This observation is specific to that
+fixture and does not establish a general rule for added words. Preserve independent detector
+thresholds, speech and silence durations, and padding, together with validated window, overlap, step, horizon, seam, and endpoint settings. Make supported
 settings consistently available and explicit across applicable file and streaming interfaces;
 reject invalid or inapplicable combinations and bind model-rate-dependent values before work.
 Evaluate short and quiet speech, multiple channels, endpoint behavior and quality across
@@ -174,7 +181,7 @@ VAD, encoder and decoder execution, stitching, and response projection. Measure 
 stage costs and memory under representative batch and streaming workloads before selecting
 optimizations; preserve recognition quality, timestamps, cancellation, bounded admission,
 and provider behavior. Review window reuse, avoidable copying and allocation, threading,
-queue fairness and optional silence skipping against their quality and resource tradeoffs.
+queue fairness and the measured silence-skipping tradeoffs against recognition quality and resource use.
 
 ### CTC precision selection
 

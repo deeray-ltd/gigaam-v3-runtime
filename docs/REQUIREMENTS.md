@@ -237,3 +237,20 @@ and release material describe the same behavior in more detail and do not contra
   observations and cancellation refuse before their candidate state is accepted.
 - Scope: Recognition decoder implementors and Transcription streaming sessions; process
   adapters expose only their separately documented endpoint selectors.
+
+### STREAM-SKIP-001 · Optional acoustic predecode gate
+
+- Requirement: The streaming core defaults to decoding scheduled windows. When explicitly
+  enabled, it skips an Advance window only after one valid complete real-buffer VAD observation
+  is strictly below the configured threshold and no word, seam or un-emitted update is pending.
+  The skip performs no recognition frontend or decoder call, preserves real overlap and source
+  time, and tracks processed position separately from decoded feature state. Speech-positive
+  windows and nonempty flushes decode normally. One channel-local detector serves both skip and
+  VAD endpointing; invalid observations and cancellation refuse before candidate state commits.
+  The native CTC WebSocket exposes the explicit policy and refuses incompatible threshold,
+  model-rate, missing selected VAD asset or runtime capability before upgrade.
+- Source: [Issue 20](https://github.com/deeray-ltd/gigaam-v3-runtime/issues/20); Owner: runtime
+  maintainers. Scope: Transcription streaming and native CTC WebSocket configuration; status:
+  implemented for this boundary, with real-model and Realtime acceptance tracked separately.
+  Validation: controlled call, source-clock, detector and refusal witnesses plus applicable native
+  tests. Supersession: an explicit revised streaming requirement replaces this record.
