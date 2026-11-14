@@ -1004,7 +1004,8 @@ mod tests {
             StartupEnvironment {
                 encoder_ep: Some("cpu"),
                 ort_dylib: Some(""),
-                ..default_provider_environment()
+                variant: Some("v3_ctc"),
+                ..StartupEnvironment::default()
             },
         )
         .expect_err("an empty environment path must be refused");
