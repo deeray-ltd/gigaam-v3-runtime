@@ -211,3 +211,21 @@ endpoint and commit on flush. Public process selectors remain separately defined
 **Cost.** Existing downstream decoder implementations must declare their capability. VAD
 classifications may depend on the independent window context; sample accounting does not imply
 partition-invariant model output.
+
+
+## Conservative acoustic predecode skipping
+
+**Context.** Streaming can repeatedly decode a fully silent retained window, but token absence
+is not an acoustic observation and aggressive cropping can lose recognition context.
+
+**Decision.** Keep skipping off by default. When enabled, use one per-channel detector to
+classify the full real window and reuse that observation for VAD endpointing. Skip an Advance
+only when every probability is strictly below the threshold and no transcript work is pending.
+Retain original audio, overlap and source clock; track processed ticks separately from computed
+features, and decode a nonempty flush. Errors and cancellation refuse before state acceptance.
+The CTC WebSocket checks the enabled policy and VAD prerequisites before upgrade.
+
+**Cost and feedback.** This conservative gate can leave recognition work after speech and adds
+VAD cost; it makes no general quality or speed guarantee. Whole native calls can finish after
+cancellation. Reconsider it if source-time, context or transcript invariants fail, or if measured
+quality and total cost support a different bounded strategy. Realtime integration is separate.

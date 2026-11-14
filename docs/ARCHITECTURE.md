@@ -231,3 +231,12 @@ Recognition decoders declare an immutable silence-mask capability. Transcription
 legacy blank heuristic only for decoders declaring it; non-legacy VAD sessions accumulate
 newly observed source samples across bounded windows. Core manual sessions commit on flush.
 The process adapters expose only the endpoint selectors listed in the API documentation.
+
+
+The optional streaming silence gate observes the complete retained real-audio window before an
+Advance decode. A channel owns one detector for both the gate and VAD endpointing, reusing the
+observation when both apply. Only all-subthreshold windows with no pending transcript work skip;
+they do not produce a synthetic decoder result. A processed-sample cursor is distinct from the
+feature cache and decoded position, and rollover retains real overlap and source time. Nonempty
+flush decodes normally. The native CTC WebSocket validates enabled policy and selected VAD
+capability before upgrade; non-deadline work still uses the existing execution ownership.
