@@ -507,8 +507,20 @@ impl WindowDecoder for RnntDecoder {
         features: FeatureMatrixView<'_>,
         detail: crate::contracts::ScoreDetail,
     ) -> Result<Decoded, String> {
+        let control = crate::ExecutionControl::without_deadline();
+        self.decode_in_context(features, detail, &control)
+    }
+
+    fn decode_in_context(
+        &mut self,
+        features: FeatureMatrixView<'_>,
+        detail: crate::contracts::ScoreDetail,
+        control: &crate::ExecutionControl,
+    ) -> Result<Decoded, String> {
+        control.checkpoint()?;
         let started = Instant::now();
         let encoded = self.encoder.forward_rnnt(features)?;
+        control.checkpoint()?;
         let encoder_seconds = started.elapsed().as_secs_f64();
         let scored = detail == crate::contracts::ScoreDetail::TokenLogProbabilities;
         let (output, output_frames) = match (&mut self.transition, encoded) {
@@ -519,12 +531,13 @@ impl WindowDecoder for RnntDecoder {
                     encoder_dimension: self.encoder_dimension,
                 };
                 (
-                    rnnt::greedy_with_detail(
+                    rnnt::greedy_typed_in_context(
                         transition,
                         &frames,
                         self.blank,
                         self.max_symbols_per_step,
                         scored,
+                        control,
                     )?,
                     count,
                 )
@@ -536,12 +549,13 @@ impl WindowDecoder for RnntDecoder {
                     encoder_dimension: self.encoder_dimension,
                 };
                 (
-                    rnnt::greedy_with_detail(
+                    rnnt::greedy_typed_in_context(
                         transition,
                         &frames,
                         self.blank,
                         self.max_symbols_per_step,
                         scored,
+                        control,
                     )?,
                     count,
                 )
@@ -553,12 +567,13 @@ impl WindowDecoder for RnntDecoder {
                     encoder_dimension: self.encoder_dimension,
                 };
                 (
-                    rnnt::greedy_typed_with_detail(
+                    rnnt::greedy_typed_in_context(
                         transition,
                         &frames,
                         self.blank,
                         self.max_symbols_per_step,
                         scored,
+                        control,
                     )?,
                     count,
                 )
@@ -567,8 +582,10 @@ impl WindowDecoder for RnntDecoder {
                 return Err("native FP16 encoder requires FP16 RNN-T heads".into());
             }
         };
+        control.checkpoint()?;
         let words = ctc::tokens_to_words(output.tokens(), &self.vocabulary, self.frame_rate)?;
         let spans = ctc::word_token_spans(output.tokens(), &self.vocabulary);
+        control.checkpoint()?;
         Decoded::new_with_tokens(crate::contracts::DecodedTokensInput {
             words,
             silence: output.silence().to_vec(),

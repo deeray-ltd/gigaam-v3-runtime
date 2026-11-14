@@ -95,12 +95,34 @@ fn greedy_masked_with_detail(
     space: Option<usize>,
     scored: bool,
 ) -> Result<GreedyMaskedOutput, String> {
+    greedy_masked_in_context(
+        log_probabilities,
+        frames,
+        vocabulary,
+        blank,
+        space,
+        scored,
+        &crate::ExecutionControl::without_deadline(),
+    )
+}
+
+fn greedy_masked_in_context(
+    log_probabilities: &[f32],
+    frames: usize,
+    vocabulary: usize,
+    blank: usize,
+    space: Option<usize>,
+    scored: bool,
+    control: &crate::ExecutionControl,
+) -> Result<GreedyMaskedOutput, String> {
+    control.checkpoint()?;
     validate_greedy_input(log_probabilities, frames, vocabulary, blank, space)?;
     let mut out = Vec::new();
     let mut silence = Vec::with_capacity(frames);
     let mut labels = Vec::with_capacity(frames);
     let mut previous = usize::MAX;
     for frame in 0..frames {
+        control.checkpoint()?;
         let row = &log_probabilities[frame * vocabulary..(frame + 1) * vocabulary];
         let mut best = 0_usize;
         for (index, &value) in row.iter().enumerate() {
@@ -323,19 +345,34 @@ impl<E: Encoder> WindowDecoder for CtcDecoder<E> {
         features: FeatureMatrixView<'_>,
         detail: crate::contracts::ScoreDetail,
     ) -> Result<Decoded, String> {
+        let control = crate::ExecutionControl::without_deadline();
+        self.decode_in_context(features, detail, &control)
+    }
+
+    fn decode_in_context(
+        &mut self,
+        features: FeatureMatrixView<'_>,
+        detail: crate::contracts::ScoreDetail,
+        control: &crate::ExecutionControl,
+    ) -> Result<Decoded, String> {
+        control.checkpoint()?;
         let started = Instant::now();
         let (log_probabilities, output_frames) = self.encoder.forward(features)?;
+        control.checkpoint()?;
         let encoder_seconds = started.elapsed().as_secs_f64();
-        let (tokens, silence, labels) = greedy_masked_with_detail(
+        let (tokens, silence, labels) = greedy_masked_in_context(
             &log_probabilities,
             output_frames,
             self.encoder.out_dim(),
             self.blank,
             self.silence_policy.space_token(),
             detail == crate::contracts::ScoreDetail::TokenLogProbabilities,
+            control,
         )?;
+        control.checkpoint()?;
         let word_spans = word_token_spans(&tokens, &self.vocabulary);
         let words = tokens_to_words(&tokens, &self.vocabulary, self.frame_rate)?;
+        control.checkpoint()?;
         Decoded::new_with_labels(
             words,
             silence,

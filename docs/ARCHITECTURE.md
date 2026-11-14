@@ -160,8 +160,14 @@ facades may omit the runtime, but a request selecting native VAD then refuses.
 HTTP batch work receives a shared execution control. When its deadline publishes a 504,
 queued or successor windows cannot start after cancellation is observed; the admission
 permit remains owned until the work terminalizes; and a late result cannot replace the
-timeout response. An already executing native call may finish. Streaming and offline
-non-deadline paths use explicit non-cancelling execution control.
+timeout response. Transcription passes that same control through normal, scored, warmup and
+flush window decoding. Scheduled contextual calls refuse a control with different shared identity;
+legacy scheduled calls use the bound control, while direct native legacy calls create an operation
+control. Boxed decoders preserve all entry points. Decoder algorithms check cancellation between
+supported steps without terminally completing the request. An already executing native call may
+finish and retains worker capacity until return; whole VAD calls, validation and reconstruction do
+not promise interruption within the call. Streaming and offline non-deadline paths use explicit
+control without a deadline.
 
 The scheduler currently gives Tick work strict priority before Window work. That is a
 selected implementation baseline, not a compatibility promise or a fairness guarantee.

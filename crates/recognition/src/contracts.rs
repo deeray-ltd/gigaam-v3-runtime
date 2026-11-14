@@ -368,6 +368,18 @@ pub trait WindowDecoder {
 
     fn decode(&mut self, features: FeatureMatrixView<'_>) -> Result<Decoded, String>;
 
+    fn decode_in_context(
+        &mut self,
+        features: FeatureMatrixView<'_>,
+        detail: ScoreDetail,
+        control: &crate::ExecutionControl,
+    ) -> Result<Decoded, String> {
+        control.checkpoint()?;
+        let result = self.decode_with_detail(features, detail);
+        control.checkpoint()?;
+        result
+    }
+
     fn decode_with_detail(
         &mut self,
         features: FeatureMatrixView<'_>,
@@ -402,6 +414,15 @@ impl WindowDecoder for Box<dyn WindowDecoder> {
         detail: ScoreDetail,
     ) -> Result<Decoded, String> {
         (**self).decode_with_detail(features, detail)
+    }
+
+    fn decode_in_context(
+        &mut self,
+        features: FeatureMatrixView<'_>,
+        detail: ScoreDetail,
+        control: &crate::ExecutionControl,
+    ) -> Result<Decoded, String> {
+        (**self).decode_in_context(features, detail, control)
     }
 }
 

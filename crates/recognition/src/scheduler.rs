@@ -138,7 +138,7 @@ impl ExecutionScheduler {
                 send_event(job.events.clone(), JobEvent::Started);
 
                 match catch_unwind(AssertUnwindSafe(|| {
-                    decoder.decode_with_detail(job.features.view(), job.detail)
+                    decoder.decode_in_context(job.features.view(), job.detail, &job.control)
                 })) {
                     Ok(result) => {
                         if job.control.cancellation_won() {
@@ -340,6 +340,19 @@ impl WindowDecoder for ScheduledRecognizer {
         features: FeatureMatrixView<'_>,
         detail: crate::contracts::ScoreDetail,
     ) -> Result<Decoded, String> {
+        let control = self.control.clone();
+        self.decode_in_context(features, detail, &control)
+    }
+
+    fn decode_in_context(
+        &mut self,
+        features: FeatureMatrixView<'_>,
+        detail: crate::contracts::ScoreDetail,
+        control: &ExecutionControl,
+    ) -> Result<Decoded, String> {
+        if !self.control.shares_identity(control) {
+            return Err("execution control does not match scheduled request".into());
+        }
         self.control.enqueue()?;
         let (events_tx, events_rx): (Sender<JobEvent>, Receiver<JobEvent>) = mpsc::channel();
         self.enqueue(Job {
@@ -421,6 +434,111 @@ mod tests {
         wait_until("the expected pending queue depth", || {
             scheduler.pending() == expected
         });
+    }
+
+    #[test]
+    fn boxed_scheduled_calls_preserve_identity_and_detail() {
+        use crate::contracts::ScoreDetail;
+        struct DetailFake(Arc<Mutex<Vec<ScoreDetail>>>);
+        impl WindowDecoder for DetailFake {
+            fn silence_capability(&self) -> crate::SilenceCapability {
+                crate::SilenceCapability::LegacyBlank
+            }
+            fn frame_rate(&self) -> FrameRate {
+                FrameRate::new(25.0).expect("valid rate")
+            }
+            fn decode(&mut self, features: FeatureMatrixView<'_>) -> Result<Decoded, String> {
+                self.0.lock().expect("test lock").push(ScoreDetail::None);
+                decoded(features.frames())
+            }
+            fn decode_with_detail(
+                &mut self,
+                features: FeatureMatrixView<'_>,
+                detail: ScoreDetail,
+            ) -> Result<Decoded, String> {
+                self.0.lock().expect("test lock").push(detail);
+                decoded(features.frames())
+            }
+        }
+        let details = Arc::new(Mutex::new(Vec::new()));
+        let scheduler = ExecutionScheduler::spawn(DetailFake(Arc::clone(&details)));
+        let control = ExecutionControl::for_request();
+        let mut decoder: Box<dyn WindowDecoder> =
+            Box::new(scheduler.window_channel(control.clone()));
+        let input = features(1);
+        assert!(
+            decoder
+                .decode_in_context(
+                    input.view(),
+                    ScoreDetail::None,
+                    &ExecutionControl::for_request()
+                )
+                .is_err()
+        );
+        assert_eq!(scheduler.pending(), 0);
+        assert_eq!(control.state(), ExecutionState::Ready);
+        decoder.decode(input.view()).expect("boxed legacy decode");
+        decoder
+            .decode_with_detail(input.view(), ScoreDetail::TokenLogProbabilities)
+            .expect("boxed scored decode");
+        decoder
+            .decode_in_context(input.view(), ScoreDetail::None, &control.clone())
+            .expect("shared control");
+        assert_eq!(
+            *details.lock().expect("test lock"),
+            vec![
+                ScoreDetail::None,
+                ScoreDetail::TokenLogProbabilities,
+                ScoreDetail::None
+            ]
+        );
+    }
+
+    #[test]
+    fn default_context_rejects_cancellation_before_and_after_legacy_decode() {
+        use crate::contracts::ScoreDetail;
+        struct Legacy {
+            control: ExecutionControl,
+            calls: usize,
+        }
+        impl WindowDecoder for Legacy {
+            fn silence_capability(&self) -> crate::SilenceCapability {
+                crate::SilenceCapability::LegacyBlank
+            }
+            fn frame_rate(&self) -> FrameRate {
+                FrameRate::new(25.0).expect("valid rate")
+            }
+            fn decode(&mut self, features: FeatureMatrixView<'_>) -> Result<Decoded, String> {
+                self.calls += 1;
+                self.control.request_cancellation();
+                decoded(features.frames())
+            }
+        }
+        let control = ExecutionControl::for_request();
+        let mut legacy = Legacy {
+            control: control.clone(),
+            calls: 0,
+        };
+        let input = features(1);
+        assert!(
+            legacy
+                .decode_in_context(input.view(), ScoreDetail::None, &control)
+                .is_err()
+        );
+        assert_eq!(legacy.calls, 1);
+        assert!(
+            legacy
+                .decode_in_context(input.view(), ScoreDetail::None, &control)
+                .is_err()
+        );
+        assert_eq!(legacy.calls, 1);
+        let live = ExecutionControl::for_request();
+        assert!(
+            legacy
+                .decode_in_context(input.view(), ScoreDetail::TokenLogProbabilities, &live)
+                .is_err()
+        );
+        assert_eq!(legacy.calls, 1);
     }
 
     #[test]
