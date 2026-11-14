@@ -33,6 +33,15 @@ pub struct VariantPrecision {
     pub rnnt_heads_fp16: bool,
 }
 
+/// Explicit precision and width for one selected V3 RNN-T beam decoder.
+#[derive(Clone, Copy, Debug)]
+pub struct RnntBeamSelection {
+    /// Precision of the selected encoder and RNN-T heads.
+    pub precision: VariantPrecision,
+    /// Positive maximum number of retained prefixes; no automatic width is chosen.
+    pub width: usize,
+}
+
 /// A concrete selected recognizer. Process adapters choose this once and keep its provider plan
 /// outside the decoder interface.
 pub struct DirectRecognizer(Implementation);
@@ -125,6 +134,23 @@ impl DirectRecognizer {
                 RnntDecoder::from_variant(pack, (runtime, plan), precision, full_rnnt_fp16)?,
             )))),
         }
+    }
+
+    /// Constructs a V3 RNN-T recognizer with an explicitly selected beam width.
+    ///
+    /// The selected package supplies the tokenizer and symbol cap. The decoder reuses its
+    /// encoder, prediction and joint sessions and returns representative token scores and
+    /// emission frames. Beam width one is not guaranteed to match greedy decoding. Native
+    /// calls may finish after cooperative cancellation is requested.
+    pub fn variant_rnnt_beam(
+        pack: &VariantPackage,
+        runtime: &NativeRuntime,
+        plan: &ProviderPlan,
+        selection: RnntBeamSelection,
+    ) -> Result<Self, String> {
+        Ok(Self(Implementation::Rnnt(Box::new(
+            RnntDecoder::from_variant_beam(pack, (runtime, plan), selection)?,
+        ))))
     }
 
     pub const fn encoder_precision(&self) -> EncoderPrecision {
