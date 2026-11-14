@@ -28,8 +28,9 @@ refuse rather than selecting a default.
 
 Set `ASR_API_MODE=openai` to expose `POST /v1/audio/transcriptions` and `GET /v1/models`.
 Native `/v1/transcribe` and `/v1/stream` are unavailable in this mode. The model list
-contains `gigaam-v3` and `gigaam-v3-ctc`, plus `gigaam-v3-rnnt` when RNN-T is loaded.
-`gigaam-v3` selects CTC. These are local model identifiers.
+contains the exact loaded variant and its matching family aliases. CTC exposes `gigaam-v3`
+and `gigaam-v3-ctc`; RNN-T exposes `gigaam-v3-rnnt`. `gigaam-v3` always means CTC and
+refuses on an RNN-T instance. An explicit other variant or family refuses.
 
 Send multipart form data with `file` and `model`. The optional `response_format` is
 `json` (default), `text`, or `verbose_json`; `language` must be `ru` when supplied and
@@ -62,7 +63,7 @@ to select a decoder. Its configured body boundary is described in
 
 | Query key | Accepted values | Default |
 | --- | --- | --- |
-| model | ctc; rnnt only when the service loaded RNN-T | ctc |
+| model | selected exact V3 identity or matching `ctc` / `rnnt` family | loaded variant |
 | ext | wav, flac, ogg, opus, mp3, aac, m4a, mp4, mkv, vorbis, pcm | source detection |
 | words | 1, 0, true, false | false |
 | segments | 1, 0, true, false | false |
@@ -127,7 +128,8 @@ turns is present only when requested and multichannel output exists; each item h
 channel, start, end, and text.
 
 Version 1 preserves the established response body. Explicit version 2 adds
-`schema_version: 2` and `applied.vad`. With VAD disabled that object is exactly
+`schema_version: 2`, the exact loaded `variant`, and `applied.vad`. The existing `model`
+field remains the family (`ctc` or `rnnt`). With VAD disabled that object is exactly
 `{"enabled":false}`. With VAD enabled it contains `enabled:true`, `sample_rate:16000`,
 `threshold`, `neg_threshold`, `min_speech_ms`, `min_silence_ms`, and `speech_pad_ms` from
 the validated policy actually used by the batch call. Policy values preserve the bound
@@ -189,8 +191,8 @@ owned until that call returns and the request actually terminalizes.
 
 ## Health, liveness, readiness, and metrics
 
-GET /health returns a JSON object with status set to ok, a models array containing ctc and,
-when loaded, rnnt, and the selected provider string cpu, cuda, or tensorrt. It is a
+GET /health returns a JSON object with status set to ok, a models array containing the
+single loaded V3 variant identity, and the selected provider string cpu, cuda, or tensorrt. It is a
 capability projection, not a real-model inference probe.
 
 GET /livez returns {"status":"alive"}. GET /readyz returns {"status":"ready"} while
@@ -328,26 +330,26 @@ positionals, invalid UTF-8 arguments, and invalid scalar values refuse. It has n
 help or version command grammar.
 
 ~~~text
-asr transcribe FILE [--model DIR] [--ep cpu|cuda|tensorrt] [--ort-dylib PATH]
+asr transcribe FILE [--model DIR] [--variant ID] [--ep cpu|cuda|tensorrt] [--ort-dylib PATH]
                     [--fp16] [--ctc-precision fp32|fp16io32|fp16] [--rnnt] [--rnnt-precision fp32|fp16] [--window S] [--overlap S] [--pad]
                     [--words] [--split-channels] [--turns] [--turn-gap S]
                     [--evidence PATH] [--evidence-version 1|2]
                     [--vad] [--vad-threshold F] [--vad-neg-threshold F]
                     [--vad-min-speech-ms N] [--vad-min-silence-ms N] [--vad-speech-pad-ms N]
 
-asr bench [--audio FILE] [--model DIR] [--ep cpu|cuda|tensorrt] [--ort-dylib PATH]
+asr bench [--audio FILE] [--model DIR] [--variant ID] [--ep cpu|cuda|tensorrt] [--ort-dylib PATH]
           [--fp16] [--ctc-precision fp32|fp16io32|fp16] [--window S] [--iters N] [--gap-ms N] [--alt-window S]
 
-asr stream FILE [--model DIR] [--ep cpu|cuda|tensorrt] [--ort-dylib PATH]
+asr stream FILE [--model DIR] [--variant ID] [--ep cpu|cuda|tensorrt] [--ort-dylib PATH]
               [--fp16] [--ctc-precision fp32|fp16io32|fp16] [--chunk-ms N] [--step-ms N] [--horizon S]
               [--window S] [--overlap S] [--endpoint blank|vad] [--silence-ms N]
               [--no-speech-ms N] [--vad-threshold F] [--seam-after S] [--keep-silence S]
               [--ref FILE] [--lock] [--events] [--applied-config]
 
-asr vad FILE [--model DIR] [--ort-dylib PATH] [--threshold F] [--neg-threshold F]
+asr vad FILE [--model DIR] [--variant ID] [--ort-dylib PATH] [--threshold F] [--neg-threshold F]
            [--min-speech-ms N] [--min-silence-ms N] [--speech-pad-ms N] [--channels all|0,2]
 
-asr dialog FILE [--model DIR] [--ep cpu|cuda|tensorrt] [--ort-dylib PATH]
+asr dialog FILE [--model DIR] [--variant ID] [--ep cpu|cuda|tensorrt] [--ort-dylib PATH]
               [--ctc-precision fp32|fp16io32|fp16]
               [--turn-gap S] [--endpoint blank|vad] [--no-dedup]
               [--backchannel-max-ms N] [--window S] [--overlap S] [--step-ms N]
@@ -486,7 +488,9 @@ the footer. A late final write/flush failure still fails the command and may lea
 bytes, so success requires both zero CLI exit status and a valid complete file. The format
 does not promise atomic publication or durable storage.
 
-For applicable commands, --model defaults to model. --ort-dylib or ORT_DYLIB_PATH is
+For applicable commands, `--variant` or `ASR_MODEL_VARIANT` selects an exact V3 variant;
+when both are supplied they must agree. Omission retains the legacy V1/V2 CLI path. A V3
+RNN-T transcribe needs no `--rnnt`; that flag is an optional RNN-T assertion. `--model` defaults to model. --ort-dylib or ORT_DYLIB_PATH is
 required; when both are present, they must be identical. Provider selection and runtime
 environment follow [OPERATIONS.md](OPERATIONS.md).
 
@@ -496,9 +500,9 @@ This is process configuration, not an HTTP or WebSocket field. With selected CUD
 `ASR_CUDA_ASSIGNMENT_POLICY` is absent or `verified` by default and requires the exact
 64-hex-character SHA-256 value for every encoder role the command or Service will construct:
 `ASR_CUDA_CTC_ASSIGNMENT_SHA256` and, when RNN-T is required,
-`ASR_CUDA_RNNT_ASSIGNMENT_SHA256`. Service requires CTC and also RNN-T unless started with
-`--no-rnnt`; ordinary transcribe, bench, stream, and dialog require CTC; RNN-T transcribe
-requires RNN-T; VAD requires neither.
+`ASR_CUDA_RNNT_ASSIGNMENT_SHA256`. Service requires only its selected variant's family role;
+CLI transcribe requires its selected family, bench, stream and dialog require CTC, and VAD
+requires neither.
 
 `ASR_CUDA_ASSIGNMENT_POLICY=allow-unverified` is the only bypass. It conflicts with either
 fingerprint setting and skips fingerprint equality only. The session still refuses an empty

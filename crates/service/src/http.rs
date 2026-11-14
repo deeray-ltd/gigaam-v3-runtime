@@ -118,9 +118,11 @@ pub(crate) fn openai_routes(state: HttpState) -> HttpRoutes {
 
 async fn openai_models(State(state): State<HttpState>) -> Response {
     use crate::json::{Json, obj};
-    let mut names = vec!["gigaam-v3", "gigaam-v3-ctc"];
-    if state.context.capabilities.rnnt.is_some() {
-        names.push("gigaam-v3-rnnt");
+    let variant = state.context.capabilities.pack.variant();
+    let mut names = vec![variant.as_str()];
+    match variant.family() {
+        gigaam_model_package::ModelFamily::Ctc => names.extend(["gigaam-v3", "gigaam-v3-ctc"]),
+        gigaam_model_package::ModelFamily::Rnnt => names.push("gigaam-v3-rnnt"),
     }
     let data = names
         .into_iter()
@@ -180,7 +182,7 @@ async fn parse_openai_multipart(
         }
         fields.push((name, filename, bytes));
     }
-    crate::openai::parse_fields(fields, state.context.capabilities.rnnt.is_some())
+    crate::openai::parse_fields_for_variant(fields, state.context.capabilities.pack.variant())
 }
 
 async fn openai_transcribe(State(state): State<HttpState>, request: Request) -> Response {
@@ -277,7 +279,7 @@ async fn openai_transcribe(State(state): State<HttpState>, request: Request) -> 
                 progress: &work_progress,
             },
             || {
-                Vad::from_pack(
+                Vad::from_variant(
                     &capabilities.pack,
                     capabilities.native_runtime()?,
                     capabilities.intra_threads,
@@ -469,7 +471,13 @@ impl BatchModel {
         match value {
             None | Some("ctc") => Ok(Self::Ctc),
             Some("rnnt") => Ok(Self::Rnnt),
-            Some(value) => Err(format!("model must be ctc or rnnt, got {value:?}")),
+            Some(value) => match value.parse::<gigaam_model_package::VariantId>() {
+                Ok(variant) => Ok(match variant.family() {
+                    gigaam_model_package::ModelFamily::Ctc => Self::Ctc,
+                    gigaam_model_package::ModelFamily::Rnnt => Self::Rnnt,
+                }),
+                Err(_) => Err(format!("unknown model {value:?}")),
+            },
         }
     }
 
@@ -490,7 +498,60 @@ struct TranscribeQuery {
     vad: Option<VadPolicyConfig>,
 }
 
+#[derive(Debug)]
+enum QueryBindError {
+    Invalid(String),
+    Unavailable {
+        version: ResponseVersion,
+        message: &'static str,
+    },
+}
+impl QueryBindError {
+    fn response(self) -> Response {
+        match self {
+            Self::Invalid(message) => json_err(StatusCode::BAD_REQUEST, message),
+            Self::Unavailable { version, message } => transcribe_error_response(
+                version,
+                StatusCode::BAD_REQUEST,
+                TranscribeErrorCode::UnsupportedCapability,
+                message,
+            ),
+        }
+    }
+}
+
 impl TranscribeQuery {
+    fn parse_for_variant(
+        raw: Option<&str>,
+        variant: gigaam_model_package::VariantId,
+    ) -> Result<Self, QueryBindError> {
+        let parameters = QueryParameters::parse(raw).map_err(QueryBindError::Invalid)?;
+        let value = parameters.get("model");
+        let mut query = Self::parse(raw).map_err(QueryBindError::Invalid)?;
+        let selected = match variant.family() {
+            gigaam_model_package::ModelFamily::Ctc => BatchModel::Ctc,
+            gigaam_model_package::ModelFamily::Rnnt => BatchModel::Rnnt,
+        };
+        if value.is_none() {
+            query.model = selected;
+        }
+        if let Some(value) = value
+            && let Ok(requested) = value.parse::<gigaam_model_package::VariantId>()
+            && requested != variant
+        {
+            return Err(QueryBindError::Unavailable {
+                version: query.response_version,
+                message: "requested variant is not loaded",
+            });
+        }
+        if query.model != selected {
+            return Err(QueryBindError::Unavailable {
+                version: query.response_version,
+                message: "requested model family is not loaded",
+            });
+        }
+        Ok(query)
+    }
     fn parse(raw: Option<&str>) -> Result<Self, String> {
         let parameters = QueryParameters::parse(raw)?;
         parameters.reject_unknown(&[
@@ -872,17 +933,15 @@ async fn upload_transcribe(State(state): State<HttpState>, request: Request) -> 
             return json_err(StatusCode::BAD_REQUEST, error);
         }
     };
-    let query = match TranscribeQuery::parse(request.uri().query()) {
+    let query = match TranscribeQuery::parse_for_variant(
+        request.uri().query(),
+        state.context.capabilities.pack.variant(),
+    ) {
         Ok(query) => query,
         Err(error) => {
             state.metrics.transcribe();
             state.metrics.transcribe_error();
-            return complete_early_response(
-                &state,
-                &request_id,
-                started,
-                json_err(StatusCode::BAD_REQUEST, error),
-            );
+            return complete_early_response(&state, &request_id, started, error.response());
         }
     };
     let reader = match state.admission.admit_upload() {
@@ -973,13 +1032,16 @@ async fn transcribe_inner(
             &request_id,
         );
     }
-    let query = match TranscribeQuery::parse(query_text.as_deref()) {
+    let query = match TranscribeQuery::parse_for_variant(
+        query_text.as_deref(),
+        state.context.capabilities.pack.variant(),
+    ) {
         Ok(query) => query,
         Err(error) => {
             metrics.transcribe_error();
             drop(body);
             drop(reader);
-            return with_request_id(json_err(StatusCode::BAD_REQUEST, error), &request_id);
+            return with_request_id(error.response(), &request_id);
         }
     };
     let model = query.model.as_str().to_owned();
@@ -1081,7 +1143,7 @@ struct BatchWork<'a> {
 fn do_transcribe(work: BatchWork<'_>) -> Result<String, TranscribeError> {
     let capabilities = &work.context.capabilities;
     do_transcribe_with_vad_factory(work, || {
-        Vad::from_pack(
+        Vad::from_variant(
             &capabilities.pack,
             capabilities.native_runtime()?,
             capabilities.intra_threads,
@@ -1096,6 +1158,7 @@ fn do_transcribe_with_vad_factory<D: SpeechProbabilityDetector>(
     factory: impl FnOnce() -> Result<D, String>,
 ) -> Result<String, TranscribeError> {
     let query = work.query;
+    let work_variant = work.context.capabilities.pack.variant().as_str();
     let progress = work.progress;
     let (result, duration, source_rate, rtf) = run_batch(work, factory, false, false)?;
     let options = query.options;
@@ -1114,6 +1177,7 @@ fn do_transcribe_with_vad_factory<D: SpeechProbabilityDetector>(
             source_channels: result.source_channels(),
             duplicate: result.duplicate(),
             model: query.model.as_str(),
+            variant: work_variant,
             rtf,
         });
         Ok(response.to_string())
@@ -1134,12 +1198,16 @@ fn run_batch<D: SpeechProbabilityDetector>(
         control,
         progress,
     } = work;
-    let scheduler = match query.model {
-        BatchModel::Ctc => &context.capabilities.ctc,
-        BatchModel::Rnnt => context.capabilities.rnnt.as_ref().ok_or_else(|| {
-            TranscribeError::UnsupportedCapability("rnnt model is not loaded".into())
-        })?,
+    let selected = match context.capabilities.pack.variant().family() {
+        gigaam_model_package::ModelFamily::Ctc => BatchModel::Ctc,
+        gigaam_model_package::ModelFamily::Rnnt => BatchModel::Rnnt,
     };
+    if query.model != selected {
+        return Err(TranscribeError::UnsupportedCapability(
+            "requested model is not loaded".into(),
+        ));
+    }
+    let scheduler = &context.capabilities.scheduler;
     if query.vad.is_some() || scored {
         if context
             .capabilities
@@ -1157,7 +1225,8 @@ fn run_batch<D: SpeechProbabilityDetector>(
             .capabilities
             .pack
             .vad_model()
-            .map_err(|error| TranscribeError::UnsupportedCapability(error.to_string()))?;
+            .map_err(|error| TranscribeError::UnsupportedCapability(error.to_string()))?
+            .ok_or_else(|| TranscribeError::UnsupportedCapability("VAD is not declared".into()))?;
     }
     let loaded = progress.stage(BatchStage::AudioDecode, || {
         let encoded = EncodedAudio::new(bytes, query.extension.clone())
@@ -1298,6 +1367,46 @@ impl<D: SpeechProbabilityDetector> SpeechProbabilityDetector for ObservedVad<'_,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn selected_variant_binds_native_model_and_rejects_other_variants() {
+        use gigaam_model_package::VariantId;
+        for (variant, family) in [
+            (VariantId::V3Ctc, BatchModel::Ctc),
+            (VariantId::V3E2eCtc, BatchModel::Ctc),
+            (VariantId::V3Rnnt, BatchModel::Rnnt),
+            (VariantId::V3E2eRnnt, BatchModel::Rnnt),
+        ] {
+            assert_eq!(
+                TranscribeQuery::parse_for_variant(None, variant)
+                    .expect("omitted selects loaded")
+                    .model,
+                family
+            );
+            assert_eq!(
+                TranscribeQuery::parse_for_variant(
+                    Some(&format!("model={}", variant.as_str())),
+                    variant
+                )
+                .expect("matching variant")
+                .model,
+                family
+            );
+            let other = if variant == VariantId::V3Ctc {
+                VariantId::V3E2eCtc
+            } else {
+                VariantId::V3Ctc
+            };
+            assert!(
+                TranscribeQuery::parse_for_variant(
+                    Some(&format!("model={}", other.as_str())),
+                    variant
+                )
+                .is_err()
+            );
+        }
+    }
+
     use crate::admission::RequestWorkOwner;
     use crate::admission::ServiceAdmission;
     use crate::context::ApplicationContext;
@@ -1415,6 +1524,9 @@ mod tests {
             run("ext=wav&response_version=2&vad=false")?
                 .contains("\"applied\":{\"vad\":{\"enabled\":false}}")
         );
+        let v2 = run("ext=wav&response_version=2&vad=false")?;
+        assert!(v2.contains("\"model\":\"ctc\""));
+        assert!(v2.contains("\"variant\":\"v3_ctc\""));
         assert_eq!(calls.get(), 0);
         assert!(
             run("ext=wav&response_version=2&vad=true").is_err(),
@@ -1720,6 +1832,10 @@ mod tests {
                 Some("unsupported_capability"),
             ),
             (
+                "response_version=2&model=v3_e2e_ctc",
+                Some("unsupported_capability"),
+            ),
+            (
                 "response_version=2&vad=true",
                 Some("unsupported_capability"),
             ),
@@ -1778,7 +1894,7 @@ mod tests {
     }
 
     fn histogram_count(metrics: &Metrics, name: &str) -> u64 {
-        let rendered = metrics.render(0, 0, 0, None);
+        let rendered = metrics.render(0, 0, Some(0), None);
         let prefix = format!("{name}_count ");
         let line = rendered
             .lines()
@@ -1830,8 +1946,7 @@ mod tests {
             native_runtime: None,
             pack: Arc::clone(&fixture.pack),
             frontend: Arc::clone(&fixture.frontend),
-            ctc: Arc::new(ExecutionScheduler::spawn(TerminalDecoder)),
-            rnnt: None,
+            scheduler: Arc::new(ExecutionScheduler::spawn(TerminalDecoder)),
             provider: Device::Cpu,
             intra_threads: None,
         })?;
@@ -1900,7 +2015,7 @@ mod tests {
         Arc::get_mut(&mut state.context)
             .expect("the test has not shared its application context yet")
             .capabilities
-            .ctc = Arc::new(ExecutionScheduler::spawn(ControlledDecoder {
+            .scheduler = Arc::new(ExecutionScheduler::spawn(ControlledDecoder {
             started: Some(started_tx),
             release: release_rx,
         }));
@@ -2463,7 +2578,7 @@ mod tests {
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
         let context = Arc::get_mut(&mut state.context).ok_or("test context has an extra owner")?;
-        context.capabilities.ctc = Arc::new(ExecutionScheduler::spawn(ControlledDecoder {
+        context.capabilities.scheduler = Arc::new(ExecutionScheduler::spawn(ControlledDecoder {
             started: Some(started_tx),
             release: release_rx,
         }));
@@ -2940,7 +3055,7 @@ mod tests {
     }
 
     fn metric_counter(metrics: &Metrics, name: &str) -> u64 {
-        let rendered = metrics.render(1, 1, 0, None);
+        let rendered = metrics.render(1, 1, Some(0), None);
         let prefix = format!("{name} ");
         let line = match rendered.lines().find(|line| line.starts_with(&prefix)) {
             Some(line) => line,
@@ -3066,7 +3181,7 @@ mod tests {
         assert!(
             failing
                 .metrics()
-                .render(1, 1, 0, None)
+                .render(1, 1, Some(0), None)
                 .contains("asr_telemetry_write_failures_total{destination=\"stdout\"} 1\n")
         );
         drop(failing_producer);

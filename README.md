@@ -22,7 +22,7 @@ may change.
 - Offline commands through asr: transcribe, bench, stream, vad, and dialog.
 - CPU and CUDA execution, plus TensorRT loading of engines prepared offline.
 - RNN-T encoder, prediction and joint use the selected provider, with explicit FP32/FP16 selection.
-- Typed V1/V2 model-package validation before selected asset or native-session use.
+- Typed V3 single-variant Service package validation; V1/V2 remain available to library and CLI users.
 - Bounded Service admission, cooperative HTTP batch cancellation, Prometheus metrics, and
   bounded best-effort runtime access/trace telemetry.
 
@@ -62,8 +62,9 @@ cargo build --release --package gigaam-service --no-default-features
 export ORT_DYLIB_PATH=/path/to/libonnxruntime.so.1.29.0
 export LD_LIBRARY_PATH=/path/to/onnxruntime/lib
 
-./target/release/asr transcribe audio.wav --model model --words
-./target/release/asr-serve --model model --port 8080
+# The example package declares variant=v3_ctc.
+./target/release/asr transcribe audio.wav --model model --variant v3_ctc --words
+./target/release/asr-serve --model model --variant v3_ctc --port 8080
 
 curl --data-binary @audio.wav \
   'http://127.0.0.1:8080/v1/transcribe?model=ctc&words=true'
@@ -112,29 +113,11 @@ before relying on it, and prefer a CUDA or TensorRT provider for streaming.
 ## Docker images
 
 Published images are on Docker Hub at [deerayltd/asr](https://hub.docker.com/r/deerayltd/asr).
-They contain no model. Choose a released version and pin its provider tag or digest from
-[the release notes](https://github.com/deeray-ltd/gigaam-v3-runtime/releases/latest).
-Tags follow `deerayltd/asr:<version>-cpu`, `-cuda` and `-tensorrt`; the dynamic release link
-is for discovery, not an instruction to automatically upgrade a running service.
-Mount a compatible model package read-only at `/app/model`:
-
-Replace `<released-version>` below with the selected version (without the `v` prefix).
-
-~~~sh
-ASR_VERSION='<released-version>'
-docker pull "deerayltd/asr:${ASR_VERSION}-cpu"
-
-docker run --rm -p 127.0.0.1:8080:8080 \
-  --mount type=bind,src="$PWD/model",dst=/app/model,readonly \
-  "deerayltd/asr:${ASR_VERSION}-cpu"
-~~~
-
-The CUDA and TensorRT images additionally need `--gpus all`; the CUDA image also needs the
-verified encoder placement fingerprints described in [docs/OPERATIONS.md](docs/OPERATIONS.md).
-CPU/CUDA accept V1 ONNX packages and compatible V2 ONNX packages. TensorRT requires V2
-`artifact_format=trt_ep_context` with engines prepared for the selected runtime, hardware
-and shapes. Prepare the artifacts offline with `scripts/prepare_gpu_model.py`; see
-[model preparation](docs/MODELS.md#version-2-gpu-artifacts).
+The released 0.1.1 images use the legacy V1/V2 paired-package Service contract; consult the
+[pinned 0.1.1 documentation](https://github.com/deeray-ltd/gigaam-v3-runtime/tree/v0.1.1)
+for their startup and model requirements. Do not assume an existing release has the V3
+single-variant startup described below. For any later published version, use that version's
+own release notes and documentation before selecting its tag or digest.
 
 ### Building from source
 
@@ -148,6 +131,7 @@ docker buildx build --load --platform linux/amd64 \
   -f Dockerfile.cpu -t gigaam-v3-runtime:cpu .
 
 docker run --rm -p 127.0.0.1:8080:8080 \
+  -e ASR_MODEL_VARIANT=v3_ctc \
   --mount type=bind,src="$PWD/model",dst=/app/model,readonly \
   gigaam-v3-runtime:cpu
 ~~~
@@ -175,7 +159,7 @@ particular model, native library, GPU, or deployment.
 - [docs/REQUIREMENTS.md](docs/REQUIREMENTS.md) — canonical product and engineering requirements
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — capability ownership and data flow
 - [docs/DECISIONS.md](docs/DECISIONS.md) — design choices and costs
-- [docs/MODELS.md](docs/MODELS.md) — V1/V2 package contracts and offline engine preparation
+- [docs/MODELS.md](docs/MODELS.md) — V1/V2 and V3 package contracts and offline engine preparation
 - [docs/API.md](docs/API.md) — HTTP, WebSocket, and CLI contracts
 - [docs/OPERATIONS.md](docs/OPERATIONS.md) — configuration, telemetry, lifecycle, and images
 - [docs/ROADMAP.md](docs/ROADMAP.md) — deferred work, why it is deferred, and what unlocks it

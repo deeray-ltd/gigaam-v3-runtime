@@ -156,8 +156,9 @@ preparation; this command does not fall back to another builder.
 
 ## Version 3 single-variant metadata
 
-`VariantPackage` accepts V3 metadata for one explicit variant; the current Service and CLI
-continue to use V1/V2 and do not run V3 packages. `variant` is exactly `v3_ctc`, `v3_rnnt`,
+`VariantPackage` accepts V3 metadata for one explicit variant. Service requires V3 and a
+matching explicit selection; CLI supports that selection while retaining legacy V1/V2 operation
+when none is specified. `variant` is exactly `v3_ctc`, `v3_rnnt`,
 `v3_e2e_ctc`, or `v3_e2e_rnnt`. Base variants declare `tokenizer.kind=characters`;
 end-to-end variants declare `tokenizer.kind=sentencepiece` and require `tokenizer.model`.
 
@@ -183,7 +184,7 @@ order, including any literal-space row. Blank is external at that count; CTC out
 is count plus one. Positive dimensions, ordered positive clamps, a window no longer than FFT,
 and the frame-rate relation are validated from declarations. The declared f64 rate and
 `sample_rate / (hop_length * subsampling_factor)` must map to the same finite positive f32.
-Native compatibility and source/tokenizer consistency need separate evidence. To migrate a
+Native construction checks the selected family, encoder format and tokenizer capability; RNN-T requires one prediction layer in the current adapter. Actual graph compatibility and source/tokenizer consistency need separate evidence. To migrate a
 legacy pack, export a sibling V3 package from the actual selected source and preserve all
 nonblank token indices; do not infer identity from filenames or vocabulary size.
 

@@ -5,6 +5,7 @@
 //! Offline batch-transcription command adapter.
 
 use crate::composition;
+use crate::composition::Package;
 use crate::configuration;
 use crate::grammar::{
     ChannelOutput, DecoderChoice, EvidenceVersion, TranscribeInvocation, TranscribeOutput,
@@ -15,7 +16,6 @@ use crate::projection::{
     evidence_token,
 };
 use gigaam_audio::load;
-use gigaam_model_package::ModelPackage;
 use gigaam_primitives::f64_to_f32;
 use gigaam_recognition::{ExecutionControl, FrameRate, RequiredEncoderRoles, vad::VAD_SR};
 use gigaam_transcription::{
@@ -28,18 +28,28 @@ use std::time::Instant;
 
 /// Executes a complete direct batch transcription without a service scheduler.
 pub(crate) fn run(invocation: TranscribeInvocation) -> Result<(), String> {
-    let ctc_precision = match invocation.decoder {
+    let variant = composition::resolve_variant(&invocation.runtime)?;
+    let decoder = selected_decoder(
+        variant,
+        invocation.decoder,
+        DecoderAssertions {
+            rnnt: invocation.rnnt_asserted,
+            ctc_precision: invocation.ctc_precision.is_some(),
+            rnnt_precision: invocation.rnnt_precision.is_some(),
+        },
+    )?;
+    let ctc_precision = match decoder {
         DecoderChoice::Ctc => Some(configuration::ctc_precision(
             invocation.ctc_precision,
             invocation.precision == gigaam_model_package::EncoderPrecision::Fp16Io32,
         )?),
         DecoderChoice::Rnnt => None,
     };
-    let required_roles = match invocation.decoder {
+    let required_roles = match decoder {
         DecoderChoice::Ctc => RequiredEncoderRoles::ctc(),
         DecoderChoice::Rnnt => RequiredEncoderRoles::rnnt(),
     };
-    let rnnt_precision = match invocation.decoder {
+    let rnnt_precision = match decoder {
         DecoderChoice::Ctc => None,
         DecoderChoice::Rnnt => configuration::rnnt_precision(
             invocation.rnnt_precision,
@@ -47,7 +57,7 @@ pub(crate) fn run(invocation: TranscribeInvocation) -> Result<(), String> {
         )?,
     };
     let evidence_path = configuration::evidence_path(invocation.evidence.clone())?;
-    if evidence_path.is_some() && invocation.decoder == DecoderChoice::Rnnt {
+    if evidence_path.is_some() && decoder == DecoderChoice::Rnnt {
         return Err("--evidence requires CTC; it does not support --rnnt".into());
     }
     if evidence_path.is_some()
@@ -69,7 +79,7 @@ pub(crate) fn run(invocation: TranscribeInvocation) -> Result<(), String> {
         configuration::frontend_mode().map_err(|error| format!("frontend: {error}"))?;
     let mut observations = projection::observations(trace_mode);
 
-    let package = composition::open_package(&invocation.model)?;
+    let package = composition::open_package(&invocation.model, variant)?;
     let sample_rate = composition::package_sample_rate(&package)?;
     if vad_policy.is_some() && sample_rate.as_usize()? != VAD_SR {
         return Err(format!(
@@ -92,7 +102,8 @@ pub(crate) fn run(invocation: TranscribeInvocation) -> Result<(), String> {
         .transpose()?;
     let frontend = composition::frontend_for_package(&package, frontend_mode)
         .map_err(|error| format!("frontend: {error}"))?;
-    let decoder = match invocation.decoder {
+    let decoder_choice = decoder;
+    let decoder = match decoder_choice {
         DecoderChoice::Ctc => {
             let decoder = composition::ctc_recognizer(
                 &package,
@@ -187,7 +198,7 @@ pub(crate) fn run(invocation: TranscribeInvocation) -> Result<(), String> {
         config,
         output: invocation.output,
         precision: effective_precision,
-        rnnt_head_precision: match invocation.decoder {
+        rnnt_head_precision: match decoder_choice {
             DecoderChoice::Ctc => None,
             DecoderChoice::Rnnt => {
                 Some(rnnt_precision.unwrap_or(gigaam_recognition::RnntPrecisionSelection::Fp32))
@@ -202,13 +213,48 @@ pub(crate) fn run(invocation: TranscribeInvocation) -> Result<(), String> {
     Ok(())
 }
 
+struct DecoderAssertions {
+    rnnt: bool,
+    ctc_precision: bool,
+    rnnt_precision: bool,
+}
+
+fn selected_decoder(
+    variant: Option<gigaam_model_package::VariantId>,
+    legacy: DecoderChoice,
+    options: DecoderAssertions,
+) -> Result<DecoderChoice, String> {
+    let DecoderAssertions {
+        rnnt: rnnt_asserted,
+        ctc_precision,
+        rnnt_precision,
+    } = options;
+    let decoder = match variant {
+        Some(variant) => match variant.family() {
+            gigaam_model_package::ModelFamily::Ctc if rnnt_asserted => {
+                return Err("--rnnt conflicts with CTC variant".into());
+            }
+            gigaam_model_package::ModelFamily::Ctc => DecoderChoice::Ctc,
+            gigaam_model_package::ModelFamily::Rnnt => DecoderChoice::Rnnt,
+        },
+        None => legacy,
+    };
+    if decoder == DecoderChoice::Rnnt && ctc_precision {
+        return Err("--ctc-precision does not apply to RNN-T".into());
+    }
+    if decoder == DecoderChoice::Ctc && rnnt_precision {
+        return Err("--rnnt-precision requires RNN-T".into());
+    }
+    Ok(decoder)
+}
+
 /// Opens the evidence file and writes its selected version and `model` header lines from the
 /// package's own typed frontend and CTC definitions. The subsampling factor is derived, never a
 /// hard-coded constant, through the exact function the batch window loop uses internally.
 fn open_evidence_writer(
     path: &Path,
     model_path: &Path,
-    package: &ModelPackage,
+    package: &Package,
     version: EvidenceVersion,
 ) -> Result<EvidenceWriter, String> {
     let model_id = evidence_token(model_path, "model")?;
@@ -223,13 +269,15 @@ fn open_evidence_writer(
     let vocabulary = package
         .ctc_vocabulary()
         .map_err(|error| format!("model: {error}"))?;
-    let space = vocabulary.iter().position(|piece| piece == "\u{2581}");
+    let space = vocabulary
+        .iter()
+        .position(|piece| piece == package.space_piece());
     EvidenceWriter::create(
         path,
         EvidenceModelHeader {
             model_id: &model_id,
             frames_per_sec: frame_rate.get(),
-            blank: package.ctc().blank_id(),
+            blank: package.blank_id(),
             vocab_size: vocabulary.len(),
             space,
             subsampling,
@@ -250,6 +298,59 @@ fn batch_channel_policy(output: TranscribeOutput) -> BatchChannelPolicy {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn variant_selects_family_and_validates_assertions() {
+        use super::{DecoderAssertions, DecoderChoice, selected_decoder};
+        use gigaam_model_package::VariantId;
+        let options = || DecoderAssertions {
+            rnnt: false,
+            ctc_precision: false,
+            rnnt_precision: false,
+        };
+        assert_eq!(
+            selected_decoder(Some(VariantId::V3E2eRnnt), DecoderChoice::Ctc, options())
+                .expect("variant selects RNN-T"),
+            DecoderChoice::Rnnt
+        );
+        assert_eq!(
+            selected_decoder(None, DecoderChoice::Ctc, options()).expect("legacy default"),
+            DecoderChoice::Ctc
+        );
+        assert!(
+            selected_decoder(
+                Some(VariantId::V3Ctc),
+                DecoderChoice::Rnnt,
+                DecoderAssertions {
+                    rnnt: true,
+                    ..options()
+                }
+            )
+            .is_err()
+        );
+        assert!(
+            selected_decoder(
+                Some(VariantId::V3Rnnt),
+                DecoderChoice::Ctc,
+                DecoderAssertions {
+                    ctc_precision: true,
+                    ..options()
+                }
+            )
+            .is_err()
+        );
+        assert!(
+            selected_decoder(
+                None,
+                DecoderChoice::Ctc,
+                DecoderAssertions {
+                    rnnt_precision: true,
+                    ..options()
+                }
+            )
+            .is_err()
+        );
+    }
+
     use super::batch_channel_policy;
     use crate::grammar::{ChannelOutput, TranscribeOutput, TurnOutput, WordOutput};
     use gigaam_transcription::BatchChannelPolicy;

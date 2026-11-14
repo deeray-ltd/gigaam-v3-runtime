@@ -20,7 +20,10 @@ pub(crate) fn run(invocation: VadInvocation) -> Result<(), String> {
         .map_err(|error| format!("runtime configuration: {error}"))?;
     let config = invocation.policy.bind()?;
 
-    let package = composition::open_package(&invocation.model)?;
+    let package = composition::open_package(
+        &invocation.model,
+        composition::resolve_variant(&invocation.runtime)?,
+    )?;
     let native = composition::initialize_runtime(&runtime)?;
     let mut detector = composition::vad(&package, &native, runtime.plan().intra_threads())
         .map_err(|error| format!("vad: {error}"))?;

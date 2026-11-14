@@ -11,7 +11,7 @@
 
 use crate::admission::{RequestBodyLimit, ServiceAdmission};
 use gigaam_audio::{FrontendProcessor, SampleRate};
-use gigaam_model_package::ModelPackage;
+use gigaam_model_package::VariantPackage;
 use gigaam_recognition::{Device, ExecutionScheduler, NativeRuntime};
 use gigaam_transcription::{BatchConfig, ObservationMode, PadPolicy, StreamConfig};
 use std::num::NonZeroUsize;
@@ -25,10 +25,9 @@ pub(crate) fn model_sample_rate(value: usize) -> Result<SampleRate, String> {
 
 /// All recognition resources accepted atomically by the service facade.
 pub struct ServiceCapabilitiesParameters {
-    pub pack: Arc<ModelPackage>,
+    pub pack: Arc<VariantPackage>,
     pub frontend: Arc<FrontendProcessor>,
-    pub ctc: Arc<ExecutionScheduler>,
-    pub rnnt: Option<Arc<ExecutionScheduler>>,
+    pub scheduler: Arc<ExecutionScheduler>,
     /// Runtime required for lazily constructed native VAD sessions.
     pub native_runtime: Option<NativeRuntime>,
     pub provider: Device,
@@ -40,10 +39,9 @@ pub struct ServiceCapabilitiesParameters {
 
 /// Mandatory and optional recognition capabilities owned by one service application.
 pub struct ServiceCapabilities {
-    pub(crate) pack: Arc<ModelPackage>,
+    pub(crate) pack: Arc<VariantPackage>,
     pub(crate) frontend: Arc<FrontendProcessor>,
-    pub(crate) ctc: Arc<ExecutionScheduler>,
-    pub(crate) rnnt: Option<Arc<ExecutionScheduler>>,
+    pub(crate) scheduler: Arc<ExecutionScheduler>,
     pub(crate) native_runtime: Option<NativeRuntime>,
     pub(crate) provider: Device,
     pub(crate) intra_threads: Option<NonZeroUsize>,
@@ -61,8 +59,7 @@ impl ServiceCapabilities {
         let ServiceCapabilitiesParameters {
             pack,
             frontend,
-            ctc,
-            rnnt,
+            scheduler,
             provider,
             native_runtime,
             intra_threads,
@@ -74,8 +71,7 @@ impl ServiceCapabilities {
         Ok(Self {
             pack,
             frontend,
-            ctc,
-            rnnt,
+            scheduler,
             provider,
             native_runtime,
             intra_threads,

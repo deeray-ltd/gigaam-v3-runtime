@@ -67,9 +67,9 @@ own audio validation, bounded admission, provider refusal, and lifecycle behavio
 
 ## Data and ownership flow
 
-1. Model Package validates the closed version-1 configuration before a selected asset or
-   native session is used. It exposes typed frontend, CTC, RNN-T, VAD, tensor-name, and
-   artifact definitions.
+1. Model Package validates a closed versioned configuration before selected assets or native
+   sessions are used. Service selects one V3 variant and family; the library and CLI also retain
+   V1/V2 packages. Typed frontend, tokenizer, family, VAD and artifact definitions feed Recognition.
 2. Audio decodes complete input or validated incremental frames, rejects invalid terminal
    frame state, resamples to the model rate, and creates log-mel features from package
    tables.

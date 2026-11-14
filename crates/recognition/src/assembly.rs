@@ -17,13 +17,20 @@ use crate::ort_encoder::OrtEncoder;
 use crate::ort_rnnt::RnntDecoder;
 use crate::provider::ProviderPlan;
 use gigaam_audio::FeatureMatrixView;
-use gigaam_model_package::{EncoderPrecision, ModelPackage};
+use gigaam_model_package::{EncoderPrecision, ModelFamily, ModelPackage, VariantPackage};
 
 /// Precision of the complete RNN-T neural pipeline.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RnntPrecisionSelection {
     Fp32,
     Fp16,
+}
+
+/// Precision choices for the one selected V3 family.
+#[derive(Clone, Copy, Debug)]
+pub struct VariantPrecision {
+    pub encoder: EncoderPrecision,
+    pub rnnt_heads_fp16: bool,
 }
 
 /// A concrete selected recognizer. Process adapters choose this once and keep its provider plan
@@ -85,6 +92,38 @@ impl DirectRecognizer {
                     RnntDecoder::from_pack(pack, (runtime, plan), precision, true)?,
                 ))))
             }
+        }
+    }
+
+    /// Constructs the single family declared by a validated V3 package.
+    pub fn variant(
+        pack: &VariantPackage,
+        runtime: &NativeRuntime,
+        plan: &ProviderPlan,
+        selection: VariantPrecision,
+    ) -> Result<Self, String> {
+        let precision = selection.encoder;
+        let full_rnnt_fp16 = selection.rnnt_heads_fp16;
+        match pack.variant().family() {
+            ModelFamily::Ctc => {
+                if full_rnnt_fp16 {
+                    return Err("RNN-T head precision is invalid for CTC".into());
+                }
+                // Validate tokenizer capability before native session construction.
+                let projector = crate::TokenTextProjector::new(
+                    pack.load_tokenizer().map_err(|error| error.to_string())?,
+                )?;
+                let encoder = OrtEncoder::variant(pack, runtime, plan, precision)?;
+                let assignment_evidence = encoder.assignment_evidence().cloned();
+                Ok(Self(Implementation::Ctc {
+                    decoder: Box::new(CtcDecoder::from_variant(pack, encoder, projector)?),
+                    precision,
+                    assignment_evidence,
+                }))
+            }
+            ModelFamily::Rnnt => Ok(Self(Implementation::Rnnt(Box::new(
+                RnntDecoder::from_variant(pack, (runtime, plan), precision, full_rnnt_fp16)?,
+            )))),
         }
     }
 

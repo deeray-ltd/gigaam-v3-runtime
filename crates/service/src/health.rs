@@ -22,22 +22,19 @@ use std::sync::Arc;
 #[derive(Clone)]
 pub(crate) struct HealthState {
     admission: Arc<AdmissionState>,
-    ctc: Arc<ExecutionScheduler>,
-    rnnt: Option<Arc<ExecutionScheduler>>,
+    scheduler: Arc<ExecutionScheduler>,
     projection: HealthProjection,
 }
 
 impl HealthState {
     pub(crate) fn new(
         admission: Arc<AdmissionState>,
-        ctc: Arc<ExecutionScheduler>,
-        rnnt: Option<Arc<ExecutionScheduler>>,
+        scheduler: Arc<ExecutionScheduler>,
         projection: HealthProjection,
     ) -> Self {
         Self {
             admission,
-            ctc,
-            rnnt,
+            scheduler,
             projection,
         }
     }
@@ -45,11 +42,7 @@ impl HealthState {
     /// Whether any owned recognition worker has stopped after a decoder panic. Ordinary decode
     /// errors are returned to the calling request and do not stop the worker.
     fn workers_stopped(&self) -> bool {
-        self.ctc.is_stopped()
-            || self
-                .rnnt
-                .as_ref()
-                .is_some_and(|scheduler| scheduler.is_stopped())
+        self.scheduler.is_stopped()
     }
 }
 
@@ -187,6 +180,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn health_reports_only_the_selected_rnnt_variant() {
+        let settings =
+            ServiceAdmission::new(1, 1, Duration::from_secs(1)).expect("valid admission");
+        let admission = Arc::new(AdmissionState::new(&settings).expect("valid state"));
+        let state = HealthState::new(
+            admission,
+            idle_scheduler(),
+            HealthProjection::new(Device::Cpu, gigaam_model_package::VariantId::V3E2eRnnt),
+        );
+        let response = health(State(state)).await;
+        assert_eq!(
+            to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("health body"),
+            "{\"status\":\"ok\",\"models\":[\"v3_e2e_rnnt\"],\"provider\":\"cpu\"}"
+        );
+    }
+
+    #[tokio::test]
     async fn probe_triple_preserves_exact_health_liveness_and_readiness_across_drain() {
         let settings = ServiceAdmission::new(1, 1, Duration::from_secs(1))
             .expect("positive test admission settings are valid");
@@ -196,8 +208,7 @@ mod tests {
         let state = HealthState::new(
             Arc::clone(&admission),
             idle_scheduler(),
-            None,
-            HealthProjection::new(Device::Cpu, false),
+            HealthProjection::new(Device::Cpu, gigaam_model_package::VariantId::V3Ctc),
         );
 
         let health_before = health(State(state.clone())).await;
@@ -212,7 +223,7 @@ mod tests {
             to_bytes(health_before.into_body(), usize::MAX)
                 .await
                 .expect("health response body is available"),
-            "{\"status\":\"ok\",\"models\":[\"ctc\"],\"provider\":\"cpu\"}"
+            "{\"status\":\"ok\",\"models\":[\"v3_ctc\"],\"provider\":\"cpu\"}"
         );
         let live_before = livez().await;
         assert_eq!(
@@ -237,7 +248,7 @@ mod tests {
             to_bytes(health_after.into_body(), usize::MAX)
                 .await
                 .expect("health response body is available"),
-            "{\"status\":\"ok\",\"models\":[\"ctc\"],\"provider\":\"cpu\"}"
+            "{\"status\":\"ok\",\"models\":[\"v3_ctc\"],\"provider\":\"cpu\"}"
         );
         let live_after = livez().await;
         assert_eq!(
@@ -303,8 +314,7 @@ mod tests {
         let state = HealthState::new(
             Arc::clone(&admission),
             Arc::clone(&ctc),
-            None,
-            HealthProjection::new(Device::Cpu, false),
+            HealthProjection::new(Device::Cpu, gigaam_model_package::VariantId::V3Ctc),
         );
 
         let ready_before = readyz(State(state.clone())).await;
