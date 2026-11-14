@@ -243,7 +243,7 @@ impl<D: WindowDecoder> BatchTranscriber<D> {
             return Err("recognition decoder reported an invalid stage duration".into());
         }
         if let (Some(labels), Some(tokens), Some(word_spans), Some(subsampling_factor)) = (
-            decoded.labels(),
+            decoded.frame_labels(),
             decoded.tokens(),
             decoded.word_spans(),
             geometry.subsampling_factor,
@@ -267,7 +267,7 @@ impl<D: WindowDecoder> BatchTranscriber<D> {
                 origin: geometry.first_frame / subsampling_factor,
                 output_frames: decoded.output_frames(),
                 keep_until_sec: source_offset + geometry.keep_until_sec,
-                labels: labels.to_vec(),
+                labels: labels.clone(),
                 mask: decoded.silence().to_vec(),
                 tokens: tokens.to_vec(),
                 word_spans: word_spans.to_vec(),
@@ -743,6 +743,34 @@ mod tests {
                 vec![Token::new(1, 0)],
                 vec![(0, 0)],
             )
+        }
+    }
+
+    struct BeamEvidenceDecoder;
+    impl WindowDecoder for BeamEvidenceDecoder {
+        fn silence_capability(&self) -> gigaam_recognition::SilenceCapability {
+            gigaam_recognition::SilenceCapability::RepresentativeAlignment
+        }
+        fn frame_rate(&self) -> FrameRate {
+            FrameRate::new(8.0).expect("positive rate")
+        }
+        fn decode(
+            &mut self,
+            features: gigaam_audio::FeatureMatrixView<'_>,
+        ) -> Result<Decoded, String> {
+            let frames = features.frames();
+            Decoded::new_with_frame_labels(gigaam_recognition::DecodedFrameLabelsInput {
+                words: vec![Word::new("word".into(), 0.0, 0.1)?],
+                silence: vec![false; frames],
+                output_frames: frames,
+                encoder_seconds: 0.0,
+                frame_labels: gigaam_recognition::FrameLabels::new(
+                    gigaam_recognition::FrameLabelKind::CtcRepresentativePath,
+                    vec![1; frames],
+                ),
+                tokens: vec![Token::new(1, 0)],
+                word_spans: vec![(0, 0)],
+            })
         }
     }
 
@@ -1382,6 +1410,34 @@ mod tests {
     }
 
     #[test]
+    fn batch_forwards_representative_alignment_without_argmax_reinterpretation() {
+        let observer = Arc::new(EvidenceRecordingObserver {
+            observations: Mutex::new(Vec::new()),
+        });
+        let mut batch = BatchTranscriber::new(BatchSetup {
+            frontend: test_support::frontend(),
+            decoder: BeamEvidenceDecoder,
+            config: config(),
+            control: ExecutionControl::without_deadline(),
+            observations: ObservationMode::disabled().with_evidence(observer.clone()),
+        })
+        .expect("valid setup");
+        batch
+            .transcribe_channel(&input())
+            .expect("beam evidence batch");
+        let records = observer.observations();
+        assert!(!records.is_empty());
+        for record in records {
+            assert_eq!(record.labels(), None);
+            assert_eq!(
+                record.frame_labels().kind(),
+                gigaam_recognition::FrameLabelKind::CtcRepresentativePath
+            );
+            assert_eq!(record.tokens(), &[Token::new(1, 0)]);
+        }
+    }
+
+    #[test]
     fn evidence_observer_emits_one_record_per_window_and_leaves_the_transcript_unchanged() {
         let enabled_calls = Arc::new(AtomicUsize::new(0));
         let observer = Arc::new(EvidenceRecordingObserver {
@@ -1411,7 +1467,7 @@ mod tests {
                 WindowKind::Body
             };
             assert_eq!(record.kind(), expected_kind);
-            assert_eq!(record.output_frames(), record.labels().len());
+            assert_eq!(record.output_frames(), record.frame_labels().values().len());
             assert_eq!(record.output_frames(), record.mask().len());
             assert_eq!(record.tokens(), &[Token::new(1, 0)]);
             assert_eq!(record.word_spans(), &[(0, 0)]);

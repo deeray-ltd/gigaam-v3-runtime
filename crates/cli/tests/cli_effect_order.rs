@@ -11,8 +11,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT_TEMPORARY_ROOT: AtomicU64 = AtomicU64::new(0);
 
-const PRODUCT_ENVIRONMENT_KEYS: [&str; 17] = [
+const PRODUCT_ENVIRONMENT_KEYS: [&str; 19] = [
     "ASR_MODEL_VARIANT",
+    "ASR_DECODING",
+    "ASR_BEAM_WIDTH",
     "ASR_ENCODER_EP",
     "ASR_CTC_PRECISION",
     "ASR_RNNT_PRECISION",
@@ -678,5 +680,28 @@ fn selected_rnnt_controls_precision_before_package_and_needs_no_redundant_flag()
         run(conflicting),
         "--rnnt conflicts with CTC variant",
         "conflicting variant assertion",
+    );
+}
+
+#[test]
+fn beam_evidence_refuses_legacy_format_before_package_or_native_work() {
+    let root = CliWitnessRoot::new();
+    let mut command = root.command("transcribe", root.missing_model());
+    command.args([
+        "--variant",
+        "v3_ctc",
+        "--decoding",
+        "beam",
+        "--beam-width",
+        "2",
+        "--evidence",
+        "out.txt",
+        "--evidence-version",
+        "2",
+    ]);
+    assert_exact_failure(
+        run(command),
+        "beam evidence requires version 3",
+        "beam evidence compatibility",
     );
 }

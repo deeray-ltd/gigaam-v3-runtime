@@ -79,6 +79,9 @@ pub struct CtcBeamOutput {
     tokens: Vec<Token>,
 }
 impl CtcBeamOutput {
+    pub fn into_parts(self) -> (Vec<usize>, Vec<Token>) {
+        (self.labels, self.tokens)
+    }
     /// One label per input frame, including blanks.
     pub fn labels(&self) -> &[usize] {
         &self.labels

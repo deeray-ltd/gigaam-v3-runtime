@@ -106,6 +106,7 @@ fn open_model(
             if pack.variant() != startup.variant {
                 return Err("selected variant does not match model package".into());
             }
+            gigaam_recognition::validate_variant_mode(&pack, startup.decoding)?;
             Ok(pack)
         },
         |configuration, pack| {
@@ -260,18 +261,36 @@ fn run_scoped(
                 ),
             },
         };
-        let decoder = DirectRecognizer::variant(
+        let decoder = DirectRecognizer::variant_with_mode(
             &pack,
             native,
             &startup.plan,
-            gigaam_recognition::VariantPrecision {
-                encoder: precision,
-                rnnt_heads_fp16: full_heads,
+            gigaam_recognition::VariantDecodeSelection {
+                precision: gigaam_recognition::VariantPrecision {
+                    encoder: precision,
+                    rnnt_heads_fp16: full_heads,
+                },
+                mode: startup.decoding,
             },
         )
         .map_err(|error| format!("selected decoder: {error}"))?;
         emit_ctc_construction_notice(&decoder);
         emit_unverified_cuda_assignment(&startup.plan, role, decoder.assignment_evidence());
+        let mask_capability = decoder.silence_capability();
+        match startup.decoding {
+            gigaam_recognition::DecodingMode::Greedy => {
+                eprintln!("# decoding greedy; mask {mask_capability:?}")
+            }
+            gigaam_recognition::DecodingMode::Beam { width } => {
+                eprintln!("# decoding beam width {width}; mask {mask_capability:?}")
+            }
+        }
+        if let gigaam_model_package::VariantArtifacts::Rnnt(definition) = pack.artifacts() {
+            eprintln!(
+                "# RNN-T max symbols per step {}",
+                definition.max_symbols_per_step()
+            );
+        }
         let scheduler = Arc::new(ExecutionScheduler::spawn(decoder));
         warmup(
             &scheduler,

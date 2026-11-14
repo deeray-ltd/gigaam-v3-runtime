@@ -10,7 +10,7 @@
 //! Process-independent per-window observation contracts.
 
 use crate::channel_selection::OriginalChannel;
-use gigaam_recognition::Token;
+use gigaam_recognition::{FrameLabelKind, FrameLabels, Token};
 use std::sync::Arc;
 
 /// Immutable observation emitted after a successful recognition window.
@@ -85,15 +85,15 @@ pub(crate) struct WindowEvidenceInput {
     pub(crate) origin: usize,
     pub(crate) output_frames: usize,
     pub(crate) keep_until_sec: f32,
-    pub(crate) labels: Vec<usize>,
+    pub(crate) labels: FrameLabels,
     pub(crate) mask: Vec<bool>,
     pub(crate) tokens: Vec<Token>,
     pub(crate) word_spans: Vec<(usize, usize)>,
 }
 
 /// Immutable per-window collapse-and-geometry evidence, emitted after a successful decode when a
-/// window-evidence observer is installed. It carries the CTC decoder's own raw per-frame argmax
-/// labels, its collapsed pre-word-merge tokens, and the token-index span behind each decoded
+/// window-evidence observer is installed. It carries typed CTC per-frame argmax or representative
+/// alignment labels, its collapsed pre-word-merge tokens, and the token-index span behind each decoded
 /// word, all in this window's local frame/token coordinates, so an external tool can reproduce
 /// word segmentation without re-running recognition or re-implementing the decoder's word rule.
 /// Temporal fields and `first_sample` refer to the original channel. Feature frames, `origin`,
@@ -114,7 +114,7 @@ pub struct WindowEvidence {
     origin: usize,
     output_frames: usize,
     keep_until_sec: f32,
-    labels: Vec<usize>,
+    labels: FrameLabels,
     mask: Vec<bool>,
     tokens: Vec<Token>,
     word_spans: Vec<(usize, usize)>,
@@ -134,10 +134,10 @@ impl WindowEvidence {
         if input.first_sample < input.frontend_origin_sample {
             return Err("window evidence first sample precedes its frontend origin".into());
         }
-        if input.labels.len() != input.output_frames {
+        if input.labels.values().len() != input.output_frames {
             return Err(format!(
                 "window evidence labels has {} frames, expected {}",
-                input.labels.len(),
+                input.labels.values().len(),
                 input.output_frames
             ));
         }
@@ -244,7 +244,13 @@ impl WindowEvidence {
         self.keep_until_sec
     }
 
-    pub fn labels(&self) -> &[usize] {
+    pub fn labels(&self) -> Option<&[usize]> {
+        match self.labels.kind() {
+            FrameLabelKind::GreedyArgmax => Some(self.labels.values()),
+            FrameLabelKind::CtcRepresentativePath => None,
+        }
+    }
+    pub fn frame_labels(&self) -> &FrameLabels {
         &self.labels
     }
 
@@ -335,7 +341,7 @@ impl ObservationMode {
 #[cfg(test)]
 mod tests {
     use super::{WindowEvidence, WindowEvidenceInput, WindowKind};
-    use gigaam_recognition::Token;
+    use gigaam_recognition::{FrameLabelKind, FrameLabels, Token};
 
     fn valid_input() -> WindowEvidenceInput {
         WindowEvidenceInput {
@@ -352,7 +358,7 @@ mod tests {
             origin: 0,
             output_frames: 2,
             keep_until_sec: 1.0,
-            labels: vec![0, 1],
+            labels: FrameLabels::new(FrameLabelKind::GreedyArgmax, vec![0, 1]),
             mask: vec![true, false],
             tokens: vec![Token::new(1, 1)],
             word_spans: vec![(0, 0)],
@@ -371,7 +377,7 @@ mod tests {
         assert_eq!((evidence.residue(), evidence.origin()), (0, 0));
         assert_eq!(evidence.output_frames(), 2);
         assert_eq!(evidence.keep_until_sec(), 1.0);
-        assert_eq!(evidence.labels(), &[0, 1]);
+        assert_eq!(evidence.labels(), Some(&[0, 1][..]));
         assert_eq!(evidence.mask(), &[true, false]);
         assert_eq!(evidence.tokens(), &[Token::new(1, 1)]);
         assert_eq!(evidence.word_spans(), &[(0, 0)]);
@@ -393,7 +399,7 @@ mod tests {
     #[test]
     fn window_evidence_refuses_mismatched_lengths_and_out_of_range_tokens() {
         let mut wrong_labels = valid_input();
-        wrong_labels.labels = vec![0];
+        wrong_labels.labels = FrameLabels::new(FrameLabelKind::GreedyArgmax, vec![0]);
         assert!(WindowEvidence::new(wrong_labels).is_err());
 
         let mut wrong_mask = valid_input();

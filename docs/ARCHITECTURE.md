@@ -231,3 +231,11 @@ Recognition decoders declare an immutable silence-mask capability. Transcription
 legacy blank heuristic only for decoders declaring it; non-legacy VAD sessions accumulate
 newly observed source samples across bounded windows. Core manual sessions commit on flush.
 The process adapters expose only the endpoint selectors listed in the API documentation.
+
+## Search and alignment ownership
+
+The selected native decoder owns greedy or explicit-width beam search. CTC carries typed
+per-frame greedy argmax or representative-path labels alongside original token occurrences;
+RNN-T carries occurrences without inventing a CTC alignment. An alignment-derived mask is not
+an acoustic silence declaration. Batch observations preserve the label kind and streaming
+requires an acoustic or manual endpoint when the decoder does not declare legacy blank silence.

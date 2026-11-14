@@ -20,6 +20,7 @@ use std::time::Instant;
 
 /// Executes the direct stream simulator and preserves incremental client projection.
 pub(crate) fn run(invocation: StreamInvocation) -> Result<(), String> {
+    let mode = configuration::decoding(&invocation.runtime)?;
     let precision = configuration::ctc_precision(
         invocation.ctc_precision,
         invocation.precision == gigaam_model_package::EncoderPrecision::Fp16Io32,
@@ -42,11 +43,17 @@ pub(crate) fn run(invocation: StreamInvocation) -> Result<(), String> {
         composition::resolve_variant(&invocation.runtime)?,
     )?;
     package.require_ctc()?;
+    package.require_mode(mode)?;
     let sample_rate = composition::package_sample_rate(&package)?;
     let config = invocation
         .stream_policy
         .bind(sample_rate)
         .map_err(|error| format!("stream configuration: {error}"))?;
+    if mode != gigaam_recognition::DecodingMode::Greedy
+        && config.endpoint_source() == gigaam_transcription::EndpointSource::Blank
+    {
+        return Err("beam decoding requires a non-blank endpoint".into());
+    }
     let batch_config = BatchConfig::new(
         config.sample_rate(),
         config.window_sec(),
@@ -59,8 +66,13 @@ pub(crate) fn run(invocation: StreamInvocation) -> Result<(), String> {
     let native = composition::initialize_runtime(&runtime)?;
     let frontend = composition::frontend_for_package(&package, frontend_mode)
         .map_err(|error| format!("frontend: {error}"))?;
-    let recognizer = composition::ctc_recognizer(&package, &runtime, &native, precision)
-        .map_err(|error| format!("decoder: {error}"))?;
+    let recognizer = composition::ctc_recognizer(
+        &package,
+        &runtime,
+        &native,
+        composition::CtcSelection { precision, mode },
+    )
+    .map_err(|error| format!("decoder: {error}"))?;
     let effective_precision = recognizer.encoder_precision();
     projection::emit_ctc_construction_notice(&recognizer);
     projection::emit_unverified_cuda_assignment(

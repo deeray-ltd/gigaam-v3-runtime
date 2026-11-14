@@ -222,3 +222,95 @@ fn native_golden_suite() {
     stream_forced_cuts_lock_no_adjacent_duplicates(&native);
     stream_endpoint_fires_on_silence_and_keeps_both_parts(&native);
 }
+
+/// Exercises the real selected RNN-T beam through the shared stream owner; this is not a
+/// claim that the native WebSocket protocol exposes RNN-T.
+#[test]
+fn selected_rnnt_beam_streams_with_manual_and_vad_endpoints() {
+    use gigaam_audio::FrontendMode;
+    use gigaam_model_package::VariantPackage;
+    use gigaam_recognition::{DecodingMode, VariantDecodeSelection, VariantPrecision};
+    use gigaam_transcription::EndpointSource;
+    use std::sync::Arc;
+
+    let root = common::root();
+    let pack = VariantPackage::open(&root.join("skip-packs/v3_e2e_rnnt-fp32-vad"))
+        .expect("external selected RNN-T VAD package");
+    let audio =
+        read_wav(&root.join("beam-stream-fixtures/speech.wav")).expect("external speech fixture");
+    let native = common::init_ort();
+    let weights = pack.frontend_weights().expect("selected frontend weights");
+    let frontend = Arc::new(
+        gigaam_audio::FrontendProcessor::new(pack.frontend(), weights, FrontendMode::Scalar)
+            .expect("valid frontend"),
+    );
+    let plan = gigaam_recognition::ProviderPlan::new(
+        gigaam_recognition::Device::Cpu,
+        gigaam_recognition::OrtConfig::from_environment(gigaam_recognition::OrtEnvironment {
+            intra_threads: Some("2"),
+            ..Default::default()
+        })
+        .expect("valid ORT settings"),
+    )
+    .expect("CPU plan");
+    for endpoint in [EndpointSource::Manual, EndpointSource::Vad] {
+        let decoder = DirectRecognizer::variant_with_mode(
+            &pack,
+            &native,
+            &plan,
+            VariantDecodeSelection {
+                precision: VariantPrecision {
+                    encoder: EncoderPrecision::Fp32,
+                    rnnt_heads_fp16: false,
+                },
+                mode: DecodingMode::Beam {
+                    width: std::num::NonZeroUsize::new(2).expect("positive width"),
+                },
+            },
+        )
+        .expect("selected beam decoder");
+        let config = StreamConfig::timing_changes()
+            .with_window_sec(8.0)
+            .expect("valid window")
+            .with_overlap_sec(2.0)
+            .expect("valid overlap")
+            .with_step_sec(3.0)
+            .expect("valid step")
+            .apply(StreamConfig::checked_default(frontend.sample_rate()).expect("valid defaults"))
+            .expect("valid 8/2/3 second stream geometry")
+            .with_endpoint_source(endpoint)
+            .expect("supported endpoint");
+        let detector = match endpoint {
+            EndpointSource::Manual => EndpointDetector::Manual,
+            EndpointSource::Vad => EndpointDetector::Vad(
+                Vad::from_variant(&pack, &native, plan.intra_threads()).expect("selected VAD"),
+            ),
+            EndpointSource::Blank => panic!("blank is not selected"),
+        };
+        let session = StreamSession::new(StreamSetup {
+            frontend: Arc::clone(&frontend),
+            decoder,
+            config,
+            detector,
+            control: ExecutionControl::without_deadline(),
+        })
+        .expect("valid beam stream");
+        let words = run(session, audio.channels()[0].samples(), 16_000);
+        assert!(!words.is_empty(), "{endpoint:?} must produce words");
+        assert!(
+            words
+                .iter()
+                .all(|word| word.stability() == WordStability::Stable)
+        );
+        let text = words
+            .iter()
+            .map(StreamWord::text)
+            .collect::<Vec<_>>()
+            .join(" ");
+        eprintln!("RNN-T beam {endpoint:?} window=8 overlap=2 step=3: {text}");
+        assert_eq!(
+            text,
+            "Добрый день. Меня зовут Анна. Сегодня хорошая погода. Спасибо за помощь."
+        );
+    }
+}

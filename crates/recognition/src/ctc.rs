@@ -270,6 +270,35 @@ fn word_from_token_range(
     )
 }
 
+fn validate_beam_alignment(
+    labels: &[usize],
+    tokens: &[Token],
+    blank: usize,
+    vocabulary: usize,
+) -> Result<(), String> {
+    let mut prior = None;
+    let mut emitted = 0;
+    for (frame, &label) in labels.iter().enumerate() {
+        if label >= vocabulary {
+            return Err("CTC beam label outside vocabulary".into());
+        }
+        if label != blank && prior != Some(label) {
+            let token = tokens
+                .get(emitted)
+                .ok_or("CTC beam alignment lacks token")?;
+            if token.id() != label || token.frame() != frame {
+                return Err("CTC beam alignment does not match tokens".into());
+            }
+            emitted += 1;
+        }
+        prior = Some(label);
+    }
+    if emitted != tokens.len() {
+        return Err("CTC beam tokens exceed alignment".into());
+    }
+    Ok(())
+}
+
 pub(crate) struct ProjectedWords {
     pub(crate) words: Vec<Word>,
     pub(crate) spans: Vec<(usize, usize)>,
@@ -310,6 +339,7 @@ pub struct CtcDecoder<E: Encoder> {
     encoder: E,
     vocabulary: Vec<String>,
     projector: Option<crate::TokenTextProjector>,
+    mode: crate::DecodingMode,
     blank: usize,
     silence_policy: CtcSilencePolicy,
     frame_rate: FrameRate,
@@ -342,6 +372,7 @@ impl<E: Encoder> CtcDecoder<E> {
             encoder,
             vocabulary,
             projector: None,
+            mode: crate::DecodingMode::Greedy,
             blank,
             silence_policy,
             frame_rate,
@@ -377,6 +408,11 @@ impl<E: Encoder> CtcDecoder<E> {
         Ok(decoder)
     }
 
+    pub(crate) fn with_mode(mut self, mode: crate::DecodingMode) -> Self {
+        self.mode = mode;
+        self
+    }
+
     pub const fn silence_policy(&self) -> CtcSilencePolicy {
         self.silence_policy
     }
@@ -388,7 +424,10 @@ impl<E: Encoder> CtcDecoder<E> {
 
 impl<E: Encoder> WindowDecoder for CtcDecoder<E> {
     fn silence_capability(&self) -> crate::SilenceCapability {
-        crate::SilenceCapability::LegacyBlank
+        match self.mode {
+            crate::DecodingMode::Greedy => crate::SilenceCapability::LegacyBlank,
+            crate::DecodingMode::Beam { .. } => crate::SilenceCapability::RepresentativeAlignment,
+        }
     }
 
     fn frame_rate(&self) -> FrameRate {
@@ -419,15 +458,50 @@ impl<E: Encoder> WindowDecoder for CtcDecoder<E> {
         let (log_probabilities, output_frames) = self.encoder.forward(features)?;
         control.checkpoint()?;
         let encoder_seconds = started.elapsed().as_secs_f64();
-        let (tokens, silence, labels) = greedy_masked_in_context(
-            &log_probabilities,
-            output_frames,
-            self.encoder.out_dim(),
-            self.blank,
-            self.silence_policy.space_token(),
-            detail == crate::contracts::ScoreDetail::TokenLogProbabilities,
-            control,
-        )?;
+        let (tokens, silence, labels) = match self.mode {
+            crate::DecodingMode::Greedy => {
+                let (tokens, silence, labels) = greedy_masked_in_context(
+                    &log_probabilities,
+                    output_frames,
+                    self.encoder.out_dim(),
+                    self.blank,
+                    self.silence_policy.space_token(),
+                    detail == crate::ScoreDetail::TokenLogProbabilities,
+                    control,
+                )?;
+                (
+                    tokens,
+                    silence,
+                    crate::FrameLabels::new(crate::FrameLabelKind::GreedyArgmax, labels),
+                )
+            }
+            crate::DecodingMode::Beam { width } => {
+                let input = crate::ctc_beam::CtcBeamInput::new(
+                    &log_probabilities,
+                    output_frames,
+                    self.encoder.out_dim(),
+                    crate::ctc_beam::CtcBeamOptions {
+                        blank: self.blank,
+                        width: width.get(),
+                        detail,
+                    },
+                )?;
+                let (labels, tokens) =
+                    crate::ctc_beam::decode(&input, || control.checkpoint())?.into_parts();
+                validate_beam_alignment(&labels, &tokens, self.blank, self.encoder.out_dim())?;
+                let silence = labels
+                    .iter()
+                    .map(|label| {
+                        *label == self.blank || Some(*label) == self.silence_policy.space_token()
+                    })
+                    .collect();
+                (
+                    tokens,
+                    silence,
+                    crate::FrameLabels::new(crate::FrameLabelKind::CtcRepresentativePath, labels),
+                )
+            }
+        };
         control.checkpoint()?;
         let ProjectedWords {
             words,
@@ -439,15 +513,15 @@ impl<E: Encoder> WindowDecoder for CtcDecoder<E> {
             self.frame_rate,
         )?;
         control.checkpoint()?;
-        Decoded::new_with_labels(
+        Decoded::new_with_frame_labels(crate::DecodedFrameLabelsInput {
             words,
             silence,
             output_frames,
             encoder_seconds,
-            labels,
+            frame_labels: labels,
             tokens,
             word_spans,
-        )
+        })
     }
 }
 
@@ -509,6 +583,52 @@ mod tests {
 
     fn frame_rate() -> FrameRate {
         FrameRate::new(25.0).expect("test frame rate is finite and positive")
+    }
+
+    #[test]
+    fn beam_preserves_representative_labels_and_token_provenance() {
+        let encoder = FakeEncoder {
+            output: vec![0.0, 4.0, 0.0, 4.0, 0.0, 0.0, 0.0, 4.0, 0.0],
+            frames: 3,
+            dimension: 3,
+        };
+        let mut decoder = CtcDecoder::new(encoder, vec!["а".into(), "б".into()], 2, frame_rate())
+            .expect("valid decoder")
+            .with_mode(crate::DecodingMode::Beam {
+                width: std::num::NonZeroUsize::new(3).expect("positive width"),
+            });
+        assert_eq!(
+            decoder.silence_capability(),
+            crate::SilenceCapability::RepresentativeAlignment
+        );
+        let decoded = decoder
+            .decode_with_detail(features().view(), crate::ScoreDetail::TokenLogProbabilities)
+            .expect("beam decoding succeeds");
+        assert_eq!(decoded.labels(), None);
+        let labels = decoded.frame_labels().expect("typed labels");
+        assert_eq!(labels.kind(), crate::FrameLabelKind::CtcRepresentativePath);
+        validate_beam_alignment(labels.values(), decoded.tokens().expect("tokens"), 2, 3)
+            .expect("alignment matches");
+        assert!(
+            decoded
+                .tokens()
+                .expect("tokens")
+                .iter()
+                .all(|token| token.log_probability().is_some())
+        );
+    }
+    #[test]
+    fn alignment_refuses_wrong_id_frame_and_length() {
+        assert!(
+            validate_beam_alignment(&[1, 2, 1], &[Token::new(1, 0), Token::new(1, 2)], 2, 3)
+                .is_ok()
+        );
+        assert!(
+            validate_beam_alignment(&[1, 2, 1], &[Token::new(1, 0), Token::new(1, 1)], 2, 3)
+                .is_err()
+        );
+        assert!(validate_beam_alignment(&[3], &[], 2, 3).is_err());
+        assert!(validate_beam_alignment(&[1], &[], 2, 3).is_err());
     }
 
     #[test]

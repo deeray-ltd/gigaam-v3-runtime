@@ -191,8 +191,8 @@ source-compatible packages and each claimed provider/precision cell remains pend
 Bind advertised model variants to their actual package assets, tokenizer, frontend,
 precision, and decoder capabilities. Plan explicit base and end-to-end CTC and RNN-T
 variants with compatible package evolution; support each variant's word boundaries and
-streaming contract. Evaluate beam decoding against greedy decoding using comparable quality
-and cost measurements before offering a supported selectable decoder. SSL output remains
+streaming contract. CTC and RNN-T expose explicit-width beam selection; expand the paired real-model quality and
+cost evidence beyond the exercised CPU fixtures and qualify provider/precision cells separately. SSL output remains
 separate future work.
 
 ### CTC acoustic timestamps

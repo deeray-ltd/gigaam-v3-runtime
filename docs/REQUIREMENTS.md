@@ -105,6 +105,18 @@ and release material describe the same behavior in more detail and do not contra
   and trace selection; refines CONFIG-001. Consumers include operators, Service, CLI,
   Audio, Transcription, and Recognition.
 
+### BEAM-001 · Explicit search and truthful CTC alignment
+
+- Requirement: Service and decoding CLI commands default to greedy or select beam with an
+  explicit positive width; CLI/environment settings must agree, and unsupported combinations
+  refuse before dependent native or file work. Selected V3 CTC and RNN-T share the process
+  choice and retain actual token occurrence frames and scores. CTC beam exposes typed
+  representative alignment, never as greedy argmax; its alignment mask is not acoustic silence.
+  Evidence V1/V2 remain greedy-only and V3 records selection and alignment kind. RNN-T does
+  not fabricate CTC frame evidence. Beam blank endpoint requests refuse before stream upgrade.
+- Scope: Recognition, Transcription, Service and CLI mode selection, token/word provenance,
+  CTC evidence and stream capability; refines BACKEND-001 and CONFIG-001.
+
 ### CUDA-ASSIGNMENT-001 · Verified CUDA encoder composition
 
 - Requirement: Before Model Package or ONNX Runtime work, selected CUDA composition derives the

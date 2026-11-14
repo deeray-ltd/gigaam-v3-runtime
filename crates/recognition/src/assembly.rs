@@ -33,6 +33,13 @@ pub struct VariantPrecision {
     pub rnnt_heads_fp16: bool,
 }
 
+/// Precision and decoding policy for one V3 variant.
+#[derive(Clone, Copy, Debug)]
+pub struct VariantDecodeSelection {
+    pub precision: VariantPrecision,
+    pub mode: crate::DecodingMode,
+}
+
 /// Explicit precision and width for one selected V3 RNN-T beam decoder.
 #[derive(Clone, Copy, Debug)]
 pub struct RnntBeamSelection {
@@ -53,6 +60,48 @@ enum Implementation {
         assignment_evidence: Option<CudaAssignmentEvidence>,
     },
     Rnnt(Box<RnntDecoder>),
+}
+
+fn validate_ctc_beam_width(width: std::num::NonZeroUsize, blank: usize) -> Result<(), String> {
+    let vocabulary = blank.checked_add(1).ok_or("CTC vocabulary overflow")?;
+    width
+        .get()
+        .checked_mul(vocabulary)
+        .and_then(|count| count.checked_add(width.get()))
+        .ok_or("CTC candidate count overflow")?;
+    Ok(())
+}
+
+/// Validates selected-width arithmetic against a V3 package before native work.
+pub fn validate_variant_mode(
+    pack: &VariantPackage,
+    mode: crate::DecodingMode,
+) -> Result<(), String> {
+    let crate::DecodingMode::Beam { width } = mode else {
+        return Ok(());
+    };
+    match pack.artifacts() {
+        gigaam_model_package::VariantArtifacts::Ctc(_) => {
+            validate_ctc_beam_width(width, pack.tokenizer().blank_id())
+        }
+        gigaam_model_package::VariantArtifacts::Rnnt(definition) => {
+            let vocabulary = pack
+                .tokenizer()
+                .blank_id()
+                .checked_add(1)
+                .ok_or("RNN-T vocabulary overflow")?;
+            width
+                .get()
+                .checked_mul(vocabulary)
+                .ok_or("RNN-T candidate count overflow")?;
+            definition
+                .max_symbols_per_step()
+                .checked_add(1)
+                .and_then(|count| count.checked_mul(width.get()))
+                .ok_or("RNN-T completed count overflow")?;
+            Ok(())
+        }
+    }
 }
 
 impl DirectRecognizer {
@@ -133,6 +182,47 @@ impl DirectRecognizer {
             ModelFamily::Rnnt => Ok(Self(Implementation::Rnnt(Box::new(
                 RnntDecoder::from_variant(pack, (runtime, plan), precision, full_rnnt_fp16)?,
             )))),
+        }
+    }
+
+    pub fn variant_with_mode(
+        pack: &VariantPackage,
+        runtime: &NativeRuntime,
+        plan: &ProviderPlan,
+        selection: VariantDecodeSelection,
+    ) -> Result<Self, String> {
+        validate_variant_mode(pack, selection.mode)?;
+        match (pack.variant().family(), selection.mode) {
+            (_, crate::DecodingMode::Greedy) => {
+                Self::variant(pack, runtime, plan, selection.precision)
+            }
+            (ModelFamily::Rnnt, crate::DecodingMode::Beam { width }) => Self::variant_rnnt_beam(
+                pack,
+                runtime,
+                plan,
+                RnntBeamSelection {
+                    precision: selection.precision,
+                    width: width.get(),
+                },
+            ),
+            (ModelFamily::Ctc, crate::DecodingMode::Beam { .. }) => {
+                if selection.precision.rnnt_heads_fp16 {
+                    return Err("RNN-T head precision is invalid for CTC".into());
+                }
+                let projector = crate::TokenTextProjector::new(
+                    pack.load_tokenizer().map_err(|error| error.to_string())?,
+                )?;
+                let encoder =
+                    OrtEncoder::variant(pack, runtime, plan, selection.precision.encoder)?;
+                let assignment_evidence = encoder.assignment_evidence().cloned();
+                let decoder =
+                    CtcDecoder::from_variant(pack, encoder, projector)?.with_mode(selection.mode);
+                Ok(Self(Implementation::Ctc {
+                    decoder: Box::new(decoder),
+                    precision: selection.precision.encoder,
+                    assignment_evidence,
+                }))
+            }
         }
     }
 
@@ -223,5 +313,16 @@ impl WindowDecoder for DirectRecognizer {
             }
             Implementation::Rnnt(decoder) => decoder.decode_in_context(features, detail, control),
         }
+    }
+}
+
+#[cfg(test)]
+mod mode_tests {
+    #[test]
+    fn ctc_candidate_arithmetic_refuses_overflow_without_an_arbitrary_width_limit() {
+        let one = std::num::NonZeroUsize::new(1).expect("positive");
+        let maximum = std::num::NonZeroUsize::new(usize::MAX).expect("positive");
+        assert!(super::validate_ctc_beam_width(one, 256).is_ok());
+        assert!(super::validate_ctc_beam_width(maximum, 256).is_err());
     }
 }
