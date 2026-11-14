@@ -26,6 +26,7 @@ mod ort_runtime;
 mod ort_vad;
 mod provider;
 pub mod rnnt;
+pub mod rnnt_beam;
 pub mod vad;
 
 pub use assembly::{DirectRecognizer, RnntPrecisionSelection};
