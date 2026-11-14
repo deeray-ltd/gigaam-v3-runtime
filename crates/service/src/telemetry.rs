@@ -1053,7 +1053,7 @@ mod tests {
         assert_live_conservation(current);
         assert!(
             metrics
-                .render(1, 1, 0, None)
+                .render(1, 1, Some(0), None)
                 .contains("asr_telemetry_dropped_total{reason=\"queue_full\"} 1\n")
         );
 
@@ -1120,7 +1120,7 @@ mod tests {
         assert_eq!(current.sink_closed, 1);
         assert_eq!(current.delivered, 0);
         assert_live_conservation(current);
-        let rendered = metrics.render(1, 1, 0, None);
+        let rendered = metrics.render(1, 1, Some(0), None);
         assert!(rendered.contains("asr_telemetry_dropped_total{reason=\"sink_closed\"} 1\n"));
     }
 
@@ -1187,7 +1187,7 @@ mod tests {
         assert_eq!(final_state.undelivered, 0);
         assert_eq!(final_state.sink_closed, 3);
         assert_live_conservation(final_state);
-        let rendered = metrics.render(1, 1, 0, None);
+        let rendered = metrics.render(1, 1, Some(0), None);
         assert!(
             rendered.contains("asr_telemetry_write_failures_total{destination=\"stdout\"} 1\n")
         );
@@ -1317,7 +1317,7 @@ mod tests {
             assert_live_conservation(final_state);
             assert!(
                 metrics
-                    .render(1, 1, 0, None)
+                    .render(1, 1, Some(0), None)
                     .contains("asr_telemetry_dropped_total{reason=\"sink_closed\"} 3\n"),
                 "{cut:?} must classify the trigger, active record, and later offer once"
             );
@@ -1335,7 +1335,7 @@ mod tests {
         drop(started);
         drop(producer);
         join(handle);
-        let rendered = metrics.render(1, 1, 0, None);
+        let rendered = metrics.render(1, 1, Some(0), None);
         assert!(
             rendered.contains("asr_telemetry_write_failures_total{destination=\"stderr\"} 1\n")
         );

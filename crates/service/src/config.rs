@@ -11,7 +11,7 @@
 
 use crate::admission::{ApiMode, RecognitionLanguage, RequestBodyLimit, ServiceAdmission};
 use gigaam_audio::{FrontendMode, SampleRate};
-use gigaam_model_package::EncoderPrecision;
+use gigaam_model_package::{EncoderPrecision, ModelFamily, VariantId};
 use gigaam_recognition::{
     CudaAssignmentEnvironment, Device, OrtConfig, OrtEnvironment, ProviderPlan,
     RequiredEncoderRoles, RnntPrecisionSelection,
@@ -44,6 +44,7 @@ pub(crate) fn precision_name(precision: EncoderPrecision) -> &'static str {
 #[derive(Debug, Default)]
 struct CliOptions {
     model: Option<PathBuf>,
+    variant: Option<String>,
     port: Option<u16>,
     provider: Option<String>,
     ort_dylib: Option<PathBuf>,
@@ -57,11 +58,11 @@ struct CliOptions {
 #[derive(Debug)]
 pub(crate) struct Startup {
     pub(crate) model: PathBuf,
+    pub(crate) variant: VariantId,
     pub(crate) port: u16,
     pub(crate) plan: ProviderPlan,
     pub(crate) ort_dylib: PathBuf,
     pub(crate) ctc_precision: EncoderPrecision,
-    pub(crate) with_rnnt: bool,
     pub(crate) rnnt_fp16: bool,
     pub(crate) rnnt_precision: Option<RnntPrecisionSelection>,
     pub(crate) frontend_mode: FrontendMode,
@@ -70,6 +71,7 @@ pub(crate) struct Startup {
 
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct StartupEnvironment<'a> {
+    pub(crate) variant: Option<&'a str>,
     pub(crate) ctc_precision: Option<&'a str>,
     pub(crate) rnnt_precision: Option<&'a str>,
     pub(crate) encoder_ep: Option<&'a str>,
@@ -91,6 +93,7 @@ pub(crate) struct StartupEnvironment<'a> {
 impl Startup {
     pub(crate) fn from_process() -> Result<Self, String> {
         let args: Vec<String> = std::env::args().skip(1).collect();
+        let variant = process_env("ASR_MODEL_VARIANT")?;
         let ctc_precision = process_env("ASR_CTC_PRECISION")?;
         let rnnt_precision = process_env("ASR_RNNT_PRECISION")?;
         let encoder_ep = process_env("ASR_ENCODER_EP")?;
@@ -110,6 +113,7 @@ impl Startup {
         Self::parse(
             &args,
             StartupEnvironment {
+                variant: variant.as_deref(),
                 ctc_precision: ctc_precision.as_deref(),
                 rnnt_precision: rnnt_precision.as_deref(),
                 encoder_ep: encoder_ep.as_deref(),
@@ -135,11 +139,50 @@ impl Startup {
         environment: StartupEnvironment<'_>,
     ) -> Result<Self, String> {
         let cli = parse_cli(args)?;
+        let cli_variant = cli
+            .variant
+            .as_deref()
+            .map(str::parse::<VariantId>)
+            .transpose()
+            .map_err(|e| e.to_string())?;
+        let env_variant = environment
+            .variant
+            .map(str::parse::<VariantId>)
+            .transpose()
+            .map_err(|e| e.to_string())?;
+        let variant = match (cli_variant, env_variant) {
+            (Some(a), Some(b)) if a != b => {
+                return Err("--variant conflicts with ASR_MODEL_VARIANT".into());
+            }
+            (Some(value), _) | (_, Some(value)) => value,
+            (None, None) => return Err("--variant or ASR_MODEL_VARIANT is required".into()),
+        };
+        if variant.family() == ModelFamily::Rnnt
+            && (cli.no_rnnt
+                || cli.ctc_fp16
+                || cli.ctc_precision.is_some()
+                || environment.ctc_precision.is_some())
+        {
+            return Err("CTC options conflict with RNN-T variant".into());
+        }
+        if variant.family() == ModelFamily::Ctc
+            && (cli.rnnt_fp16
+                || cli.rnnt_precision.is_some()
+                || environment.rnnt_precision.is_some())
+        {
+            return Err("RNN-T option conflicts with CTC variant".into());
+        }
         if cli.no_rnnt && cli.rnnt_fp16 {
             return Err("--rnnt-fp16 conflicts with --no-rnnt".into());
         }
-        let rnnt_precision =
-            resolve_rnnt_precision(cli.rnnt_precision.as_deref(), environment.rnnt_precision)?;
+        if cli.no_rnnt && environment.rnnt_precision.is_some() {
+            return Err("ASR_RNNT_PRECISION conflicts with --no-rnnt".into());
+        }
+        let rnnt_precision = if variant.family() == ModelFamily::Rnnt {
+            resolve_rnnt_precision(cli.rnnt_precision.as_deref(), environment.rnnt_precision)?
+        } else {
+            None
+        };
         if cli.no_rnnt && rnnt_precision.is_some() {
             return Err("--rnnt-precision or ASR_RNNT_PRECISION conflicts with --no-rnnt".into());
         }
@@ -148,11 +191,15 @@ impl Startup {
                 "--rnnt-fp16 conflicts with --rnnt-precision and ASR_RNNT_PRECISION".into(),
             );
         }
-        let ctc_precision = resolve_ctc_precision(
-            cli.ctc_precision.as_deref(),
-            cli.ctc_fp16,
-            environment.ctc_precision,
-        )?;
+        let ctc_precision = if variant.family() == ModelFamily::Ctc {
+            resolve_ctc_precision(
+                cli.ctc_precision.as_deref(),
+                cli.ctc_fp16,
+                environment.ctc_precision,
+            )?
+        } else {
+            EncoderPrecision::Fp32
+        };
         let provider =
             Device::resolve_with_config(cli.provider.as_deref(), environment.encoder_ep)?;
         let ort_config = OrtConfig::from_environment(OrtEnvironment {
@@ -164,9 +211,9 @@ impl Startup {
             tensorrt_profile_max: environment.trt_profile_max,
             intra_threads: environment.ort_intra_threads,
         })?;
-        let required_roles = match cli.no_rnnt {
-            true => RequiredEncoderRoles::ctc(),
-            false => RequiredEncoderRoles::ctc_and_rnnt(),
+        let required_roles = match variant.family() {
+            ModelFamily::Ctc => RequiredEncoderRoles::ctc(),
+            ModelFamily::Rnnt => RequiredEncoderRoles::rnnt(),
         };
         let plan = ProviderPlan::new_with_cuda_assignment(
             provider,
@@ -197,11 +244,11 @@ impl Startup {
         )?;
         Ok(Self {
             model: cli.model.unwrap_or_else(|| PathBuf::from(DEFAULT_MODEL)),
+            variant,
             port: cli.port.unwrap_or(DEFAULT_PORT),
             plan,
             ort_dylib,
             ctc_precision,
-            with_rnnt: !cli.no_rnnt,
             rnnt_fp16: cli.rnnt_fp16,
             rnnt_precision,
             frontend_mode,
@@ -276,6 +323,11 @@ fn parse_cli(args: &[String]) -> Result<CliOptions, String> {
                 &mut options.model,
                 PathBuf::from(next_value(args, &mut position, "--model")?),
                 "--model",
+            )?,
+            "--variant" => set_once(
+                &mut options.variant,
+                next_value(args, &mut position, "--variant")?,
+                "--variant",
             )?,
             "--port" => {
                 let value = next_value(args, &mut position, "--port")?;
@@ -707,6 +759,7 @@ mod tests {
         #[cfg(feature = "cuda")]
         {
             StartupEnvironment {
+                variant: Some("v3_ctc"),
                 cuda_ctc_assignment_sha256: Some(
                     "0000000000000000000000000000000000000000000000000000000000000000",
                 ),
@@ -718,7 +771,72 @@ mod tests {
         }
         #[cfg(not(feature = "cuda"))]
         {
-            StartupEnvironment::default()
+            StartupEnvironment {
+                variant: Some("v3_ctc"),
+                ..StartupEnvironment::default()
+            }
+        }
+    }
+
+    #[test]
+    fn variant_selection_is_required_and_exact() {
+        let args = arguments(&["--ep", "cpu", "--ort-dylib", "/runtime/libonnxruntime.so"]);
+        assert!(Startup::parse(&args, StartupEnvironment::default()).is_err());
+        for name in ["v3_ctc", "v3_rnnt", "v3_e2e_ctc", "v3_e2e_rnnt"] {
+            let env = StartupEnvironment {
+                variant: Some(name),
+                ..StartupEnvironment::default()
+            };
+            let startup = Startup::parse(&args, env).expect("exact variant is accepted");
+            assert_eq!(startup.variant.as_str(), name);
+        }
+        let env = StartupEnvironment {
+            variant: Some("v3_ctc"),
+            ..StartupEnvironment::default()
+        };
+        let mut conflict = args.clone();
+        conflict.extend(arguments(&["--variant", "v3_rnnt"]));
+        assert!(Startup::parse(&conflict, env).is_err());
+        for invalid in ["", "V3_CTC", "v3_ctc "] {
+            assert!(
+                Startup::parse(
+                    &args,
+                    StartupEnvironment {
+                        variant: Some(invalid),
+                        ..StartupEnvironment::default()
+                    }
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_other_family_environment_precision_refuses() {
+        let args = arguments(&["--ep", "cpu", "--ort-dylib", "/runtime/libonnxruntime.so"]);
+        for (variant, ctc, rnnt) in [
+            ("v3_rnnt", Some("fp32"), None),
+            ("v3_ctc", None, Some("fp32")),
+        ] {
+            let env = StartupEnvironment {
+                variant: Some(variant),
+                ctc_precision: ctc,
+                rnnt_precision: rnnt,
+                ..StartupEnvironment::default()
+            };
+            assert!(Startup::parse(&args, env).is_err());
+        }
+        for (variant, ctc, rnnt) in [
+            ("v3_ctc", Some("fp32"), None),
+            ("v3_rnnt", None, Some("fp32")),
+        ] {
+            let env = StartupEnvironment {
+                variant: Some(variant),
+                ctc_precision: ctc,
+                rnnt_precision: rnnt,
+                ..StartupEnvironment::default()
+            };
+            assert!(Startup::parse(&args, env).is_ok());
         }
     }
 
@@ -826,7 +944,10 @@ mod tests {
         )
         .expect("absent provider is a documented default");
         assert_eq!(startup.plan.device(), Device::build_default());
-        assert!(startup.with_rnnt);
+        assert_eq!(
+            startup.variant.family(),
+            gigaam_model_package::ModelFamily::Ctc
+        );
     }
 
     #[test]
@@ -850,7 +971,7 @@ mod tests {
             StartupEnvironment {
                 encoder_ep: Some("cuda"),
                 ort_dylib: Some("/runtime/libonnxruntime.so"),
-                ..StartupEnvironment::default()
+                ..default_provider_environment()
             },
         )
         .expect_err("CLI and environment provider values must agree");
@@ -863,7 +984,7 @@ mod tests {
                 "--no-rnnt",
                 "--rnnt-fp16",
             ]),
-            StartupEnvironment::default(),
+            default_provider_environment(),
         )
         .expect_err("a disabled model cannot select its fp16 graph");
         assert!(rnnt_conflict.contains("conflicts"));
@@ -883,7 +1004,7 @@ mod tests {
             StartupEnvironment {
                 encoder_ep: Some("cpu"),
                 ort_dylib: Some(""),
-                ..StartupEnvironment::default()
+                ..default_provider_environment()
             },
         )
         .expect_err("an empty environment path must be refused");

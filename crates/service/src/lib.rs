@@ -52,8 +52,8 @@ pub fn run_process() {
 /// The facade-owned dynamic gauge reader deliberately samples runtime truth only at scrape time.
 struct ServiceRuntimeGaugeSource {
     admission: Arc<AdmissionState>,
-    ctc: Arc<gigaam_recognition::ExecutionScheduler>,
-    rnnt: Option<Arc<gigaam_recognition::ExecutionScheduler>>,
+    scheduler: Arc<gigaam_recognition::ExecutionScheduler>,
+    family: gigaam_model_package::ModelFamily,
 }
 
 impl RuntimeGaugeSource for ServiceRuntimeGaugeSource {
@@ -61,8 +61,16 @@ impl RuntimeGaugeSource for ServiceRuntimeGaugeSource {
         RuntimeGaugeSnapshot {
             available_http: self.admission.available_http(),
             available_ws: self.admission.available_ws(),
-            ctc_pending: self.ctc.pending(),
-            rnnt_pending: self.rnnt.as_ref().map(|scheduler| scheduler.pending()),
+            ctc_pending: if self.family == gigaam_model_package::ModelFamily::Ctc {
+                Some(self.scheduler.pending())
+            } else {
+                None
+            },
+            rnnt_pending: if self.family == gigaam_model_package::ModelFamily::Rnnt {
+                Some(self.scheduler.pending())
+            } else {
+                None
+            },
         }
     }
 }
@@ -203,16 +211,15 @@ impl ServiceApplication {
         } = started;
         let gauges: Arc<dyn RuntimeGaugeSource> = Arc::new(ServiceRuntimeGaugeSource {
             admission: Arc::clone(&admission),
-            ctc: Arc::clone(&context.capabilities.ctc),
-            rnnt: context.capabilities.rnnt.as_ref().map(Arc::clone),
+            scheduler: Arc::clone(&context.capabilities.scheduler),
+            family: context.capabilities.pack.variant().family(),
         });
         let health = health::HealthState::new(
             Arc::clone(&admission),
-            Arc::clone(&context.capabilities.ctc),
-            context.capabilities.rnnt.as_ref().map(Arc::clone),
+            Arc::clone(&context.capabilities.scheduler),
             response::HealthProjection::new(
                 context.capabilities.provider,
-                context.capabilities.rnnt.is_some(),
+                context.capabilities.pack.variant(),
             ),
         );
         let router = router::router(router::RouterParameters {
@@ -256,7 +263,7 @@ pub(crate) mod tests {
         ServicePolicy, ServicePolicyParameters,
     };
     use gigaam_audio::{FeatureMatrixView, FrontendMode, FrontendProcessor, SampleRate};
-    use gigaam_model_package::ModelPackage;
+    use gigaam_model_package::VariantPackage;
     use gigaam_recognition::{Decoded, Device, ExecutionScheduler, FrameRate, WindowDecoder};
     use gigaam_transcription::{ObservationMode, WindowTiming, WindowTimingObserver};
     use std::fs;
@@ -342,17 +349,14 @@ pub(crate) mod tests {
 
     pub(crate) struct AssemblyFixture {
         _package: AssemblyPackage,
-        pub(crate) pack: Arc<ModelPackage>,
+        pub(crate) pack: Arc<VariantPackage>,
         pub(crate) frontend: Arc<FrontendProcessor>,
     }
 
     impl AssemblyFixture {
         /// A regular placeholder is selected by package validation, never passed to native ORT.
         pub(crate) fn write_injected_vad_asset(&self) -> Result<(), String> {
-            let name = include_str!("../../../model/config.kv")
-                .lines()
-                .find_map(|line| line.strip_prefix("vad.model="))
-                .expect("the canonical fixture package declares a VAD model asset");
+            let name = "silero_vad.onnx";
             fs::write(
                 self._package.path().join(name),
                 b"injected detector fixture",
@@ -376,21 +380,14 @@ pub(crate) mod tests {
 
     pub(crate) fn assembly_fixture_at_rate(rate: u32) -> Result<AssemblyFixture, String> {
         let package = AssemblyPackage::new()?;
-        let config = include_str!("../../../model/config.kv")
-            .lines()
-            .map(|line| {
-                if line.starts_with("sample_rate=") {
-                    format!("sample_rate={rate}")
-                } else {
-                    line.to_owned()
-                }
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
+        let rate_fps = f64::from(rate) / 640.0;
+        let config = format!(
+            "format_version=3\nvariant=v3_ctc\nartifact_format=onnx\nsample_rate={rate}\nn_mels=64\nhop_length=160\nwin_length=320\nn_fft=320\ncenter=false\nlog_clamp_min=1e-09\nlog_clamp_max=1000000000\nsubsampling_factor=4\nframes_per_sec={rate_fps}\nfrontend.window=stft_window.f32\nfrontend.filterbank=mel_fbank.f32\ntokenizer.kind=characters\ntokenizer.vocab=vocab.txt\ntokenizer.vocab_size=2\ntokenizer.blank_id=2\nctc.encoder_fp32=encoder.onnx\nctc.input_names=features,feature_lengths\nctc.output_names=log_probs,encoded_lengths\nctc.out_dim=3\nctc.out_layout=t_d\nvad.model=silero_vad.onnx\n"
+        );
         fs::write(package.path().join("config.kv"), config)
             .map_err(|error| format!("write fixture model rate: {error}"))?;
         let pack = Arc::new(
-            ModelPackage::open(package.path())
+            VariantPackage::open(package.path())
                 .map_err(|error| format!("open service assembly package: {error}"))?,
         );
         let definition = pack.frontend();
@@ -488,8 +485,7 @@ pub(crate) mod tests {
             native_runtime: None,
             pack: Arc::clone(&fixture.pack),
             frontend: Arc::clone(&fixture.frontend),
-            ctc: Arc::new(ExecutionScheduler::spawn(IdleDecoder)),
-            rnnt: None,
+            scheduler: Arc::new(ExecutionScheduler::spawn(IdleDecoder)),
             provider: Device::Cpu,
             intra_threads: None,
         })
@@ -571,8 +567,7 @@ pub(crate) mod tests {
             native_runtime: None,
             pack: Arc::clone(&fixture.pack),
             frontend: Arc::clone(&fixture.frontend),
-            ctc: Arc::new(ExecutionScheduler::spawn(IdleDecoder)),
-            rnnt: None,
+            scheduler: Arc::new(ExecutionScheduler::spawn(IdleDecoder)),
             provider: Device::Cpu,
             intra_threads: None,
         })?;
