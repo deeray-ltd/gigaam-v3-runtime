@@ -22,7 +22,7 @@ use axum::extract::{RawQuery, State};
 use axum::http::StatusCode;
 use axum::response::Response;
 use gigaam_audio::{FrontendProcessor, RatePair, SampleFormat, SampleRate};
-use gigaam_model_package::ModelPackage;
+use gigaam_model_package::VariantPackage;
 use gigaam_recognition::{ExecutionControl, ExecutionScheduler, ScheduledRecognizer, Vad};
 use gigaam_transcription::{
     BackchannelDuration, BackchannelPolicy, CorrelationThreshold, EndpointDetector, EndpointRules,
@@ -454,7 +454,7 @@ fn parse_control(text: &str) -> Result<Control, String> {
 
 /// Service-owned capability factory; Transcription validates and warms every returned setup.
 struct ServiceStreamChannelFactory {
-    pack: Arc<ModelPackage>,
+    pack: Arc<VariantPackage>,
     frontend: Arc<FrontendProcessor>,
     scheduler: Arc<ExecutionScheduler>,
     intra_threads: Option<NonZeroUsize>,
@@ -466,7 +466,7 @@ impl ServiceStreamChannelFactory {
         Self {
             pack: Arc::clone(&capabilities.pack),
             frontend: Arc::clone(&capabilities.frontend),
-            scheduler: Arc::clone(&capabilities.ctc),
+            scheduler: Arc::clone(&capabilities.scheduler),
             intra_threads: capabilities.intra_threads,
             native_runtime: capabilities.native_runtime.clone(),
         }
@@ -487,7 +487,7 @@ impl StreamChannelFactory for ServiceStreamChannelFactory {
         let detector = match config.endpoint_source() {
             EndpointSource::Manual => EndpointDetector::Manual,
             EndpointSource::Blank => EndpointDetector::Blank,
-            EndpointSource::Vad => EndpointDetector::Vad(Vad::from_pack(
+            EndpointSource::Vad => EndpointDetector::Vad(Vad::from_variant(
                 &self.pack,
                 self.native_runtime
                     .as_ref()
@@ -830,6 +830,14 @@ pub(crate) async fn stream(
     RawQuery(query_text): RawQuery,
     upgrade: WebSocketUpgrade,
 ) -> Response {
+    if state.context.capabilities.pack.variant().family() != gigaam_model_package::ModelFamily::Ctc
+    {
+        state.metrics.ws_reject();
+        return crate::stream_response::pre_upgrade_refusal(
+            StatusCode::BAD_REQUEST,
+            "stream requires CTC",
+        );
+    }
     let prepared = match PreparedStream::parse(query_text.as_deref(), &state.context) {
         Ok(prepared) => prepared,
         Err(error) => {
@@ -1361,8 +1369,7 @@ mod tests {
             native_runtime: None,
             pack: Arc::clone(&fixture.pack),
             frontend: Arc::clone(&fixture.frontend),
-            ctc: Arc::new(ExecutionScheduler::spawn(RefusalPathDecoder)),
-            rnnt: None,
+            scheduler: Arc::new(ExecutionScheduler::spawn(RefusalPathDecoder)),
             provider: Device::Cpu,
             intra_threads: None,
         })?;
@@ -1414,8 +1421,7 @@ mod tests {
             native_runtime: None,
             pack: Arc::clone(&fixture.pack),
             frontend: Arc::clone(&fixture.frontend),
-            ctc: Arc::new(ExecutionScheduler::spawn(WarmupSucceedsDecoder)),
-            rnnt: None,
+            scheduler: Arc::new(ExecutionScheduler::spawn(WarmupSucceedsDecoder)),
             provider: Device::Cpu,
             intra_threads: None,
         })?;
@@ -1637,7 +1643,7 @@ mod tests {
     }
 
     fn metric_counter(metrics: &Metrics, name: &str) -> u64 {
-        let rendered = metrics.render(1, 1, 0, None);
+        let rendered = metrics.render(1, 1, Some(0), None);
         let prefix = format!("{name} ");
         let line = match rendered.lines().find(|line| line.starts_with(&prefix)) {
             Some(line) => line,
@@ -1794,7 +1800,7 @@ mod tests {
         assert!(
             failing
                 .metrics()
-                .render(1, 1, 0, None)
+                .render(1, 1, Some(0), None)
                 .contains("asr_telemetry_write_failures_total{destination=\"stdout\"} 1\n")
         );
         drop(failing_producer);

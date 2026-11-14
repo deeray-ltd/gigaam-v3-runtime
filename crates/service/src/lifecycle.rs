@@ -22,7 +22,7 @@ use crate::metrics::Metrics;
 use crate::telemetry::PreparedTelemetry;
 use axum::Router;
 use gigaam_audio::{FrontendProcessor, SampleRate};
-use gigaam_model_package::ModelPackage;
+use gigaam_model_package::{EncoderPrecision, ModelFamily, VariantPackage};
 use gigaam_recognition::{
     CudaAssignmentEvidence, DirectRecognizer, EncoderRole, ExecutionControl, ExecutionScheduler,
     ExecutionState, ProviderPlan, WindowDecoder, init_runtime,
@@ -97,11 +97,16 @@ fn continue_after_model_policy<T, P>(
 /// Opens the typed package before any runtime initialization can create native state.
 fn open_model(
     configuration: ProcessConfiguration,
-) -> Result<(Startup, ServerLimits, Arc<ModelPackage>), String> {
+) -> Result<(Startup, ServerLimits, Arc<VariantPackage>), String> {
     continue_after_package_open(
         configuration,
         |startup| {
-            ModelPackage::open(Path::new(&startup.model)).map_err(|error| format!("model: {error}"))
+            let pack = VariantPackage::open(Path::new(&startup.model))
+                .map_err(|error| format!("model: {error}"))?;
+            if pack.variant() != startup.variant {
+                return Err("selected variant does not match model package".into());
+            }
+            Ok(pack)
         },
         |configuration, pack| {
             let ProcessConfiguration { startup, limits } = configuration;
@@ -239,52 +244,47 @@ fn run_scoped(
                 .map_err(|error| format!("frontend: {error}"))?,
         );
 
-        let ctc_decoder =
-            DirectRecognizer::ctc(&pack, native, &startup.plan, startup.ctc_precision)
-                .map_err(|error| format!("CTC decoder: {error}"))?;
-        let ctc_precision = precision_name(ctc_decoder.encoder_precision());
-        emit_ctc_construction_notice(&ctc_decoder);
-        emit_unverified_cuda_assignment(
+        let (precision, full_heads, role) = match startup.variant.family() {
+            ModelFamily::Ctc => (startup.ctc_precision, false, EncoderRole::Ctc),
+            ModelFamily::Rnnt => match startup.rnnt_precision {
+                Some(gigaam_recognition::RnntPrecisionSelection::Fp16) => {
+                    (EncoderPrecision::Fp16, true, EncoderRole::Rnnt)
+                }
+                Some(gigaam_recognition::RnntPrecisionSelection::Fp32) => {
+                    (EncoderPrecision::Fp32, false, EncoderRole::Rnnt)
+                }
+                None => (
+                    encoder_precision(startup.rnnt_fp16),
+                    false,
+                    EncoderRole::Rnnt,
+                ),
+            },
+        };
+        let decoder = DirectRecognizer::variant(
+            &pack,
+            native,
             &startup.plan,
-            EncoderRole::Ctc,
-            ctc_decoder.assignment_evidence(),
-        );
-        let ctc = Arc::new(ExecutionScheduler::spawn(ctc_decoder));
-        warmup(&ctc, &frontend, policy.http_batch, "CTC")?;
+            gigaam_recognition::VariantPrecision {
+                encoder: precision,
+                rnnt_heads_fp16: full_heads,
+            },
+        )
+        .map_err(|error| format!("selected decoder: {error}"))?;
+        emit_ctc_construction_notice(&decoder);
+        emit_unverified_cuda_assignment(&startup.plan, role, decoder.assignment_evidence());
+        let scheduler = Arc::new(ExecutionScheduler::spawn(decoder));
+        warmup(
+            &scheduler,
+            &frontend,
+            policy.http_batch,
+            startup.variant.as_str(),
+        )?;
         eprintln!(
-            "# CTC worker started ({ctc_precision}, {})",
+            "# {} worker started ({}, {})",
+            startup.variant.as_str(),
+            precision_name(precision),
             startup.plan.device().as_str()
         );
-
-        let rnnt = if startup.with_rnnt {
-            let decoder = match startup.rnnt_precision {
-                Some(selection) => {
-                    DirectRecognizer::rnnt_with_precision(&pack, native, &startup.plan, selection)
-                }
-                None => DirectRecognizer::rnnt(
-                    &pack,
-                    native,
-                    &startup.plan,
-                    encoder_precision(startup.rnnt_fp16),
-                ),
-            }
-            .map_err(|error| format!("RNNT decoder: {error}"))?;
-            let precision = precision_name(decoder.encoder_precision());
-            emit_unverified_cuda_assignment(
-                &startup.plan,
-                EncoderRole::Rnnt,
-                decoder.assignment_evidence(),
-            );
-            let scheduler = Arc::new(ExecutionScheduler::spawn(decoder));
-            warmup(&scheduler, &frontend, policy.http_batch, "RNNT")?;
-            eprintln!(
-                "# RNNT worker started ({precision}, {})",
-                startup.plan.device().as_str()
-            );
-            Some(scheduler)
-        } else {
-            None
-        };
 
         eprintln!(
             "# limits: transcribe≤{}, channels≤{}, body≤{}MB, timeout {}s; dedup {}",
@@ -299,8 +299,7 @@ fn run_scoped(
             native_runtime: Some(native.clone()),
             pack,
             frontend,
-            ctc,
-            rnnt,
+            scheduler,
             provider: startup.plan.device(),
             intra_threads: startup.plan.intra_threads(),
         })
@@ -404,6 +403,7 @@ mod tests {
             ],
             StartupEnvironment {
                 encoder_ep: Some("cpu"),
+                variant: Some("v3_ctc"),
                 ..StartupEnvironment::default()
             },
         )

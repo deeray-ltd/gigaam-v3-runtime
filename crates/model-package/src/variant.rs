@@ -38,6 +38,14 @@ pub enum VariantId {
     V3E2eRnnt,
 }
 impl VariantId {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::V3Ctc => "v3_ctc",
+            Self::V3Rnnt => "v3_rnnt",
+            Self::V3E2eCtc => "v3_e2e_ctc",
+            Self::V3E2eRnnt => "v3_e2e_rnnt",
+        }
+    }
     pub fn family(self) -> ModelFamily {
         match self {
             Self::V3Ctc | Self::V3E2eCtc => ModelFamily::Ctc,

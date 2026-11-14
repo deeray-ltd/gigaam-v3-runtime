@@ -70,7 +70,8 @@ impl OrtEncoder {
         Self::open(artifact, runtime, plan, EncoderRole::Rnnt)
     }
 
-    pub(crate) fn variant(
+    /// Opens the encoder declared by a selected V3 package.
+    pub fn variant(
         pack: &VariantPackage,
         runtime: &NativeRuntime,
         plan: &ProviderPlan,

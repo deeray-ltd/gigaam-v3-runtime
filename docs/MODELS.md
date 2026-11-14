@@ -156,7 +156,9 @@ preparation; this command does not fall back to another builder.
 
 ## Version 3 single-variant metadata
 
-`VariantPackage` accepts V3 metadata for one explicit variant. Recognition exposes selected-family V3 native constructors; the current Service and CLI continue to use V1/V2 and do not yet run V3 packages. `variant` is exactly `v3_ctc`, `v3_rnnt`,
+`VariantPackage` accepts V3 metadata for one explicit variant. Service requires V3 and a
+matching explicit selection; CLI supports that selection while retaining legacy V1/V2 operation
+when none is specified. `variant` is exactly `v3_ctc`, `v3_rnnt`,
 `v3_e2e_ctc`, or `v3_e2e_rnnt`. Base variants declare `tokenizer.kind=characters`;
 end-to-end variants declare `tokenizer.kind=sentencepiece` and require `tokenizer.model`.
 

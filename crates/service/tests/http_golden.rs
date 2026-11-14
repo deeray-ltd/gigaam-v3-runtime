@@ -12,10 +12,10 @@
 mod external_artifacts;
 
 use gigaam_audio::{FrontendMode, FrontendProcessor, SampleRate};
-use gigaam_model_package::{EncoderPrecision, ModelPackage};
+use gigaam_model_package::{EncoderPrecision, VariantPackage};
 use gigaam_recognition::{
     Device, DirectRecognizer, ExecutionScheduler, OrtConfig, OrtEnvironment, ProviderPlan,
-    init_runtime,
+    VariantPrecision, init_runtime,
 };
 use gigaam_service::{
     RequestBodyLimit, ServiceAdmission, ServiceApplication, ServiceApplicationParameters,
@@ -39,8 +39,13 @@ fn runtime_path() -> Result<PathBuf, String> {
 
 fn application(root: &Path) -> ServiceApplication {
     let dylib = runtime_path().expect("the golden suite requires an explicit ORT library path");
-    let pack =
-        Arc::new(ModelPackage::open(&root.join("model")).expect("the test model pack must open"));
+    let pack = Arc::new(
+        VariantPackage::open(&root.join("model-v3-ctc")).expect("the test model pack must open"),
+    );
+    assert_eq!(
+        pack.variant().family(),
+        gigaam_model_package::ModelFamily::Ctc
+    );
     let model_sample_rate = SampleRate::from_usize(pack.frontend().sample_rate(), "test model")
         .expect("the test model rate must fit Audio's validated rate");
     let dedup_window_samples = pack
@@ -78,15 +83,22 @@ fn application(root: &Path) -> ServiceApplication {
         ProviderPlan::new(Device::Cpu, ort_config).expect("the CPU provider plan must be valid");
     let intra_threads = plan.intra_threads();
     let ctc = Arc::new(ExecutionScheduler::spawn(
-        DirectRecognizer::ctc(&pack, &native, &plan, EncoderPrecision::Fp32)
-            .expect("the CTC decoder must match the test pack"),
+        DirectRecognizer::variant(
+            &pack,
+            &native,
+            &plan,
+            VariantPrecision {
+                encoder: EncoderPrecision::Fp32,
+                rnnt_heads_fp16: false,
+            },
+        )
+        .expect("the CTC decoder must match the test pack"),
     ));
     let capabilities = ServiceCapabilities::new(ServiceCapabilitiesParameters {
         native_runtime: Some(native),
         pack,
         frontend,
-        ctc,
-        rnnt: None,
+        scheduler: ctc,
         provider: Device::Cpu,
         intra_threads,
     })

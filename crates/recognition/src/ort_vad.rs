@@ -13,7 +13,7 @@ use crate::NativeRuntime;
 use crate::contracts::SpeechProbabilityDetector;
 use crate::native_output::{ExpectedCardinality, NativeOutputRole, validate_f32_output};
 use gigaam_audio::ChannelAudioView;
-use gigaam_model_package::ModelPackage;
+use gigaam_model_package::{ModelPackage, VariantPackage};
 use gigaam_primitives::{isize_to_usize, usize_to_isize};
 use ort::session::Session;
 use ort::value::Tensor;
@@ -41,7 +41,27 @@ impl Vad {
         intra_threads: Option<NonZeroUsize>,
     ) -> Result<Self, String> {
         let artifact = pack.vad_model().map_err(|error| error.to_string())?;
-        let path = artifact.path();
+        Self::open(artifact.path(), runtime, intra_threads)
+    }
+
+    /// Opens the optional VAD selected by a V3 package.
+    pub fn from_variant(
+        pack: &VariantPackage,
+        runtime: &NativeRuntime,
+        intra_threads: Option<NonZeroUsize>,
+    ) -> Result<Self, String> {
+        let artifact = pack
+            .vad_model()
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "selected package does not declare VAD".to_string())?;
+        Self::open(artifact.path(), runtime, intra_threads)
+    }
+
+    fn open(
+        path: &std::path::Path,
+        runtime: &NativeRuntime,
+        intra_threads: Option<NonZeroUsize>,
+    ) -> Result<Self, String> {
         let mut builder =
             Session::builder(runtime.environment()).map_err(|error| error.to_string())?;
         if let Some(threads) = intra_threads {
