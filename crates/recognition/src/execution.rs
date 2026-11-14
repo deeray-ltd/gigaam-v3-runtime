@@ -74,6 +74,24 @@ impl ExecutionControl {
         }
     }
 
+    /// Checks that work may continue without taking terminal ownership.
+    pub fn checkpoint(&self) -> Result<(), String> {
+        match self.state() {
+            ExecutionState::Ready | ExecutionState::Queued | ExecutionState::Running => Ok(()),
+            ExecutionState::CancelRequested | ExecutionState::Cancelled => {
+                Err("execution cancelled".into())
+            }
+            ExecutionState::Completed | ExecutionState::Failed => {
+                Err("execution is already terminal".into())
+            }
+        }
+    }
+
+    /// Returns whether both handles refer to the same execution.
+    pub fn shares_identity(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.state, &other.state)
+    }
+
     /// Returns the current lifecycle observation using acquire synchronization.
     pub fn state(&self) -> ExecutionState {
         ExecutionState::from_stored(self.state.load(Ordering::Acquire))

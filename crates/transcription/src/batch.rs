@@ -23,7 +23,7 @@ use crate::vad_policy::{SpeechSegment, VadPolicyConfig, segments_from_probabilit
 use gigaam_audio::{ChannelAudio, FeatureMatrix, FrontendProcessor};
 use gigaam_primitives::{trunc_f32_to_usize, usize_to_f32, usize_to_u64_checked};
 use gigaam_recognition::{
-    ExecutionControl, FrameRate, SpeechProbabilityDetector, WindowDecoder, vad::VAD_SR,
+    ExecutionControl, FrameRate, ScoreDetail, SpeechProbabilityDetector, WindowDecoder, vad::VAD_SR,
 };
 use std::sync::Arc;
 
@@ -204,7 +204,8 @@ impl<D: WindowDecoder> BatchTranscriber<D> {
             checkpoint(&self.control)?;
             let mel = self.frontend.log_mel(&vec![0.0_f32; length])?;
             checkpoint(&self.control)?;
-            self.decoder.decode(mel.view())?;
+            self.decoder
+                .decode_in_context(mel.view(), ScoreDetail::None, &self.control)?;
             checkpoint(&self.control)?;
         }
         // Warmup costs are deliberately excluded from application timings.
@@ -227,7 +228,9 @@ impl<D: WindowDecoder> BatchTranscriber<D> {
         } else {
             gigaam_recognition::ScoreDetail::None
         };
-        let decoded = self.decoder.decode_with_detail(features.view(), detail)?;
+        let decoded = self
+            .decoder
+            .decode_in_context(features.view(), detail, &self.control)?;
         checkpoint(&self.control)?;
         let total_seconds = started.elapsed().as_secs_f64();
         let encoder_seconds = decoded.encoder_seconds();
@@ -1494,6 +1497,67 @@ mod tests {
         );
         assert_eq!(records[1].first_feature_frame(), 18);
         assert_eq!(records[1].origin(), 4);
+    }
+
+    #[test]
+    fn batch_warmup_and_work_deliver_the_request_control() {
+        struct ContextDecoder {
+            control: ExecutionControl,
+            calls: Arc<AtomicUsize>,
+        }
+        impl WindowDecoder for ContextDecoder {
+            fn silence_capability(&self) -> gigaam_recognition::SilenceCapability {
+                gigaam_recognition::SilenceCapability::LegacyBlank
+            }
+            fn frame_rate(&self) -> FrameRate {
+                FrameRate::new(8.0).expect("valid rate")
+            }
+            fn decode(
+                &mut self,
+                _: gigaam_audio::FeatureMatrixView<'_>,
+            ) -> Result<Decoded, String> {
+                Err("legacy path used".into())
+            }
+            fn decode_in_context(
+                &mut self,
+                features: gigaam_audio::FeatureMatrixView<'_>,
+                _: gigaam_recognition::ScoreDetail,
+                control: &ExecutionControl,
+            ) -> Result<Decoded, String> {
+                assert!(self.control.shares_identity(control));
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                control.request_cancellation();
+                control.checkpoint()?;
+                Decoded::new(
+                    vec![],
+                    vec![false; features.frames()],
+                    features.frames(),
+                    0.0,
+                )
+            }
+        }
+        for warmup in [true, false] {
+            let control = ExecutionControl::for_request();
+            let calls = Arc::new(AtomicUsize::new(0));
+            let mut batch = BatchTranscriber::new(BatchSetup {
+                frontend: test_support::frontend(),
+                decoder: ContextDecoder {
+                    control: control.clone(),
+                    calls: Arc::clone(&calls),
+                },
+                config: config(),
+                control,
+                observations: ObservationMode::disabled(),
+            })
+            .expect("valid setup");
+            let result = if warmup {
+                batch.warmup()
+            } else {
+                batch.transcribe_channel(&input()).map(|_| ())
+            };
+            assert!(result.is_err());
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+        }
     }
 
     #[test]

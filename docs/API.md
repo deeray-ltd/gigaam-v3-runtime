@@ -158,6 +158,15 @@ its late result cannot replace the 504; and the request capacity remains reserve
 the work terminalizes. This does not claim that ONNX Runtime interrupts an in-flight native
 call.
 
+Recognition library callers can pass an `ExecutionControl` to
+`WindowDecoder::decode_in_context` to request cooperative cancellation. Controls cloned from
+one request share identity; a scheduled decoder refuses a different control before enqueueing.
+Legacy `WindowDecoder` implementations remain usable through before/after checks, and boxed
+decoders forward legacy and contextual calls. Direct native legacy decode calls create their
+own control, while scheduled legacy calls use the control bound when their channel was created.
+The request owner retains terminal completion responsibility. Cancellation does not interrupt an
+in-flight native or whole VAD call or establish a bounded response time.
+
 After a query has completely bound to version 2, application errors use
 `{"schema_version":2,"error":{"code":"...","message":"..."}}` and retain the
 request-ID header:

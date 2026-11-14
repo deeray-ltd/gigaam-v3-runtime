@@ -112,22 +112,50 @@ pub(crate) fn greedy_typed_with_detail<
     max_symbols_per_step: usize,
     scored: bool,
 ) -> Result<RnntOutput, String> {
+    greedy_typed_in_context(
+        transition,
+        frames,
+        blank,
+        max_symbols_per_step,
+        scored,
+        &crate::ExecutionControl::without_deadline(),
+    )
+}
+
+pub(crate) fn greedy_typed_in_context<
+    T: FiniteFrameValue,
+    R: RnntTransition<T>,
+    F: RnntFrameSource<T>,
+>(
+    transition: &mut R,
+    frames: &F,
+    blank: usize,
+    max_symbols_per_step: usize,
+    scored: bool,
+    control: &crate::ExecutionControl,
+) -> Result<RnntOutput, String> {
+    control.checkpoint()?;
     let mut state = transition.start(blank)?;
+    control.checkpoint()?;
     let output_frames = frames.output_frames();
     let mut tokens = Vec::new();
     let mut silence = Vec::with_capacity(output_frames);
     for frame_index in 0..output_frames {
+        control.checkpoint()?;
         let frame = frames.frame(frame_index);
         validate_encoder_frame(frame, frame_index)?;
         transition.prepare_frame(frame)?;
+        control.checkpoint()?;
         let mut emitted = false;
         for _ in 0..max_symbols_per_step {
+            control.checkpoint()?;
             let (token, score) = if scored {
                 let (token, score) = transition.select_scored(frame, &state)?;
                 (token, Some(score))
             } else {
                 (transition.select(frame, &state)?, None)
             };
+            control.checkpoint()?;
             if token > blank {
                 return Err(format!(
                     "RNN-T selected token {token} exceeds blank vocabulary boundary {blank}"
@@ -142,9 +170,11 @@ pub(crate) fn greedy_typed_with_detail<
             });
             emitted = true;
             transition.advance(token, &mut state)?;
+            control.checkpoint()?;
         }
         silence.push(!emitted);
     }
+    control.checkpoint()?;
     Ok(RnntOutput { tokens, silence })
 }
 
@@ -213,6 +243,50 @@ mod tests {
         fn frame(&self, index: usize) -> &[f32] {
             &self.0[index]
         }
+    }
+
+    #[test]
+    fn cancellation_during_selection_stops_before_advance() {
+        struct Cancelling {
+            control: crate::ExecutionControl,
+            selections: usize,
+            advances: usize,
+        }
+        impl RnntTransition for Cancelling {
+            type State = ();
+            fn start(&mut self, _blank: usize) -> Result<Self::State, String> {
+                Ok(())
+            }
+            fn select(&mut self, _frame: &[f32], _state: &()) -> Result<usize, String> {
+                self.selections += 1;
+                self.control.request_cancellation();
+                Ok(0)
+            }
+            fn advance(&mut self, _token: usize, _state: &mut ()) -> Result<(), String> {
+                self.advances += 1;
+                Ok(())
+            }
+        }
+        let control = crate::ExecutionControl::for_request();
+        let mut transition = Cancelling {
+            control: control.clone(),
+            selections: 0,
+            advances: 0,
+        };
+        assert!(
+            greedy_typed_in_context(
+                &mut transition,
+                &FakeFrames(vec![vec![1.0]]),
+                2,
+                4,
+                false,
+                &control
+            )
+            .is_err()
+        );
+        assert_eq!(transition.selections, 1);
+        assert_eq!(transition.advances, 0);
+        assert_eq!(control.state(), crate::ExecutionState::CancelRequested);
     }
 
     #[test]

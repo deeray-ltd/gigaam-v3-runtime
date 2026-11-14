@@ -104,10 +104,16 @@ capacity and permits a late result to contradict the visible timeout.
 **Decision.** An HTTP deadline or scheduler wait expiry requests one shared execution
 cancellation state. Transcription and Recognition observe it before later work begins; the
 Service holds capacity until terminal acknowledgement and keeps the published 504 terminal.
+Window decoding accepts the caller's control; scheduled calls require identity with their
+bound request, and boxing preserves all decoder entry points. Legacy implementations receive
+before/after checks. Direct native legacy calls create an operation control, while scheduled
+legacy calls retain their bound control. Cooperative algorithms check between supported steps
+without assuming ownership of request completion.
 
-**Cost.** A native call already executing may finish. The decision does not claim native
-ONNX Runtime interruption. Streaming and non-deadline CLI paths explicitly select a
-non-cancelling execution policy.
+**Cost.** A native call already executing may finish and holds worker capacity until it returns.
+Whole VAD calls, output validation and reconstruction do not promise internal cancellation
+latency. The decision does not claim native ONNX Runtime interruption. Streaming and
+non-deadline CLI paths explicitly use control without a deadline.
 
 ## 8. Admission drains monotonically
 

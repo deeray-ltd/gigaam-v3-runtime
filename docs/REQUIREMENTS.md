@@ -140,10 +140,16 @@ and release material describe the same behavior in more detail and do not contra
   one shared execution control. Queued work and successor windows cannot begin after
   cancellation is observed; a late result cannot replace a published 504; and the admission
   permit remains held until terminal acknowledgement. A native call already executing may
-  finish. Streaming and non-deadline CLI paths explicitly use non-cancelling execution control.
-- Scope: HTTP batch work, Transcription checkpoints, Recognition scheduler, and Service
-  admission ownership. It does not establish native ONNX Runtime interruption,
-  stable error codes, or new public budgets.
+  finish. Batch and streaming window calls carry the caller's shared control into decoding,
+  including warmup and flush. A scheduled contextual call accepts only the same underlying
+  control as its bound request; boxed decoders forward legacy and contextual calls unchanged.
+  Legacy decoders receive before/after checks, while cooperative native decoders also check
+  between supported internal steps. Algorithms do not acknowledge terminal request state.
+  Streaming and non-deadline CLI callers explicitly use control without a deadline.
+- Scope: HTTP batch work, Transcription checkpoints, Recognition decoder contracts and
+  scheduler, and Service admission ownership. It does not establish interruption inside a
+  native ONNX Runtime or VAD call, bounded cancellation latency, stable error codes, or new
+  public budgets.
 
 ### OBS-001 · Bounded best-effort runtime telemetry
 

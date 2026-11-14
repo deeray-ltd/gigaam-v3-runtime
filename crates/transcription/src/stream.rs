@@ -207,7 +207,11 @@ impl<D: WindowDecoder, V: SpeechProbabilityDetector> StreamSession<D, V> {
         let features =
             FeatureMatrixView::new(self.frontend.mel_bins(), self.full_frames, &self.noise_mel)?;
         checkpoint(&self.control)?;
-        self.decoder.decode(features)?;
+        self.decoder.decode_in_context(
+            features,
+            gigaam_recognition::ScoreDetail::None,
+            &self.control,
+        )?;
         checkpoint(&self.control)
     }
 
@@ -347,7 +351,11 @@ impl<D: WindowDecoder, V: SpeechProbabilityDetector> StreamSession<D, V> {
         checkpoint(&self.control)?;
         let started = Instant::now();
         let features = FeatureMatrixView::new(mel_bins, self.full_frames, &self.mel)?;
-        let decoded = self.decoder.decode(features)?;
+        let decoded = self.decoder.decode_in_context(
+            features,
+            gigaam_recognition::ScoreDetail::None,
+            &self.control,
+        )?;
         checkpoint(&self.control)?;
         let elapsed = started.elapsed().as_secs_f64();
         let (words, silence, output_frames, encoder_seconds) = decoded.into_parts();
@@ -1052,6 +1060,65 @@ mod acoustic_stream_tests {
             .with_endpoint_source(source)?
             .with_rules(EndpointRules::new(0.320, 0.320)?)
     }
+    #[test]
+    fn stream_warmup_and_flush_deliver_the_request_control() -> Result<(), String> {
+        struct ContextDecoder {
+            control: ExecutionControl,
+            calls: Arc<AtomicUsize>,
+        }
+        impl WindowDecoder for ContextDecoder {
+            fn silence_capability(&self) -> SilenceCapability {
+                SilenceCapability::LegacyBlank
+            }
+            fn frame_rate(&self) -> FrameRate {
+                FrameRate::new(25.0).expect("valid rate")
+            }
+            fn decode(&mut self, _: FeatureMatrixView<'_>) -> Result<Decoded, String> {
+                Err("legacy path used".into())
+            }
+            fn decode_in_context(
+                &mut self,
+                features: FeatureMatrixView<'_>,
+                _: gigaam_recognition::ScoreDetail,
+                control: &ExecutionControl,
+            ) -> Result<Decoded, String> {
+                assert!(self.control.shares_identity(control));
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                control.request_cancellation();
+                control.checkpoint()?;
+                Decoded::new(
+                    vec![],
+                    vec![false; features.frames()],
+                    features.frames(),
+                    0.0,
+                )
+            }
+        }
+        for warmup in [true, false] {
+            let control = ExecutionControl::for_request();
+            let calls = Arc::new(AtomicUsize::new(0));
+            let mut session = StreamSession::new(StreamSetup {
+                frontend: crate::test_support::frontend_at_sample_rate(16_000),
+                decoder: ContextDecoder {
+                    control: control.clone(),
+                    calls: Arc::clone(&calls),
+                },
+                config: config(EndpointSource::Manual)?,
+                detector: EndpointDetector::<Wave>::Manual,
+                control,
+            })?;
+            let result = if warmup {
+                session.warmup()
+            } else {
+                session.push(&ChannelAudio::new(vec![0.1; 256])?)?;
+                session.flush().map(|_| ())
+            };
+            assert!(result.is_err());
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+        }
+        Ok(())
+    }
+
     #[test]
     fn incompatible_blank_refuses_before_decoder_calls() -> Result<(), String> {
         for capability in [SilenceCapability::Unknown, SilenceCapability::TokenAbsence] {
