@@ -81,28 +81,103 @@ struct History {
 fn length(history: Option<usize>, arena: &[History]) -> usize {
     history.map_or(0, |index| arena[index].len)
 }
-fn history_at(mut history: Option<usize>, index: usize, arena: &[History]) -> (usize, usize) {
-    while let Some(current) = history {
-        let node = &arena[current];
-        if node.len - 1 == index {
-            return (node.occurrence.frame, node.occurrence.token);
-        }
-        history = node.previous;
-    }
-    unreachable!("history index is within its length")
+// Reused initialized buffers: comparisons never allocate and only inspect live prefixes.
+#[derive(Default)]
+struct ComparisonBuffers {
+    left: Vec<(usize, usize)>,
+    right: Vec<(usize, usize)>,
+    #[cfg(test)]
+    visits: usize,
 }
-fn history_cmp(a: Option<usize>, b: Option<usize>, arena: &[History], frames: bool) -> Ordering {
-    let al = length(a, arena);
-    let bl = length(b, arena);
-    for i in 0..al.min(bl) {
-        let av = history_at(a, i, arena);
-        let bv = history_at(b, i, arena);
-        let order = if frames { av.cmp(&bv) } else { av.1.cmp(&bv.1) };
-        if order != Ordering::Equal {
-            return order;
+impl ComparisonBuffers {
+    fn prepare(&mut self, needed: usize) -> Result<(), String> {
+        for buffer in [&mut self.left, &mut self.right] {
+            if buffer.len() < needed {
+                buffer
+                    .try_reserve_exact(needed - buffer.len())
+                    .map_err(|_| "RNN-T comparison allocation failed")?;
+                buffer.resize(needed, (0, 0));
+            }
+        }
+        Ok(())
+    }
+
+    fn history_cmp(
+        &mut self,
+        a: Option<usize>,
+        b: Option<usize>,
+        arena: &[History],
+        frames: bool,
+    ) -> Ordering {
+        if a == b {
+            return Ordering::Equal;
+        }
+        let al = length(a, arena);
+        let bl = length(b, arena);
+        let visits = fill_history(a, arena, &mut self.left[..al])
+            + fill_history(b, arena, &mut self.right[..bl]);
+        #[cfg(test)]
+        {
+            self.visits += visits;
+        }
+        #[cfg(not(test))]
+        let _ = visits;
+        if frames {
+            self.left[..al].cmp(&self.right[..bl])
+        } else {
+            self.left[..al]
+                .iter()
+                .map(|key| key.1)
+                .cmp(self.right[..bl].iter().map(|key| key.1))
         }
     }
-    al.cmp(&bl)
+
+    fn candidate_cmp(
+        &mut self,
+        a: &Candidate,
+        b: &Candidate,
+        active: &[Hypothesis],
+        arena: &[History],
+    ) -> Ordering {
+        if a.parent == b.parent {
+            return a.token.cmp(&b.token);
+        }
+        let ah = active[a.parent].history;
+        let bh = active[b.parent].history;
+        let al = length(ah, arena);
+        let bl = length(bh, arena);
+        let visits = fill_history(ah, arena, &mut self.left[..al])
+            + fill_history(bh, arena, &mut self.right[..bl]);
+        #[cfg(test)]
+        {
+            self.visits += visits;
+        }
+        #[cfg(not(test))]
+        let _ = visits;
+        self.left[al] = (0, a.token);
+        self.right[bl] = (0, b.token);
+        self.left[..=al]
+            .iter()
+            .map(|key| key.1)
+            .cmp(self.right[..=bl].iter().map(|key| key.1))
+    }
+}
+
+// Each predecessor is visited once. Returning the visit count lets semantic tests check that
+// bound without depending on wall time or the private representation of a sorting algorithm.
+fn fill_history(
+    mut history: Option<usize>,
+    arena: &[History],
+    output: &mut [(usize, usize)],
+) -> usize {
+    let mut visits = 0;
+    while let Some(index) = history {
+        let node = &arena[index];
+        output[node.len - 1] = (node.occurrence.frame, node.occurrence.token);
+        history = node.previous;
+        visits += 1;
+    }
+    visits
 }
 struct Hypothesis {
     state: usize,
@@ -155,63 +230,6 @@ fn row(logits: Vec<f32>, vocabulary: usize) -> Result<Vec<f64>, String> {
         return Err("invalid normalized RNN-T row".into());
     }
     Ok(result)
-}
-fn candidate_cmp(
-    a: &Candidate,
-    b: &Candidate,
-    active: &[Hypothesis],
-    arena: &[History],
-) -> Ordering {
-    let ah = active[a.parent].history;
-    let bh = active[b.parent].history;
-    let al = length(ah, arena);
-    let bl = length(bh, arena);
-    for i in 0..(al + 1).min(bl + 1) {
-        let av = if i == al {
-            a.token
-        } else {
-            history_at(ah, i, arena).1
-        };
-        let bv = if i == bl {
-            b.token
-        } else {
-            history_at(bh, i, arena).1
-        };
-        let order = av.cmp(&bv);
-        if order != Ordering::Equal {
-            return order;
-        }
-    }
-    (al + 1).cmp(&(bl + 1))
-}
-fn candidate_history_cmp(
-    a: &Candidate,
-    b: &Candidate,
-    active: &[Hypothesis],
-    arena: &[History],
-    frame: usize,
-) -> Ordering {
-    let ah = active[a.parent].history;
-    let bh = active[b.parent].history;
-    let al = length(ah, arena);
-    let bl = length(bh, arena);
-    for i in 0..(al + 1).min(bl + 1) {
-        let av = if i == al {
-            (frame, a.token)
-        } else {
-            history_at(ah, i, arena)
-        };
-        let bv = if i == bl {
-            (frame, b.token)
-        } else {
-            history_at(bh, i, arena)
-        };
-        let order = av.cmp(&bv);
-        if order != Ordering::Equal {
-            return order;
-        }
-    }
-    (al + 1).cmp(&(bl + 1))
 }
 fn release_states<S>(states: &mut [Option<S>], active: &[Hypothesis], done: &[Hypothesis]) {
     for (index, state) in states.iter_mut().enumerate() {
@@ -285,6 +303,7 @@ pub fn decode<T: RnntBeamFrameValue, R: RnntBeamTransition<T>, F: RnntFrameSourc
     let mut states = Vec::new();
     let initial = insert_state(&mut states, state)?;
     let mut arena: Vec<History> = Vec::new();
+    let mut comparisons = ComparisonBuffers::default();
     let mut active = Vec::new();
     active
         .try_reserve_exact(width)
@@ -307,6 +326,13 @@ pub fn decode<T: RnntBeamFrameValue, R: RnntBeamTransition<T>, F: RnntFrameSourc
         done.try_reserve_exact(completed)
             .map_err(|_| "RNN-T completed allocation failed")?;
         for layer in 0..=cap {
+            let max_history = active
+                .iter()
+                .chain(&done)
+                .map(|h| length(h.history, &arena))
+                .fold(0, usize::max);
+            comparisons.prepare(max_history)?;
+            control.checkpoint()?;
             let mut candidates = Vec::new();
             candidates
                 .try_reserve_exact(scratch)
@@ -324,13 +350,18 @@ pub fn decode<T: RnntBeamFrameValue, R: RnntBeamTransition<T>, F: RnntFrameSourc
                 let mass = finite_add(hypothesis.mass, probabilities[blank])?;
                 let path = finite_add(hypothesis.path, probabilities[blank])?;
                 if let Some(existing) = done.iter_mut().find(|x| {
-                    history_cmp(x.history, hypothesis.history, &arena, false) == Ordering::Equal
+                    comparisons.history_cmp(x.history, hypothesis.history, &arena, false)
+                        == Ordering::Equal
                 }) {
                     existing.mass = log_add(existing.mass, mass)?;
                     if path > existing.path
                         || (path == existing.path
-                            && history_cmp(hypothesis.history, existing.history, &arena, true)
-                                == Ordering::Less)
+                            && comparisons.history_cmp(
+                                hypothesis.history,
+                                existing.history,
+                                &arena,
+                                true,
+                            ) == Ordering::Less)
                     {
                         existing.path = path;
                         existing.history = hypothesis.history;
@@ -362,46 +393,28 @@ pub fn decode<T: RnntBeamFrameValue, R: RnntBeamTransition<T>, F: RnntFrameSourc
             if layer == cap || candidates.is_empty() {
                 break;
             }
+            // Active full prefixes are unique. Appending one nonblank label per parent
+            // creates unique children: equal children imply equal parent prefix and label.
+            // Completed hypotheses still merge above, where distinct alignments can meet.
+            let max_child = active
+                .iter()
+                .map(|h| length(h.history, &arena))
+                .fold(0, usize::max)
+                .checked_add(1)
+                .ok_or("RNN-T comparison length overflow")?;
+            comparisons.prepare(max_child)?;
+            control.checkpoint()?;
             candidates.sort_unstable_by(|a, b| {
-                candidate_cmp(a, b, &active, &arena).then_with(|| a.parent.cmp(&b.parent))
-            });
-            let mut merged: Vec<Candidate> = Vec::new();
-            merged
-                .try_reserve_exact(candidates.len())
-                .map_err(|_| "RNN-T merge allocation failed")?;
-            for candidate in candidates {
-                control.checkpoint()?;
-                if let Some(last) = merged.last_mut()
-                    && candidate_cmp(last, &candidate, &active, &arena) == Ordering::Equal
-                {
-                    let mass = log_add(last.mass, candidate.mass)?;
-                    if candidate.path > last.path
-                        || (candidate.path == last.path
-                            && candidate_history_cmp(
-                                &candidate,
-                                last,
-                                &active,
-                                &arena,
-                                frame_index,
-                            ) == Ordering::Less)
-                    {
-                        *last = candidate;
-                    }
-                    last.mass = mass;
-                    continue;
-                }
-                merged.push(candidate);
-            }
-            merged.sort_unstable_by(|a, b| {
                 b.mass
                     .total_cmp(&a.mass)
-                    .then_with(|| candidate_cmp(a, b, &active, &arena))
+                    .then_with(|| comparisons.candidate_cmp(a, b, &active, &arena))
             });
-            merged.truncate(width);
+            candidates.truncate(width);
+            control.checkpoint()?;
             let mut next = Vec::new();
-            next.try_reserve_exact(merged.len())
+            next.try_reserve_exact(candidates.len())
                 .map_err(|_| "RNN-T state allocation failed")?;
-            for candidate in merged {
+            for candidate in candidates {
                 control.checkpoint()?;
                 let parent = &active[candidate.parent];
                 let state = transition.advance(
@@ -434,11 +447,18 @@ pub fn decode<T: RnntBeamFrameValue, R: RnntBeamTransition<T>, F: RnntFrameSourc
             active = next;
             release_states(&mut states, &active, &done);
         }
+        let max_done = done
+            .iter()
+            .map(|h| length(h.history, &arena))
+            .fold(0, usize::max);
+        comparisons.prepare(max_done)?;
+        control.checkpoint()?;
         done.sort_unstable_by(|a, b| {
             b.mass
                 .total_cmp(&a.mass)
-                .then_with(|| history_cmp(a.history, b.history, &arena, false))
+                .then_with(|| comparisons.history_cmp(a.history, b.history, &arena, false))
         });
+        control.checkpoint()?;
         done.truncate(width);
         active = done;
         release_states(&mut states, &active, &[]);
@@ -704,6 +724,184 @@ mod tests {
         }
         result
     }
+    fn append_history(
+        arena: &mut Vec<History>,
+        previous: Option<usize>,
+        frame: usize,
+        token: usize,
+    ) -> Option<usize> {
+        let len = length(previous, arena) + 1;
+        let index = arena.len();
+        arena.push(History {
+            previous,
+            occurrence: Occurrence {
+                frame,
+                token,
+                score: -0.5,
+            },
+            len,
+        });
+        Some(index)
+    }
+
+    #[test]
+    fn comparison_matches_flattened_oracle_and_ignores_stale_tails() -> Result<(), String> {
+        let mut arena = Vec::new();
+        let mut entries = vec![(None, vec![])];
+        for a in 0..3 {
+            let first = append_history(&mut arena, None, 2 - a, a);
+            entries.push((first, vec![(2 - a, a)]));
+            for b in 0..3 {
+                let second = append_history(&mut arena, first, b, b);
+                entries.push((second, vec![(2 - a, a), (b, b)]));
+                for c in 0..3 {
+                    let third = append_history(&mut arena, second, 2 - c, c);
+                    entries.push((third, vec![(2 - a, a), (b, b), (2 - c, c)]));
+                }
+            }
+        }
+        let mut cmp = ComparisonBuffers::default();
+        cmp.prepare(1)?;
+        cmp.prepare(4)?;
+        for (a, ak) in &entries {
+            for (b, bk) in &entries {
+                let expected_tokens = ak.iter().map(|x| x.1).cmp(bk.iter().map(|x| x.1));
+                assert_eq!(cmp.history_cmp(*a, *b, &arena, false), expected_tokens);
+                assert_eq!(cmp.history_cmp(*a, *b, &arena, true), ak.cmp(bk));
+                let active = vec![
+                    Hypothesis {
+                        state: 0,
+                        mass: 0.0,
+                        path: 0.0,
+                        history: *a,
+                    },
+                    Hypothesis {
+                        state: 1,
+                        mass: 0.0,
+                        path: 0.0,
+                        history: *b,
+                    },
+                ];
+                for first in 0..3 {
+                    for second in 0..3 {
+                        let left = Candidate {
+                            parent: 0,
+                            token: first,
+                            mass: 0.0,
+                            path: 0.0,
+                            score: 0.0,
+                        };
+                        let right = Candidate {
+                            parent: 1,
+                            token: second,
+                            mass: 0.0,
+                            path: 0.0,
+                            score: 0.0,
+                        };
+                        let mut x: Vec<_> = ak.iter().map(|key| key.1).collect();
+                        x.push(first);
+                        let mut y: Vec<_> = bk.iter().map(|key| key.1).collect();
+                        y.push(second);
+                        assert_eq!(cmp.candidate_cmp(&left, &right, &active, &arena), x.cmp(&y));
+                        let same_parent = Candidate {
+                            parent: 0,
+                            token: second,
+                            mass: 0.0,
+                            path: 0.0,
+                            score: 0.0,
+                        };
+                        assert_eq!(
+                            cmp.candidate_cmp(&left, &same_parent, &active, &arena),
+                            first.cmp(&second)
+                        );
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn unique_active_prefixes_generate_unique_children() {
+        use std::collections::BTreeSet;
+        let mut active = vec![vec![]];
+        for length in 1..=3 {
+            let previous: Vec<_> = active
+                .iter()
+                .filter(|v| v.len() == length - 1)
+                .cloned()
+                .collect();
+            for prefix in previous {
+                for token in 0..3 {
+                    let mut child = prefix.clone();
+                    child.push(token);
+                    active.push(child);
+                }
+            }
+        }
+        let mut children = BTreeSet::new();
+        for prefix in &active {
+            for token in 0..3 {
+                let mut child = prefix.clone();
+                child.push(token);
+                assert!(
+                    children.insert(child),
+                    "distinct active prefixes and labels produced equal children"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn long_common_prefix_comparison_visits_each_history_at_most_once() -> Result<(), String> {
+        let mut arena = Vec::new();
+        let mut common = None;
+        for index in 0..4096 {
+            common = append_history(&mut arena, common, index, index % 2);
+        }
+        let a = append_history(&mut arena, common, 4096, 0);
+        let b = append_history(&mut arena, common, 4096, 1);
+        let mut cmp = ComparisonBuffers::default();
+        cmp.prepare(4098)?;
+        assert_eq!(cmp.history_cmp(a, b, &arena, false), Ordering::Less);
+        assert_eq!(cmp.visits, 8194);
+        let active = vec![
+            Hypothesis {
+                state: 0,
+                mass: 0.0,
+                path: 0.0,
+                history: a,
+            },
+            Hypothesis {
+                state: 1,
+                mass: 0.0,
+                path: 0.0,
+                history: b,
+            },
+        ];
+        let x = Candidate {
+            parent: 0,
+            token: 1,
+            mass: 0.0,
+            path: 0.0,
+            score: 0.0,
+        };
+        let y = Candidate {
+            parent: 1,
+            token: 0,
+            mass: 0.0,
+            path: 0.0,
+            score: 0.0,
+        };
+        cmp.visits = 0;
+        assert_eq!(cmp.candidate_cmp(&x, &y, &active, &arena), Ordering::Less);
+        assert_eq!(cmp.visits, 8194);
+        cmp.visits = 0;
+        assert_eq!(cmp.history_cmp(a, a, &arena, true), Ordering::Equal);
+        assert_eq!(cmp.visits, 0);
+        Ok(())
+    }
+
     #[test]
     fn exhaustive_individual_alignments_match_full_prefix_sensitive_search() -> Result<(), String> {
         for frame_count in 1..=2 {
