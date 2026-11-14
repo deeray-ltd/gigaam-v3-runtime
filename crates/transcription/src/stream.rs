@@ -10,9 +10,9 @@
 //! Single-channel incremental transcription state and revision events.
 
 use crate::contracts::{
-    ChannelSnapshot, EndpointSource, FinalEvent, FinalReason, FrontierEvent, SnapshotWord,
-    StreamConfig, StreamEvent, StreamLockPolicy, StreamWord, TranscriptWord, WordFinality,
-    WordStability, WordsEvent, checkpoint,
+    ChannelSnapshot, EndpointSource, FinalEvent, FinalReason, FrontierEvent, SilenceSkipPolicy,
+    SnapshotWord, StreamConfig, StreamEvent, StreamLockPolicy, StreamWord, TranscriptWord,
+    WordFinality, WordStability, WordsEvent, checkpoint,
 };
 use crate::endpoint::{AcousticEndpointState, Endpoint, SpeechState, detect};
 use crate::padding::pad_noise;
@@ -34,6 +34,10 @@ pub enum EndpointDetector<D> {
     Manual,
     Blank,
     Vad(D),
+    /// Manual endpointing with one detector used solely for silence skipping.
+    ManualWithVad(D),
+    /// Blank endpointing with one detector used solely for silence skipping.
+    BlankWithVad(D),
 }
 
 /// Typed capabilities required to create one streaming session.
@@ -71,6 +75,7 @@ pub struct StreamSession<D: WindowDecoder, V: SpeechProbabilityDetector> {
     start_time: f32,
     buffer: Vec<f32>,
     decoded_samples: usize,
+    processed_samples: usize,
     committed: Vec<StreamWord>,
     /// Exactly the word line a client reaches after applying every emitted patch.
     emitted: Vec<StreamWord>,
@@ -131,8 +136,20 @@ impl<D: WindowDecoder, V: SpeechProbabilityDetector> StreamSession<D, V> {
         }
         let sample_rate = config.sample_rate().as_usize()?;
         match (config.endpoint_source(), &detector) {
-            (EndpointSource::Manual, EndpointDetector::Manual) => {}
-            (EndpointSource::Blank, EndpointDetector::Blank) => {
+            (EndpointSource::Manual, EndpointDetector::Manual)
+                if config.silence_skip() == SilenceSkipPolicy::Off => {}
+            (EndpointSource::Manual, EndpointDetector::ManualWithVad(_))
+                if config.silence_skip() != SilenceSkipPolicy::Off => {}
+            (EndpointSource::Blank, EndpointDetector::Blank)
+                if config.silence_skip() == SilenceSkipPolicy::Off =>
+            {
+                if decoder.silence_capability() != SilenceCapability::LegacyBlank {
+                    return Err("decoder does not support blank stream endpointing".into());
+                }
+            }
+            (EndpointSource::Blank, EndpointDetector::BlankWithVad(_))
+                if config.silence_skip() != SilenceSkipPolicy::Off =>
+            {
                 if decoder.silence_capability() != SilenceCapability::LegacyBlank {
                     return Err("decoder does not support blank stream endpointing".into());
                 }
@@ -188,6 +205,7 @@ impl<D: WindowDecoder, V: SpeechProbabilityDetector> StreamSession<D, V> {
             start_time: 0.0,
             buffer: Vec::with_capacity(full_samples),
             decoded_samples: 0,
+            processed_samples: 0,
             committed: Vec::new(),
             emitted: Vec::new(),
             final_sent: 0,
@@ -282,7 +300,7 @@ impl<D: WindowDecoder, V: SpeechProbabilityDetector> StreamSession<D, V> {
             let unprocessed = self
                 .buffer
                 .len()
-                .checked_sub(self.decoded_samples)
+                .checked_sub(self.processed_samples)
                 .ok_or_else(|| "stream decoded sample count exceeds its buffer".to_owned())?;
             let to_step = step.saturating_sub(unprocessed);
             let take = remaining.len().min(room).min(to_step);
@@ -291,7 +309,7 @@ impl<D: WindowDecoder, V: SpeechProbabilityDetector> StreamSession<D, V> {
             let grown = self
                 .buffer
                 .len()
-                .checked_sub(self.decoded_samples)
+                .checked_sub(self.processed_samples)
                 .ok_or_else(|| "stream decoded sample count exceeds its buffer".to_owned())?;
             if self.buffer.len() >= self.full_samples || grown >= step {
                 events.extend(self.tick(StreamProgress::Advance)?);
@@ -395,6 +413,7 @@ impl<D: WindowDecoder, V: SpeechProbabilityDetector> StreamSession<D, V> {
         self.encoder_seconds = encoder_seconds;
         self.decodes = decodes;
         self.decoded_samples = accounting.decoded_samples;
+        self.processed_samples = accounting.decoded_samples;
         Ok(())
     }
 
@@ -473,7 +492,8 @@ impl<D: WindowDecoder, V: SpeechProbabilityDetector> StreamSession<D, V> {
         self.buffer.drain(..dropped);
         self.mel.copy_from_slice(&self.noise_mel);
         self.real_full_frames = 0;
-        self.decoded_samples = self.buffer.len();
+        self.decoded_samples = 0;
+        self.processed_samples = self.buffer.len();
         self.current.clear();
         Ok(())
     }
@@ -533,13 +553,86 @@ impl<D: WindowDecoder, V: SpeechProbabilityDetector> StreamSession<D, V> {
         Ok(())
     }
 
+    fn acoustic_observation(&mut self) -> Result<Vec<f32>, String> {
+        checkpoint(&self.control)?;
+        let audio = ChannelAudioView::new(&self.buffer)?;
+        let detector = match &mut self.detector {
+            EndpointDetector::Vad(detector)
+            | EndpointDetector::ManualWithVad(detector)
+            | EndpointDetector::BlankWithVad(detector) => detector,
+            EndpointDetector::Manual | EndpointDetector::Blank => {
+                return Err("silence skip requires a detector".into());
+            }
+        };
+        let probabilities = detector.probabilities(audio)?;
+        checkpoint(&self.control)?;
+        if probabilities.len() != self.buffer.len().div_ceil(512)
+            || probabilities
+                .iter()
+                .any(|p| !p.is_finite() || !(0.0..=1.0).contains(p))
+        {
+            return Err("invalid acoustic probability frames".into());
+        }
+        Ok(probabilities)
+    }
+
+    fn skip_advance(&mut self, probabilities: &[f32]) -> Result<(), String> {
+        let mut acoustic = self.acoustic;
+        let endpoint = if self.config.endpoint_source() == EndpointSource::Vad {
+            if self.acoustic_mode {
+                let (next, endpoint) = acoustic.observe_window(
+                    self.buffer_start_sample,
+                    self.buffer.len(),
+                    probabilities,
+                    self.config.vad_threshold().get(),
+                    self.config.rules(),
+                    self.sample_rate,
+                )?;
+                acoustic = next;
+                endpoint
+            } else {
+                let silence = mask(probabilities, self.config.vad_threshold().get())?;
+                detect(
+                    self.config.rules(),
+                    &silence,
+                    silence.len(),
+                    VAD_FPS,
+                    SpeechState::Absent,
+                )?
+            }
+        } else {
+            Endpoint::None
+        };
+        checkpoint(&self.control)?;
+        let retain = if endpoint == Endpoint::NoSpeech || endpoint == Endpoint::AfterSpeech {
+            Some(self.config.retained_silence_samples().get())
+        } else if self.buffer.len() >= self.full_samples {
+            Some(self.config.overlap_samples().get())
+        } else {
+            None
+        };
+        if let Some(retain) = retain {
+            self.reset_buffer(retain)?;
+            if endpoint != Endpoint::None {
+                acoustic.clear_turn();
+            }
+            self.cut_time = self.start_time;
+        } else {
+            self.processed_samples = self.buffer.len();
+        }
+        self.acoustic = acoustic;
+        self.previous = None;
+        Ok(())
+    }
+
     fn tick(&mut self, progress: StreamProgress) -> Result<Vec<StreamEvent>, String> {
         checkpoint(&self.control)?;
         let mut events = Vec::new();
         let length = self.buffer.len();
         if length == 0 {
             if progress == StreamProgress::Flush
-                && (self.acoustic_mode || matches!(self.detector, EndpointDetector::Manual))
+                && (self.acoustic_mode
+                    || matches!(self.config.endpoint_source(), EndpointSource::Manual))
             {
                 if let Some(previous) = self.previous.take() {
                     self.commit(previous.words());
@@ -557,6 +650,29 @@ impl<D: WindowDecoder, V: SpeechProbabilityDetector> StreamSession<D, V> {
         }
         let length_seconds = usize_to_f32(length) / usize_to_f32(self.sample_rate);
         let now = self.start_time + length_seconds;
+        let observation = if progress == StreamProgress::Advance
+            && matches!(
+                self.config.silence_skip(),
+                SilenceSkipPolicy::AcousticWindow { .. }
+            ) {
+            Some(self.acoustic_observation()?)
+        } else {
+            None
+        };
+        if let (SilenceSkipPolicy::AcousticWindow { threshold }, Some(probabilities)) =
+            (self.config.silence_skip(), observation.as_ref())
+            && probabilities.iter().all(|p| *p < threshold.get())
+            && self.current.is_empty()
+            && self
+                .previous
+                .as_ref()
+                .is_none_or(|previous| previous.words().is_empty())
+            && self.committed.len() == self.final_sent
+            && self.emitted.len() == self.final_sent
+        {
+            self.skip_advance(probabilities)?;
+            return Ok(events);
+        }
         let candidate = self.decode()?;
         checkpoint(&self.control)?;
         let DecodedCandidate {
@@ -587,10 +703,16 @@ impl<D: WindowDecoder, V: SpeechProbabilityDetector> StreamSession<D, V> {
         let mut acoustic = self.acoustic;
         let endpoint = match &mut self.detector {
             EndpointDetector::Vad(detector) => {
-                let audio = ChannelAudioView::new(&self.buffer)?;
-                checkpoint(&self.control)?;
-                let probabilities = detector.probabilities(audio)?;
-                checkpoint(&self.control)?;
+                let probabilities = match observation {
+                    Some(probabilities) => probabilities,
+                    None => {
+                        let audio = ChannelAudioView::new(&self.buffer)?;
+                        checkpoint(&self.control)?;
+                        let probabilities = detector.probabilities(audio)?;
+                        checkpoint(&self.control)?;
+                        probabilities
+                    }
+                };
                 if self.acoustic_mode {
                     let (next, endpoint) = acoustic.observe_window(
                         self.buffer_start_sample,
@@ -613,8 +735,8 @@ impl<D: WindowDecoder, V: SpeechProbabilityDetector> StreamSession<D, V> {
                     )?
                 }
             }
-            EndpointDetector::Manual => Endpoint::None,
-            EndpointDetector::Blank => detect(
+            EndpointDetector::Manual | EndpointDetector::ManualWithVad(_) => Endpoint::None,
+            EndpointDetector::Blank | EndpointDetector::BlankWithVad(_) => detect(
                 self.config.rules(),
                 &silence,
                 upto,
@@ -654,7 +776,8 @@ impl<D: WindowDecoder, V: SpeechProbabilityDetector> StreamSession<D, V> {
         let open = self.open_line()?;
         match progress {
             StreamProgress::Flush
-                if self.acoustic_mode || matches!(self.detector, EndpointDetector::Manual) =>
+                if self.acoustic_mode
+                    || matches!(self.config.endpoint_source(), EndpointSource::Manual) =>
             {
                 self.commit(&open);
                 self.emit(&[], now, Some(FinalReason::ForcedOrLocked), &mut events)?;
@@ -1060,6 +1183,247 @@ mod acoustic_stream_tests {
             .with_endpoint_source(source)?
             .with_rules(EndpointRules::new(0.320, 0.320)?)
     }
+    #[test]
+    fn acoustic_skip_preserves_context_and_flush_decodes() -> Result<(), String> {
+        use crate::{SilenceSkipPolicy, VadProbability};
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut session = StreamSession::new(StreamSetup {
+            frontend: crate::test_support::frontend_at_sample_rate(16_000),
+            decoder: Decoder {
+                capability: SilenceCapability::TokenAbsence,
+                calls: Arc::clone(&calls),
+            },
+            config: config(EndpointSource::Manual)?.with_silence_skip(
+                SilenceSkipPolicy::AcousticWindow {
+                    threshold: VadProbability::new(0.5)?,
+                },
+            )?,
+            detector: EndpointDetector::ManualWithVad(Wave),
+            control: ExecutionControl::without_deadline(),
+        })?;
+        let events = session.push(&ChannelAudio::new(vec![0.0; 4096])?)?;
+        assert!(events.is_empty());
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(session.buffer_start_sample, 3072);
+        assert_eq!(session.buffer.len(), 1024);
+        assert_eq!(session.processed_samples, 1024);
+        assert_eq!(session.real_full_frames, 0);
+        assert!((session.now() - 0.256).abs() < 1e-6);
+        session.flush()?;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(session.flush()?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn skip_threshold_equality_and_pending_words_require_decode() -> Result<(), String> {
+        use crate::{SilenceSkipPolicy, VadProbability};
+        struct EqualThenQuiet(usize);
+        impl SpeechProbabilityDetector for EqualThenQuiet {
+            fn probabilities(&mut self, audio: ChannelAudioView<'_>) -> Result<Vec<f32>, String> {
+                let probability = if self.0 == 0 { 0.5 } else { 0.0 };
+                self.0 += 1;
+                Ok(vec![probability; audio.samples().len().div_ceil(512)])
+            }
+        }
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut session = StreamSession::new(StreamSetup {
+            frontend: crate::test_support::frontend_at_sample_rate(16_000),
+            decoder: Decoder {
+                capability: SilenceCapability::TokenAbsence,
+                calls: Arc::clone(&calls),
+            },
+            config: config(EndpointSource::Manual)?.with_silence_skip(
+                SilenceSkipPolicy::AcousticWindow {
+                    threshold: VadProbability::new(0.5)?,
+                },
+            )?,
+            detector: EndpointDetector::ManualWithVad(EqualThenQuiet(0)),
+            control: ExecutionControl::without_deadline(),
+        })?;
+        session.push(&ChannelAudio::new(vec![0.0; 512])?)?;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(!session.current.is_empty());
+        session.push(&ChannelAudio::new(vec![0.0; 512])?)?;
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn speech_on_either_observation_edge_requires_recognition() -> Result<(), String> {
+        use crate::{SilenceSkipPolicy, VadProbability};
+        for index in [0, 511] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let mut session = StreamSession::new(StreamSetup {
+                frontend: crate::test_support::frontend_at_sample_rate(16_000),
+                decoder: Decoder {
+                    capability: SilenceCapability::TokenAbsence,
+                    calls: Arc::clone(&calls),
+                },
+                config: config(EndpointSource::Manual)?.with_silence_skip(
+                    SilenceSkipPolicy::AcousticWindow {
+                        threshold: VadProbability::new(0.5)?,
+                    },
+                )?,
+                detector: EndpointDetector::ManualWithVad(Wave),
+                control: ExecutionControl::without_deadline(),
+            })?;
+            let mut samples = vec![0.0; 512];
+            samples[index] = 1.0;
+            session.push(&ChannelAudio::new(samples)?)?;
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn empty_seam_does_not_prevent_a_silent_skip() -> Result<(), String> {
+        use crate::{SilenceSkipPolicy, VadProbability};
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut session = StreamSession::new(StreamSetup {
+            frontend: crate::test_support::frontend_at_sample_rate(16_000),
+            decoder: Decoder {
+                capability: SilenceCapability::TokenAbsence,
+                calls: Arc::clone(&calls),
+            },
+            config: config(EndpointSource::Manual)?.with_silence_skip(
+                SilenceSkipPolicy::AcousticWindow {
+                    threshold: VadProbability::new(0.5)?,
+                },
+            )?,
+            detector: EndpointDetector::ManualWithVad(Wave),
+            control: ExecutionControl::without_deadline(),
+        })?;
+        session.previous = Some(crate::stitch::WindowWords::new(
+            crate::stitch::Window::new(0.0, 0.01)?,
+            vec![],
+        ));
+        session.push(&ChannelAudio::new(vec![0.0; 512])?)?;
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(session.previous.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn vad_skip_reuses_one_observation_and_recognizes_returning_speech() -> Result<(), String> {
+        use crate::{SilenceSkipPolicy, VadProbability};
+        struct CountingVad(Arc<AtomicUsize>);
+        impl SpeechProbabilityDetector for CountingVad {
+            fn probabilities(&mut self, audio: ChannelAudioView<'_>) -> Result<Vec<f32>, String> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(audio
+                    .samples()
+                    .chunks(512)
+                    .map(|chunk| {
+                        if chunk.iter().any(|sample| *sample > 0.5) {
+                            1.0
+                        } else {
+                            0.0
+                        }
+                    })
+                    .collect())
+            }
+        }
+        let calls = Arc::new(AtomicUsize::new(0));
+        let vad_calls = Arc::new(AtomicUsize::new(0));
+        let mut session = StreamSession::new(StreamSetup {
+            frontend: crate::test_support::frontend_at_sample_rate(16_000),
+            decoder: Decoder {
+                capability: SilenceCapability::TokenAbsence,
+                calls: Arc::clone(&calls),
+            },
+            config: config(EndpointSource::Vad)?.with_silence_skip(
+                SilenceSkipPolicy::AcousticWindow {
+                    threshold: VadProbability::new(0.5)?,
+                },
+            )?,
+            detector: EndpointDetector::Vad(CountingVad(Arc::clone(&vad_calls))),
+            control: ExecutionControl::without_deadline(),
+        })?;
+        session.push(&ChannelAudio::new(vec![0.0; 512])?)?;
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        session.push(&ChannelAudio::new(vec![1.0; 512])?)?;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(vad_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(session.buffer_start_sample, 0);
+        assert_eq!(session.decoded_samples, 1024);
+        assert!(!session.current.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn cancellation_inside_skip_observation_keeps_accepted_state() -> Result<(), String> {
+        use crate::{SilenceSkipPolicy, VadProbability};
+        struct Cancelling(ExecutionControl);
+        impl SpeechProbabilityDetector for Cancelling {
+            fn probabilities(&mut self, audio: ChannelAudioView<'_>) -> Result<Vec<f32>, String> {
+                self.0.request_cancellation();
+                Ok(vec![0.0; audio.samples().len().div_ceil(512)])
+            }
+        }
+        let control = ExecutionControl::for_request();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut session = StreamSession::new(StreamSetup {
+            frontend: crate::test_support::frontend_at_sample_rate(16_000),
+            decoder: Decoder {
+                capability: SilenceCapability::TokenAbsence,
+                calls: Arc::clone(&calls),
+            },
+            config: config(EndpointSource::Vad)?.with_silence_skip(
+                SilenceSkipPolicy::AcousticWindow {
+                    threshold: VadProbability::new(0.5)?,
+                },
+            )?,
+            detector: EndpointDetector::Vad(Cancelling(control.clone())),
+            control,
+        })?;
+        assert!(session.push(&ChannelAudio::new(vec![0.0; 512])?).is_err());
+        assert_eq!(session.buffer_start_sample, 0);
+        assert_eq!(session.processed_samples, 0);
+        assert_eq!(
+            session.acoustic,
+            crate::endpoint::AcousticEndpointState::default()
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_skip_observation_leaves_tick_unaccepted() -> Result<(), String> {
+        use crate::{SilenceSkipPolicy, VadProbability};
+        struct Invalid;
+        impl SpeechProbabilityDetector for Invalid {
+            fn probabilities(&mut self, _: ChannelAudioView<'_>) -> Result<Vec<f32>, String> {
+                Ok(vec![f32::NAN])
+            }
+        }
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut session = StreamSession::new(StreamSetup {
+            frontend: crate::test_support::frontend_at_sample_rate(16_000),
+            decoder: Decoder {
+                capability: SilenceCapability::TokenAbsence,
+                calls: Arc::clone(&calls),
+            },
+            config: config(EndpointSource::Manual)?.with_silence_skip(
+                SilenceSkipPolicy::AcousticWindow {
+                    threshold: VadProbability::new(0.5)?,
+                },
+            )?,
+            detector: EndpointDetector::ManualWithVad(Invalid),
+            control: ExecutionControl::without_deadline(),
+        })?;
+        assert!(session.push(&ChannelAudio::new(vec![0.0; 512])?).is_err());
+        assert_eq!(session.buffer_start_sample, 0);
+        assert_eq!(session.processed_samples, 0);
+        assert_eq!(session.decoded_samples, 0);
+        assert_eq!(
+            session.acoustic,
+            crate::endpoint::AcousticEndpointState::default()
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        Ok(())
+    }
+
     #[test]
     fn stream_warmup_and_flush_deliver_the_request_control() -> Result<(), String> {
         struct ContextDecoder {
