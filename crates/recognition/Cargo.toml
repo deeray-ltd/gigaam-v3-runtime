@@ -26,3 +26,11 @@ golden-tests = []
 [[test]]
 name = "ctc_golden"
 required-features = ["golden-tests"]
+
+[dev-dependencies]
+prost = "=0.13.5"
+sentencepiece-model = "=0.1.4"
+
+[[test]]
+name = "tokenizer_golden"
+required-features = ["golden-tests"]

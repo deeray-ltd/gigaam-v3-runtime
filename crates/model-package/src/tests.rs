@@ -592,3 +592,43 @@ fn v3_selected_asset_cannot_escape_through_symlink() {
         super::VariantPackage::open(pack.path()).expect("metadata does not select an asset");
     assert!(package.encoder(EncoderPrecision::Fp32).is_err());
 }
+
+#[test]
+fn v3_selected_tokenizer_reads_model_and_checks_indexed_vocabulary() {
+    use super::{PieceKind, TokenizerMetadata, VariantPackage};
+    use prost::Message;
+    use sentencepiece_model::{ModelProto, SentencePiece};
+
+    let pack = TempPack::new(&valid_v3("v3_e2e_ctc", true, false));
+    let package = VariantPackage::open(pack.path()).expect("valid variant metadata");
+    pack.write_asset("vocab.txt", b"<unk>\na\n");
+    let model = ModelProto {
+        pieces: vec![
+            SentencePiece {
+                piece: Some("<unk>".into()),
+                r#type: Some(2),
+                ..Default::default()
+            },
+            SentencePiece {
+                piece: Some("a".into()),
+                r#type: Some(1),
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+    pack.write_asset("tokenizer.model", &model.encode_to_vec());
+    match package
+        .load_tokenizer()
+        .expect("matching selected tokenizer")
+    {
+        TokenizerMetadata::SentencePiece { pieces, .. } => {
+            assert_eq!(pieces[0].kind(), PieceKind::Unknown)
+        }
+        TokenizerMetadata::Characters(_) => panic!("selected tokenizer is SentencePiece"),
+    }
+    pack.write_asset("vocab.txt", b"a\n<unk>\n");
+    assert!(package.load_tokenizer().is_err());
+    pack.write_asset("tokenizer.model", b"\xff");
+    assert!(package.load_tokenizer().is_err());
+}
