@@ -162,8 +162,13 @@ it retains intervening original audio and source time. CLI and native WebSocket 
 existing streaming endpoint controls, including optional confirmation of applied policy.
 The shared streaming core and native CTC WebSocket now provide opt-in conservative acoustic
 silence skipping with retained context and source time. Real-model quality and cost acceptance
-and the later Realtime interface join remain open. Preserve independent detector thresholds, speech and silence durations, and padding, together
-with validated window, overlap, step, horizon, seam, and endpoint settings. Make supported
+and the later Realtime interface join remain open. An existing empty-seam behavior can drop a
+leading word when skipping is off; [issue 39](https://github.com/deeray-ltd/gigaam-v3-runtime/issues/39)
+tracks that separately. On one short CTC boundary fixture, strict off/on equality failed because
+skipping retained the spoken word that the existing off-path seam discarded; matching decode
+inputs and outputs located the difference after decoding. This observation is specific to that
+fixture and does not establish a general rule for added words. Preserve independent detector
+thresholds, speech and silence durations, and padding, together with validated window, overlap, step, horizon, seam, and endpoint settings. Make supported
 settings consistently available and explicit across applicable file and streaming interfaces;
 reject invalid or inapplicable combinations and bind model-rate-dependent values before work.
 Evaluate short and quiet speech, multiple channels, endpoint behavior and quality across
