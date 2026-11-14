@@ -61,6 +61,10 @@ impl RnntBeamOutput {
     pub fn silence(&self) -> &[bool] {
         &self.silence
     }
+    /// Consumes the search result without copying its token or silence buffers.
+    pub fn into_parts(self) -> (Vec<Token>, Vec<bool>) {
+        (self.tokens, self.silence)
+    }
 }
 
 #[derive(Clone)]

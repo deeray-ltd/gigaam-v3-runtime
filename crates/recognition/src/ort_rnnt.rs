@@ -18,6 +18,7 @@ use crate::ort_assignment::CudaAssignmentEvidence;
 use crate::ort_encoder::{EncodedRnntWindow, OrtEncoder};
 use crate::provider::{Device, ProviderPlan};
 use crate::rnnt::{self, RnntFrameSource, RnntTransition};
+use crate::rnnt_beam::{self, RnntBeamFrameValue, RnntBeamOptions, RnntBeamTransition};
 use gigaam_audio::FeatureMatrixView;
 use gigaam_model_package::{
     EncoderPrecision, ModelPackage, RnntAssets, VariantArtifacts, VariantPackage,
@@ -126,6 +127,40 @@ impl<T: SessionFloat> OrtRnntTransition<T> {
             hidden: hidden.to_vec(),
             cell: cell.to_vec(),
         })
+    }
+
+    fn joint_row(&mut self, frame: &[T], decoder: &[T]) -> Result<Vec<f32>, String> {
+        let encoder = Tensor::from_array(([1_usize, self.encoder_dimension, 1], frame.to_vec()))
+            .map_err(|error| error.to_string())?;
+        let prediction =
+            Tensor::from_array(([1_usize, self.prediction_hidden, 1], decoder.to_vec()))
+                .map_err(|error| error.to_string())?;
+        let output = self
+            .joint
+            .run(ort::inputs![
+                self.joint_inputs[0].as_str() => encoder,
+                self.joint_inputs[1].as_str() => prediction,
+            ])
+            .map_err(|error| error.to_string())?;
+        let (shape, logits) = output[self.joint_output.as_str()]
+            .try_extract_tensor::<T>()
+            .map_err(|error| error.to_string())?;
+        let expected = self
+            .blank
+            .checked_add(1)
+            .ok_or("RNN-T vocabulary overflow")?;
+        T::validate(
+            NativeOutputRole::RnntJoint,
+            shape,
+            logits,
+            ExpectedCardinality::Exact(expected),
+        )?;
+        validate_vector_axes("joint", shape, expected, 4)?;
+        let mut row = Vec::new();
+        row.try_reserve_exact(expected)
+            .map_err(|_| "RNN-T joint row allocation failed")?;
+        row.extend(logits.iter().map(|value| value.to_f32()));
+        Ok(row)
     }
 
     fn joint_argmax(
@@ -326,6 +361,56 @@ impl RnntTransition<f32> for OrtRnntTransition<half::f16> {
     }
 }
 
+macro_rules! native_beam_transition {
+    ($ty:ty) => {
+        impl RnntBeamTransition<$ty> for OrtRnntTransition<$ty> {
+            type State = PredictionState<$ty>;
+            fn start(&mut self, blank: usize) -> Result<Self::State, String> {
+                self.start_state(blank)
+            }
+            fn prepare_frame(&mut self, _: &[$ty]) -> Result<(), String> {
+                Ok(())
+            }
+            fn distribution(
+                &mut self,
+                frame: &[$ty],
+                state: &Self::State,
+            ) -> Result<Vec<f32>, String> {
+                self.joint_row(frame, &state.decoder)
+            }
+            fn advance(
+                &mut self,
+                token: usize,
+                state: &Self::State,
+            ) -> Result<Self::State, String> {
+                let label = usize_to_i64(token)
+                    .map_err(|error| format!("RNN-T token identifier: {error}"))?;
+                self.prediction_step(label, &state.hidden, &state.cell)
+            }
+        }
+    };
+}
+native_beam_transition!(f32);
+native_beam_transition!(half::f16);
+impl RnntBeamTransition<f32> for OrtRnntTransition<half::f16> {
+    type State = PredictionState<half::f16>;
+    fn start(&mut self, blank: usize) -> Result<Self::State, String> {
+        self.start_state(blank)
+    }
+    fn prepare_frame(&mut self, frame: &[f32]) -> Result<(), String> {
+        <Self as RnntTransition<f32>>::prepare_frame(self, frame)
+    }
+    fn distribution(&mut self, _: &[f32], state: &Self::State) -> Result<Vec<f32>, String> {
+        let frame = self.prepared_frame.clone();
+        self.joint_row(&frame, &state.decoder)
+    }
+    fn advance(&mut self, token: usize, state: &Self::State) -> Result<Self::State, String> {
+        let label =
+            usize_to_i64(token).map_err(|error| format!("RNN-T token identifier: {error}"))?;
+        self.prediction_step(label, &state.hidden, &state.cell)
+    }
+}
+
 enum Transition {
     F32(OrtRnntTransition<f32>),
     F16(OrtRnntTransition<half::f16>),
@@ -341,6 +426,7 @@ pub(crate) struct RnntDecoder {
     encoder_dimension: usize,
     max_symbols_per_step: usize,
     frame_rate: FrameRate,
+    beam_width: Option<usize>,
 }
 
 struct RnntParts {
@@ -601,7 +687,41 @@ impl RnntDecoder {
             encoder_dimension,
             max_symbols_per_step,
             frame_rate,
+            beam_width: None,
         })
+    }
+
+    pub(crate) fn from_variant_beam(
+        pack: &VariantPackage,
+        context: (&crate::NativeRuntime, &ProviderPlan),
+        selection: crate::RnntBeamSelection,
+    ) -> Result<Self, String> {
+        let width = selection.width;
+        let precision = selection.precision.encoder;
+        let full_fp16 = selection.precision.rnnt_heads_fp16;
+        if width == 0 {
+            return Err("RNN-T beam width must be positive".into());
+        }
+        let definition = match pack.artifacts() {
+            VariantArtifacts::Rnnt(definition) => definition,
+            VariantArtifacts::Ctc(_) => return Err("selected variant is not RNN-T".into()),
+        };
+        let vocabulary = pack
+            .tokenizer()
+            .blank_id()
+            .checked_add(1)
+            .ok_or("RNN-T vocabulary overflow")?;
+        width
+            .checked_mul(vocabulary)
+            .ok_or("RNN-T candidate count overflow")?;
+        definition
+            .max_symbols_per_step()
+            .checked_add(1)
+            .and_then(|n| n.checked_mul(width))
+            .ok_or("RNN-T completed count overflow")?;
+        let mut decoder = Self::from_variant(pack, context, precision, full_fp16)?;
+        decoder.beam_width = Some(width);
+        Ok(decoder)
     }
 
     /// The selected encoder precision. Prediction and joint assets remain fp32 CPU assets.
@@ -611,6 +731,54 @@ impl RnntDecoder {
 
     pub(crate) const fn assignment_evidence(&self) -> Option<&CudaAssignmentEvidence> {
         self.encoder.assignment_evidence()
+    }
+}
+
+struct DecodeSettings<'a> {
+    blank: usize,
+    cap: usize,
+    detail: crate::ScoreDetail,
+    beam_width: Option<usize>,
+    control: &'a crate::ExecutionControl,
+}
+fn decode_selected<T, R, F>(
+    transition: &mut R,
+    frames: &F,
+    settings: &DecodeSettings<'_>,
+) -> Result<(Vec<crate::Token>, Vec<bool>), String>
+where
+    T: rnnt::FiniteFrameValue + RnntBeamFrameValue,
+    R: RnntTransition<T> + RnntBeamTransition<T>,
+    F: RnntFrameSource<T>,
+{
+    if let Some(width) = settings.beam_width {
+        let vocabulary = settings
+            .blank
+            .checked_add(1)
+            .ok_or("RNN-T vocabulary overflow")?;
+        let output = rnnt_beam::decode(
+            transition,
+            frames,
+            RnntBeamOptions {
+                vocabulary,
+                blank: settings.blank,
+                width,
+                max_symbols_per_step: settings.cap,
+                detail: settings.detail,
+            },
+            settings.control,
+        )?;
+        Ok(output.into_parts())
+    } else {
+        let output = rnnt::greedy_typed_in_context(
+            transition,
+            frames,
+            settings.blank,
+            settings.cap,
+            settings.detail == crate::ScoreDetail::TokenLogProbabilities,
+            settings.control,
+        )?;
+        Ok((output.tokens().to_vec(), output.silence().to_vec()))
     }
 }
 
@@ -647,25 +815,22 @@ impl WindowDecoder for RnntDecoder {
         let encoded = self.encoder.forward_rnnt(features)?;
         control.checkpoint()?;
         let encoder_seconds = started.elapsed().as_secs_f64();
-        let scored = detail == crate::contracts::ScoreDetail::TokenLogProbabilities;
-        let (output, output_frames) = match (&mut self.transition, encoded) {
+        let settings = DecodeSettings {
+            blank: self.blank,
+            cap: self.max_symbols_per_step,
+            detail,
+            beam_width: self.beam_width,
+            control,
+        };
+        let (tokens, silence, output_frames) = match (&mut self.transition, encoded) {
             (Transition::F32(transition), EncodedRnntWindow::F32(values, count)) => {
                 let frames = OrtFrameSource {
                     values: &values,
                     output_frames: count,
                     encoder_dimension: self.encoder_dimension,
                 };
-                (
-                    rnnt::greedy_typed_in_context(
-                        transition,
-                        &frames,
-                        self.blank,
-                        self.max_symbols_per_step,
-                        scored,
-                        control,
-                    )?,
-                    count,
-                )
+                let (tokens, silence) = decode_selected(transition, &frames, &settings)?;
+                (tokens, silence, count)
             }
             (Transition::F16(transition), EncodedRnntWindow::F32(values, count)) => {
                 let frames = OrtFrameSource {
@@ -673,17 +838,8 @@ impl WindowDecoder for RnntDecoder {
                     output_frames: count,
                     encoder_dimension: self.encoder_dimension,
                 };
-                (
-                    rnnt::greedy_typed_in_context(
-                        transition,
-                        &frames,
-                        self.blank,
-                        self.max_symbols_per_step,
-                        scored,
-                        control,
-                    )?,
-                    count,
-                )
+                let (tokens, silence) = decode_selected(transition, &frames, &settings)?;
+                (tokens, silence, count)
             }
             (Transition::F16(transition), EncodedRnntWindow::F16(values, count)) => {
                 let frames = OrtFrameSource {
@@ -691,25 +847,19 @@ impl WindowDecoder for RnntDecoder {
                     output_frames: count,
                     encoder_dimension: self.encoder_dimension,
                 };
-                (
-                    rnnt::greedy_typed_in_context(
-                        transition,
-                        &frames,
-                        self.blank,
-                        self.max_symbols_per_step,
-                        scored,
-                        control,
-                    )?,
-                    count,
-                )
+                let (tokens, silence) = decode_selected(transition, &frames, &settings)?;
+                (tokens, silence, count)
             }
             (Transition::F32(_), EncodedRnntWindow::F16(_, _)) => {
                 return Err("native FP16 encoder requires FP16 RNN-T heads".into());
             }
         };
         control.checkpoint()?;
+        if self.beam_width.is_some() && self.projector.is_none() {
+            return Err("RNN-T beam requires selected tokenizer projection".into());
+        }
         let ctc::ProjectedWords { words, spans } = ctc::project_words(
-            output.tokens(),
+            &tokens,
             &self.vocabulary,
             self.projector.as_ref(),
             self.frame_rate,
@@ -717,10 +867,10 @@ impl WindowDecoder for RnntDecoder {
         control.checkpoint()?;
         Decoded::new_with_tokens(crate::contracts::DecodedTokensInput {
             words,
-            silence: output.silence().to_vec(),
+            silence,
             output_frames,
             encoder_seconds,
-            tokens: output.tokens().to_vec(),
+            tokens,
             word_spans: spans,
         })
     }
@@ -768,5 +918,86 @@ mod variant_precision_tests {
         assert_eq!(error, "FP16 RNN-T heads require an FP16 encoder selection");
         assert!(validate_precision(EncoderPrecision::Fp16Io32, true, Device::Cuda).is_ok());
         assert!(validate_precision(EncoderPrecision::Fp16, true, Device::Cuda).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod beam_dispatch_tests {
+    use super::*;
+    struct Frames<T>(Vec<T>);
+    impl<T> RnntFrameSource<T> for Frames<T> {
+        fn output_frames(&self) -> usize {
+            1
+        }
+        fn frame(&self, _: usize) -> &[T] {
+            &self.0
+        }
+    }
+    #[derive(Default)]
+    struct Fake {
+        greedy_calls: usize,
+        beam_calls: usize,
+        advances: usize,
+    }
+    impl<T> RnntTransition<T> for Fake {
+        type State = Vec<usize>;
+        fn start(&mut self, _: usize) -> Result<Self::State, String> {
+            Ok(vec![])
+        }
+        fn select(&mut self, _: &[T], _: &Self::State) -> Result<usize, String> {
+            self.greedy_calls += 1;
+            Ok(2)
+        }
+        fn advance(&mut self, _: usize, _: &mut Self::State) -> Result<(), String> {
+            Err("greedy blank must not advance".into())
+        }
+    }
+    impl<T> RnntBeamTransition<T> for Fake {
+        type State = Vec<usize>;
+        fn start(&mut self, _: usize) -> Result<Self::State, String> {
+            Ok(vec![])
+        }
+        fn prepare_frame(&mut self, _: &[T]) -> Result<(), String> {
+            Ok(())
+        }
+        fn distribution(&mut self, _: &[T], _: &Self::State) -> Result<Vec<f32>, String> {
+            self.beam_calls += 1;
+            Ok(vec![0.0, 0.0, 1.0])
+        }
+        fn advance(&mut self, token: usize, state: &Self::State) -> Result<Self::State, String> {
+            self.advances += 1;
+            let mut next = state.clone();
+            next.push(token);
+            Ok(next)
+        }
+    }
+    fn verify_dispatch<T: rnnt::FiniteFrameValue + RnntBeamFrameValue>(
+        frames: Frames<T>,
+    ) -> Result<(), String> {
+        let control = crate::ExecutionControl::without_deadline();
+        let mut fake = Fake::default();
+        let mut settings = DecodeSettings {
+            blank: 2,
+            cap: 1,
+            detail: crate::ScoreDetail::None,
+            beam_width: None,
+            control: &control,
+        };
+        let (tokens, silence) = decode_selected(&mut fake, &frames, &settings)?;
+        assert!(tokens.is_empty());
+        assert_eq!(silence, vec![true]);
+        assert_eq!(fake.greedy_calls, 1);
+        assert_eq!(fake.beam_calls, 0);
+        settings.beam_width = Some(2);
+        let _ = decode_selected(&mut fake, &frames, &settings)?;
+        assert_eq!(fake.greedy_calls, 1);
+        assert!(fake.beam_calls > 0);
+        assert!(fake.advances > 0);
+        Ok(())
+    }
+    #[test]
+    fn selected_mode_dispatches_both_frame_precisions() -> Result<(), String> {
+        verify_dispatch(Frames(vec![1.0_f32]))?;
+        verify_dispatch(Frames(vec![half::f16::from_f32(1.0)]))
     }
 }
