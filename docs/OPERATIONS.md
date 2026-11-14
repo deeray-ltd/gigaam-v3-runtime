@@ -15,7 +15,7 @@ startup; the runtime does not discover a substitute package or provider.
 
 ~~~text
 asr-serve --variant v3_ctc|v3_rnnt|v3_e2e_ctc|v3_e2e_rnnt [--model DIR] [--port 1..65535] [--ep cpu|cuda|tensorrt]
-          [--ort-dylib PATH] [--ctc-fp16] [--ctc-precision fp32|fp16io32|fp16] [--no-rnnt] [--rnnt-fp16] [--rnnt-precision fp32|fp16]
+          [--ort-dylib PATH] [--decoding greedy|beam] [--beam-width N] [--ctc-fp16] [--ctc-precision fp32|fp16io32|fp16] [--no-rnnt] [--rnnt-fp16] [--rnnt-precision fp32|fp16]
 ~~~
 
 `--variant` or `ASR_MODEL_VARIANT` is required; when both are set they must agree exactly
@@ -26,6 +26,13 @@ selects fp16io32 or `--ctc-precision` / `ASR_CTC_PRECISION` selects fp32, fp16io
 For RNN-T, `--rnnt-fp16` selects an fp16io32 encoder; `--rnnt-precision` /
 `ASR_RNNT_PRECISION` selects fp32 or full fp16. Explicit settings must agree, and selected
 assets and provider must support the chosen precision. No precision fallback occurs.
+
+Search defaults to greedy. Select beam with `--decoding beam` or `ASR_DECODING=beam`
+and an explicit positive `--beam-width` or `ASR_BEAM_WIDTH`. CLI/environment pairs must
+agree; width without beam refuses. Both selected families use the same process choice and
+one scheduler. Native WebSocket is CTC-only: a beam request requires VAD rather than the
+blank endpoint. File batch remains available even when the WebSocket default is incompatible.
+No width is implied to satisfy a latency or memory target; measure the selected workload.
 
 ## Service limits and policy environment
 

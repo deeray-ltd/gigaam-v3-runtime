@@ -29,6 +29,7 @@ use std::time::Instant;
 /// Executes a complete direct batch transcription without a service scheduler.
 pub(crate) fn run(invocation: TranscribeInvocation) -> Result<(), String> {
     let variant = composition::resolve_variant(&invocation.runtime)?;
+    let mode = configuration::decoding(&invocation.runtime)?;
     let decoder = selected_decoder(
         variant,
         invocation.decoder,
@@ -57,6 +58,12 @@ pub(crate) fn run(invocation: TranscribeInvocation) -> Result<(), String> {
         )?,
     };
     let evidence_path = configuration::evidence_path(invocation.evidence.clone())?;
+    if evidence_path.is_some()
+        && mode != gigaam_recognition::DecodingMode::Greedy
+        && invocation.evidence_version != EvidenceVersion::V3
+    {
+        return Err("beam evidence requires version 3".into());
+    }
     if evidence_path.is_some() && decoder == DecoderChoice::Rnnt {
         return Err("--evidence requires CTC; it does not support --rnnt".into());
     }
@@ -80,6 +87,7 @@ pub(crate) fn run(invocation: TranscribeInvocation) -> Result<(), String> {
     let mut observations = projection::observations(trace_mode);
 
     let package = composition::open_package(&invocation.model, variant)?;
+    package.require_mode(mode)?;
     let sample_rate = composition::package_sample_rate(&package)?;
     if vad_policy.is_some() && sample_rate.as_usize()? != VAD_SR {
         return Err(format!(
@@ -109,7 +117,10 @@ pub(crate) fn run(invocation: TranscribeInvocation) -> Result<(), String> {
                 &package,
                 &runtime,
                 &native,
-                ctc_precision.expect("CTC branch resolves CTC precision"),
+                composition::CtcSelection {
+                    precision: ctc_precision.expect("CTC branch resolves CTC precision"),
+                    mode,
+                },
             )
             .map_err(|error| format!("decoder: {error}"))?;
             projection::emit_ctc_construction_notice(&decoder);
@@ -124,8 +135,11 @@ pub(crate) fn run(invocation: TranscribeInvocation) -> Result<(), String> {
             let decoder = composition::rnnt_recognizer(
                 &package,
                 (&runtime, &native),
-                invocation.precision,
-                rnnt_precision,
+                composition::RnntSelection {
+                    precision: invocation.precision,
+                    heads: rnnt_precision,
+                    mode,
+                },
             )
             .map_err(|error| format!("RNNT decoder: {error}"))?;
             projection::emit_unverified_cuda_assignment(
@@ -144,6 +158,7 @@ pub(crate) fn run(invocation: TranscribeInvocation) -> Result<(), String> {
             &invocation.model,
             &package,
             invocation.evidence_version,
+            mode,
         )?)),
         None => None,
     };
@@ -256,6 +271,7 @@ fn open_evidence_writer(
     model_path: &Path,
     package: &Package,
     version: EvidenceVersion,
+    mode: gigaam_recognition::DecodingMode,
 ) -> Result<EvidenceWriter, String> {
     let model_id = evidence_token(model_path, "model")?;
     let frame_rate = FrameRate::new(f64_to_f32(package.frontend().frames_per_second()))
@@ -283,6 +299,7 @@ fn open_evidence_writer(
             subsampling,
         },
         version,
+        mode,
     )
 }
 

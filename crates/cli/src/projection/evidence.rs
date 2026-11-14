@@ -84,6 +84,7 @@ struct WindowRecord<'a> {
     origin: usize,
     output_frames: usize,
     keep_until_sec: f32,
+    label_kind: gigaam_recognition::FrameLabelKind,
     labels: &'a [usize],
     mask: &'a [bool],
     tokens: &'a [Token],
@@ -97,6 +98,7 @@ pub(crate) struct EvidenceWriter {
     writer: Mutex<BufWriter<File>>,
     failure: Mutex<Option<String>>,
     version: EvidenceVersion,
+    mode: gigaam_recognition::DecodingMode,
     emitted_windows: Mutex<BTreeMap<usize, usize>>,
 }
 
@@ -107,16 +109,25 @@ impl EvidenceWriter {
         path: &Path,
         header: EvidenceModelHeader<'_>,
         version: EvidenceVersion,
+        mode: gigaam_recognition::DecodingMode,
     ) -> Result<Self, String> {
+        if version != EvidenceVersion::V3 && mode != gigaam_recognition::DecodingMode::Greedy {
+            return Err("beam evidence requires version 3".into());
+        }
         let file = File::create(path)
             .map_err(|error| format!("--evidence {}: {error}", path.display()))?;
         let mut writer = BufWriter::new(file);
         write_model_header(&mut writer, &header, version)
             .map_err(|error| format!("--evidence {}: {error}", path.display()))?;
+        if version == EvidenceVersion::V3 {
+            write_decoding_line(&mut writer, mode)
+                .map_err(|error| format!("--evidence {}: {error}", path.display()))?;
+        }
         Ok(Self {
             writer: Mutex::new(writer),
             failure: Mutex::new(None),
             version,
+            mode,
             emitted_windows: Mutex::new(BTreeMap::new()),
         })
     }
@@ -159,7 +170,7 @@ impl EvidenceWriter {
             .expect("evidence writer lock must not be poisoned");
         match self.version {
             EvidenceVersion::V1 => writer.flush(),
-            EvidenceVersion::V2 => {
+            EvidenceVersion::V2 | EvidenceVersion::V3 => {
                 let selected = result
                     .channels()
                     .iter()
@@ -210,7 +221,8 @@ impl WindowEvidenceObserver for EvidenceWriter {
             origin: observation.origin(),
             output_frames: observation.output_frames(),
             keep_until_sec: observation.keep_until_sec(),
-            labels: observation.labels(),
+            label_kind: observation.frame_labels().kind(),
+            labels: observation.frame_labels().values(),
             mask: observation.mask(),
             tokens: observation.tokens(),
             word_spans: observation.word_spans(),
@@ -219,12 +231,12 @@ impl WindowEvidenceObserver for EvidenceWriter {
             .writer
             .lock()
             .expect("evidence writer lock must not be poisoned");
-        if let Err(error) = write_window(&mut *writer, &record, self.version) {
+        if let Err(error) = write_window_checked(&mut *writer, &record, self.version, self.mode) {
             drop(writer);
             self.record_failure(error.to_string());
             return;
         }
-        if self.version == EvidenceVersion::V2 {
+        if self.version != EvidenceVersion::V1 {
             let channel = record
                 .channel
                 .expect("v2 window serialization validates physical identity");
@@ -241,6 +253,20 @@ impl WindowEvidenceObserver for EvidenceWriter {
     }
 }
 
+fn write_decoding_line(
+    writer: &mut dyn Write,
+    mode: gigaam_recognition::DecodingMode,
+) -> io::Result<()> {
+    match mode {
+        gigaam_recognition::DecodingMode::Greedy => {
+            writeln!(writer, "decoding ctc-greedy width none")
+        }
+        gigaam_recognition::DecodingMode::Beam { width } => {
+            writeln!(writer, "decoding ctc-prefix-beam width {width}")
+        }
+    }
+}
+
 fn write_model_header(
     writer: &mut dyn Write,
     header: &EvidenceModelHeader<'_>,
@@ -249,6 +275,7 @@ fn write_model_header(
     let version = match version {
         EvidenceVersion::V1 => "v1",
         EvidenceVersion::V2 => "v2",
+        EvidenceVersion::V3 => "v3",
     };
     writeln!(writer, "evidence {version}")?;
     writeln!(
@@ -342,19 +369,50 @@ fn write_completion(writer: &mut dyn Write, coverage: &Coverage<'_>) -> io::Resu
     writer.flush()
 }
 
+fn write_window_checked(
+    writer: &mut dyn Write,
+    record: &WindowRecord<'_>,
+    version: EvidenceVersion,
+    mode: gigaam_recognition::DecodingMode,
+) -> io::Result<()> {
+    let expected = match mode {
+        gigaam_recognition::DecodingMode::Greedy => {
+            gigaam_recognition::FrameLabelKind::GreedyArgmax
+        }
+        gigaam_recognition::DecodingMode::Beam { .. } => {
+            gigaam_recognition::FrameLabelKind::CtcRepresentativePath
+        }
+    };
+    if record.label_kind != expected {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "evidence label kind conflicts with decoding selection",
+        ));
+    }
+    write_window(writer, record, version)
+}
+
 fn write_window(
     writer: &mut dyn Write,
     record: &WindowRecord<'_>,
     version: EvidenceVersion,
 ) -> io::Result<()> {
-    if version == EvidenceVersion::V2 && record.channel.is_none() {
+    if version != EvidenceVersion::V1 && record.channel.is_none() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "evidence v2 requires a physical source channel",
         ));
     }
+    if version != EvidenceVersion::V3
+        && record.label_kind != gigaam_recognition::FrameLabelKind::GreedyArgmax
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "legacy evidence requires greedy labels",
+        ));
+    }
     write!(writer, "window {}", record.index)?;
-    if version == EvidenceVersion::V2 {
+    if version != EvidenceVersion::V1 {
         write!(
             writer,
             " channel {} frontend_origin_sample {}",
@@ -378,6 +436,17 @@ fn write_window(
         record.output_frames,
         record.keep_until_sec,
     )?;
+    if version == EvidenceVersion::V3 {
+        match record.label_kind {
+            gigaam_recognition::FrameLabelKind::GreedyArgmax => {
+                writeln!(writer, "label_kind greedy-argmax mask_kind legacy-blank")?
+            }
+            gigaam_recognition::FrameLabelKind::CtcRepresentativePath => writeln!(
+                writer,
+                "label_kind ctc-representative-path mask_kind representative-alignment"
+            )?,
+        }
+    }
     write!(writer, "labels")?;
     for label in record.labels {
         write!(writer, " {label}")?;
@@ -427,6 +496,217 @@ mod tests {
     use std::path::Path;
 
     #[test]
+    fn beam_evidence_version_is_checked_before_file_creation() {
+        let root =
+            std::env::temp_dir().join(format!("gigaam-beam-evidence-{}", std::process::id()));
+        std::fs::create_dir(&root).expect("create evidence test root");
+        let path = root.join("evidence.txt");
+        let header = || EvidenceModelHeader {
+            model_id: "model",
+            frames_per_sec: 25.0,
+            blank: 2,
+            vocab_size: 2,
+            space: None,
+            subsampling: 4,
+        };
+        let mode = gigaam_recognition::DecodingMode::Beam {
+            width: std::num::NonZeroUsize::new(2).expect("positive width"),
+        };
+        assert!(super::EvidenceWriter::create(&path, header(), EvidenceVersion::V2, mode).is_err());
+        assert!(!path.exists());
+        let writer = super::EvidenceWriter::create(&path, header(), EvidenceVersion::V3, mode)
+            .expect("V3 beam accepted");
+        drop(writer);
+        let text = std::fs::read_to_string(&path).expect("evidence header");
+        assert!(text.starts_with("evidence v3\nmodel "));
+        assert!(text.contains("\ndecoding ctc-prefix-beam width 2\n"));
+        std::fs::remove_dir_all(root).expect("remove evidence test root");
+    }
+
+    #[test]
+    fn v3_complete_evidence_round_trips_geometry_alignment_and_coverage() {
+        use gigaam_recognition::{DecodingMode, FrameLabelKind};
+        let mode = DecodingMode::Beam {
+            width: std::num::NonZeroUsize::new(2).expect("positive"),
+        };
+        let header = EvidenceModelHeader {
+            model_id: "model",
+            frames_per_sec: 25.0,
+            blank: 2,
+            vocab_size: 2,
+            space: None,
+            subsampling: 4,
+        };
+        let audio = EvidenceAudioHeader {
+            audio_name: "audio.wav",
+            sample_rate: 16_000,
+            samples: 4096,
+            total_seconds: 0.256,
+        };
+        let record = WindowRecord {
+            channel: Some(1),
+            frontend_origin_sample: 511,
+            index: 0,
+            kind: WindowKind::Tail,
+            start_sec: 0.0319375,
+            end_sec: 0.0640625,
+            first_sample: 511,
+            first_feature_frame: 0,
+            feature_frames: 256,
+            residue: 0,
+            origin: 0,
+            output_frames: 2,
+            keep_until_sec: 0.0640625,
+            label_kind: FrameLabelKind::CtcRepresentativePath,
+            labels: &[1, 0],
+            mask: &[false, true],
+            tokens: &[Token::new(1, 0)],
+            word_spans: &[(0, 0)],
+        };
+        let mut bytes = Vec::new();
+        write_model_header(&mut bytes, &header, EvidenceVersion::V3).expect("model");
+        super::write_decoding_line(&mut bytes, mode).expect("selection");
+        write_audio_header_line(&mut bytes, &audio).expect("audio");
+        super::write_vad_policy_line(&mut bytes, None).expect("policy");
+        super::write_window_checked(&mut bytes, &record, EvidenceVersion::V3, mode)
+            .expect("window");
+        let counts = std::collections::BTreeMap::from([(1, 1)]);
+        super::write_completion(
+            &mut bytes,
+            &super::Coverage {
+                source_channels: 3,
+                selected: &[0, 1, 2],
+                duplicate: gigaam_transcription::DuplicateClassification::NotDualMono,
+                emitted_windows: &counts,
+            },
+        )
+        .expect("completion");
+        let text = String::from_utf8(bytes).expect("UTF-8");
+        fn parse_complete(text: &str) -> Result<(), &'static str> {
+            let mut lines = text.lines();
+            if lines.next() != Some("evidence v3") {
+                return Err("version");
+            }
+            let model = lines
+                .next()
+                .ok_or("model")?
+                .split_whitespace()
+                .collect::<Vec<_>>();
+            if model.first() != Some(&"model") || field(&model, "blank") != "2" {
+                return Err("model");
+            }
+            let selection = lines.next().ok_or("selection")?;
+            if selection != "decoding ctc-prefix-beam width 2" {
+                return Err("selection");
+            }
+            if !lines.next().ok_or("audio")?.starts_with("audio audio.wav ")
+                || lines.next() != Some("vad disabled")
+            {
+                return Err("audio/policy");
+            }
+            let window = lines
+                .next()
+                .ok_or("window")?
+                .split_whitespace()
+                .collect::<Vec<_>>();
+            if window.first() != Some(&"window")
+                || field(&window, "channel") != "1"
+                || field(&window, "frontend_origin_sample") != "511"
+                || field(&window, "first_sample") != "511"
+                || field(&window, "output_frames") != "2"
+            {
+                return Err("geometry");
+            }
+            if lines.next()
+                != Some("label_kind ctc-representative-path mask_kind representative-alignment")
+            {
+                return Err("kind");
+            }
+            if lines.next() != Some("labels 1 0")
+                || lines.next() != Some("mask 0 1")
+                || lines.next() != Some("tokens 1@0")
+                || lines.next() != Some("words 0-0")
+                || lines.next() != Some("end")
+            {
+                return Err("alignment");
+            }
+            if lines.next()
+                != Some(
+                    "coverage source_channels 3 selected_channels 0 1 2 duplicate not-dual-mono",
+                )
+                || lines.next() != Some("channel_windows 0 emitted 0")
+                || lines.next() != Some("channel_windows 1 emitted 1")
+                || lines.next() != Some("channel_windows 2 emitted 0")
+                || lines.next() != Some("complete")
+                || lines.next().is_some()
+            {
+                return Err("coverage");
+            }
+            Ok(())
+        }
+        assert!(parse_complete(&text).is_ok());
+        assert!(parse_complete(&text.replace("ctc-representative-path", "greedy-argmax")).is_err());
+        assert!(
+            parse_complete(
+                &text.replace("frontend_origin_sample 511", "frontend_origin_sample 512")
+            )
+            .is_err()
+        );
+        assert!(
+            parse_complete(
+                &text.replace("channel_windows 1 emitted 1", "channel_windows 1 emitted 0")
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn v3_records_representative_kind_and_legacy_refuses_before_writing() {
+        let record = WindowRecord {
+            channel: Some(0),
+            frontend_origin_sample: 3,
+            index: 0,
+            kind: WindowKind::Body,
+            start_sec: 0.0,
+            end_sec: 1.0,
+            first_sample: 3,
+            first_feature_frame: 0,
+            feature_frames: 2,
+            residue: 0,
+            origin: 0,
+            output_frames: 2,
+            keep_until_sec: 1.0,
+            label_kind: gigaam_recognition::FrameLabelKind::CtcRepresentativePath,
+            labels: &[1, 0],
+            mask: &[false, true],
+            tokens: &[Token::new(1, 0)],
+            word_spans: &[(0, 0)],
+        };
+        let mut mismatched = Vec::new();
+        assert!(
+            super::write_window_checked(
+                &mut mismatched,
+                &record,
+                EvidenceVersion::V3,
+                gigaam_recognition::DecodingMode::Greedy
+            )
+            .is_err()
+        );
+        assert!(mismatched.is_empty());
+        let mut legacy = Vec::new();
+        assert!(write_window(&mut legacy, &record, EvidenceVersion::V2).is_err());
+        assert!(legacy.is_empty());
+        let mut v3 = Vec::new();
+        write_window(&mut v3, &record, EvidenceVersion::V3)
+            .expect("V3 accepts representative alignment");
+        let text = String::from_utf8(v3).expect("UTF-8 evidence");
+        assert!(text.contains("channel 0 frontend_origin_sample 3"));
+        assert!(text.contains(
+            "label_kind ctc-representative-path mask_kind representative-alignment\nlabels 1 0\n"
+        ));
+    }
+
+    #[test]
     fn v2_preserves_local_geometry_and_closes_unequal_selected_channel_coverage() {
         let mut output = Vec::new();
         let record = WindowRecord {
@@ -443,6 +723,7 @@ mod tests {
             origin: 0,
             output_frames: 2,
             keep_until_sec: 0.0640625,
+            label_kind: gigaam_recognition::FrameLabelKind::GreedyArgmax,
             labels: &[1, 0],
             mask: &[false, true],
             tokens: &[Token::new(1, 0)],
@@ -781,6 +1062,7 @@ mod tests {
             origin: 1030,
             output_frames: 188,
             keep_until_sec: 71.25,
+            label_kind: gigaam_recognition::FrameLabelKind::GreedyArgmax,
             labels: &[256, 1, 1, 0, 2],
             mask: &[true, false, false, true, false],
             tokens: &[Token::new(1, 1), Token::new(2, 4)],
@@ -847,6 +1129,7 @@ mod tests {
             origin: 0,
             output_frames: 2,
             keep_until_sec: 1.0,
+            label_kind: gigaam_recognition::FrameLabelKind::GreedyArgmax,
             labels: &[0, 0],
             mask: &[true, true],
             tokens: &[],

@@ -45,6 +45,18 @@ impl Package {
             Self::Variant(pack) => pack.vocabulary(),
         }
     }
+    pub(crate) fn require_mode(
+        &self,
+        mode: gigaam_recognition::DecodingMode,
+    ) -> Result<(), String> {
+        match self {
+            Self::Legacy(_) if mode != gigaam_recognition::DecodingMode::Greedy => {
+                Err("beam decoding requires a V3 package".into())
+            }
+            Self::Legacy(_) => Ok(()),
+            Self::Variant(pack) => gigaam_recognition::validate_variant_mode(pack, mode),
+        }
+    }
     pub(crate) fn require_ctc(&self) -> Result<(), String> {
         match self {
             Self::Legacy(_) => Ok(()),
@@ -149,26 +161,45 @@ pub(crate) fn resample_to(
     resample_audio(audio, sample_rate)
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct CtcSelection {
+    pub precision: EncoderPrecision,
+    pub mode: gigaam_recognition::DecodingMode,
+}
+#[derive(Clone, Copy)]
+pub(crate) struct RnntSelection {
+    pub precision: EncoderPrecision,
+    pub heads: Option<gigaam_recognition::RnntPrecisionSelection>,
+    pub mode: gigaam_recognition::DecodingMode,
+}
+
 /// Builds one exact direct CTC recognizer for the selected provider and precision.
 pub(crate) fn ctc_recognizer(
     package: &Package,
     runtime: &RuntimeConfig,
     native: &NativeRuntime,
-    precision: EncoderPrecision,
+    selection: CtcSelection,
 ) -> Result<DirectRecognizer, String> {
+    let CtcSelection { precision, mode } = selection;
     match package {
-        Package::Legacy(pack) => DirectRecognizer::ctc(pack, native, runtime.plan(), precision),
+        Package::Legacy(pack) if mode == gigaam_recognition::DecodingMode::Greedy => {
+            DirectRecognizer::ctc(pack, native, runtime.plan(), precision)
+        }
+        Package::Legacy(_) => Err("beam decoding requires a V3 package".into()),
         Package::Variant(pack) => {
             if pack.variant().family() != gigaam_model_package::ModelFamily::Ctc {
                 return Err("command requires a CTC variant".into());
             }
-            DirectRecognizer::variant(
+            DirectRecognizer::variant_with_mode(
                 pack,
                 native,
                 runtime.plan(),
-                gigaam_recognition::VariantPrecision {
-                    encoder: precision,
-                    rnnt_heads_fp16: false,
+                gigaam_recognition::VariantDecodeSelection {
+                    precision: gigaam_recognition::VariantPrecision {
+                        encoder: precision,
+                        rnnt_heads_fp16: false,
+                    },
+                    mode,
                 },
             )
         }
@@ -179,22 +210,27 @@ pub(crate) fn ctc_recognizer(
 pub(crate) fn rnnt_recognizer(
     package: &Package,
     context: (&RuntimeConfig, &NativeRuntime),
-    precision: EncoderPrecision,
-    selection: Option<gigaam_recognition::RnntPrecisionSelection>,
+    selection: RnntSelection,
 ) -> Result<DirectRecognizer, String> {
     let (runtime, native) = context;
+    let RnntSelection {
+        precision,
+        heads,
+        mode,
+    } = selection;
     match package {
-        Package::Legacy(pack) => match selection {
+        Package::Legacy(pack) if mode == gigaam_recognition::DecodingMode::Greedy => match heads {
             Some(selection) => {
                 DirectRecognizer::rnnt_with_precision(pack, native, runtime.plan(), selection)
             }
             None => DirectRecognizer::rnnt(pack, native, runtime.plan(), precision),
         },
+        Package::Legacy(_) => Err("beam decoding requires a V3 package".into()),
         Package::Variant(pack) => {
             if pack.variant().family() != gigaam_model_package::ModelFamily::Rnnt {
                 return Err("command requires an RNN-T variant".into());
             }
-            let (encoder, rnnt_heads_fp16) = match selection {
+            let (encoder, rnnt_heads_fp16) = match heads {
                 Some(gigaam_recognition::RnntPrecisionSelection::Fp32) => {
                     (EncoderPrecision::Fp32, false)
                 }
@@ -203,13 +239,16 @@ pub(crate) fn rnnt_recognizer(
                 }
                 None => (precision, false),
             };
-            DirectRecognizer::variant(
+            DirectRecognizer::variant_with_mode(
                 pack,
                 native,
                 runtime.plan(),
-                gigaam_recognition::VariantPrecision {
-                    encoder,
-                    rnnt_heads_fp16,
+                gigaam_recognition::VariantDecodeSelection {
+                    precision: gigaam_recognition::VariantPrecision {
+                        encoder,
+                        rnnt_heads_fp16,
+                    },
+                    mode,
                 },
             )
         }
@@ -252,7 +291,7 @@ pub(crate) struct DialogStreamFactory<'a> {
     plan: &'a ProviderPlan,
     native: &'a NativeRuntime,
     frontend: Arc<FrontendProcessor>,
-    precision: EncoderPrecision,
+    selection: CtcSelection,
 }
 
 impl<'a> DialogStreamFactory<'a> {
@@ -261,7 +300,7 @@ impl<'a> DialogStreamFactory<'a> {
         package: &'a Package,
         context: (&'a RuntimeConfig, &'a NativeRuntime),
         frontend: Arc<FrontendProcessor>,
-        precision: EncoderPrecision,
+        selection: CtcSelection,
     ) -> Self {
         let (runtime, native) = context;
         Self {
@@ -269,7 +308,7 @@ impl<'a> DialogStreamFactory<'a> {
             plan: runtime.plan(),
             frontend,
             native,
-            precision,
+            selection,
         }
     }
 }
@@ -284,16 +323,22 @@ impl StreamChannelFactory for DialogStreamFactory<'_> {
         config: StreamConfig,
     ) -> Result<StreamSetup<Self::Decoder, Self::Detector>, String> {
         let decoder = match self.package {
-            Package::Legacy(pack) => {
-                DirectRecognizer::ctc(pack, self.native, self.plan, self.precision)
+            Package::Legacy(pack)
+                if self.selection.mode == gigaam_recognition::DecodingMode::Greedy =>
+            {
+                DirectRecognizer::ctc(pack, self.native, self.plan, self.selection.precision)
             }
-            Package::Variant(pack) => DirectRecognizer::variant(
+            Package::Legacy(_) => Err("beam decoding requires a V3 package".into()),
+            Package::Variant(pack) => DirectRecognizer::variant_with_mode(
                 pack,
                 self.native,
                 self.plan,
-                gigaam_recognition::VariantPrecision {
-                    encoder: self.precision,
-                    rnnt_heads_fp16: false,
+                gigaam_recognition::VariantDecodeSelection {
+                    precision: gigaam_recognition::VariantPrecision {
+                        encoder: self.selection.precision,
+                        rnnt_heads_fp16: false,
+                    },
+                    mode: self.selection.mode,
                 },
             ),
         }

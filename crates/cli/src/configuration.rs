@@ -36,6 +36,19 @@ pub(crate) enum TraceMode {
     Enabled,
 }
 
+pub(crate) fn decoding(
+    request: &RuntimeRequest,
+) -> Result<gigaam_recognition::DecodingMode, String> {
+    let mode = process_env("ASR_DECODING")?;
+    let width = process_env("ASR_BEAM_WIDTH")?;
+    gigaam_recognition::DecodingMode::resolve(
+        request.decoding.as_deref(),
+        mode.as_deref(),
+        request.beam_width.as_deref(),
+        width.as_deref(),
+    )
+}
+
 /// Reads the established provider and ORT environment in its historical order.
 pub(crate) fn runtime(
     request: &RuntimeRequest,

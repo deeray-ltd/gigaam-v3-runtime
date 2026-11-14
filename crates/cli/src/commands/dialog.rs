@@ -17,6 +17,7 @@ use gigaam_transcription::{
 
 /// Executes offline dialogue reconstruction using direct channel-local recognition composition.
 pub(crate) fn run(invocation: DialogInvocation) -> Result<(), String> {
+    let mode = configuration::decoding(&invocation.runtime)?;
     let precision = configuration::ctc_precision(invocation.ctc_precision, false)?;
     let runtime = configuration::runtime(&invocation.runtime, RequiredEncoderRoles::ctc())
         .map_err(|error| format!("runtime configuration: {error}"))?;
@@ -31,11 +32,17 @@ pub(crate) fn run(invocation: DialogInvocation) -> Result<(), String> {
         composition::resolve_variant(&invocation.runtime)?,
     )?;
     package.require_ctc()?;
+    package.require_mode(mode)?;
     let sample_rate = composition::package_sample_rate(&package)?;
     let stream_config = invocation
         .stream_policy
         .bind(sample_rate)
         .map_err(|error| format!("dialog stream configuration: {error}"))?;
+    if mode != gigaam_recognition::DecodingMode::Greedy
+        && stream_config.endpoint_source() == gigaam_transcription::EndpointSource::Blank
+    {
+        return Err("beam decoding requires a non-blank endpoint".into());
+    }
     let setup = OfflineDialogSetup::new(OfflineDialogSetupInput {
         channel_policy: invocation.channel_policy,
         stream_config: stream_config.clone(),
@@ -50,8 +57,12 @@ pub(crate) fn run(invocation: DialogInvocation) -> Result<(), String> {
     let audio = composition::resample_to(loaded, frontend.sample_rate())
         .map_err(|error| format!("resample: {error}"))?;
     let channels = audio.channels().len();
-    let mut factory =
-        composition::DialogStreamFactory::new(&package, (&runtime, &native), frontend, precision);
+    let mut factory = composition::DialogStreamFactory::new(
+        &package,
+        (&runtime, &native),
+        frontend,
+        composition::CtcSelection { precision, mode },
+    );
     let result = transcribe_offline_dialog(setup, &mut factory, audio.channels())
         .map_err(|failure| projection::dialog_failure_message(&failure))?;
     projection::dialog(&result, channels);

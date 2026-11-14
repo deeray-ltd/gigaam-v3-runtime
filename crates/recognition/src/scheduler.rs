@@ -196,6 +196,10 @@ impl ExecutionScheduler {
     pub const fn frame_rate(&self) -> FrameRate {
         self.frame_rate
     }
+    /// Immutable interpretation of the selected decoder's mask.
+    pub const fn silence_capability(&self) -> crate::SilenceCapability {
+        self.silence_capability
+    }
 
     /// Current count of queued, not-yet-started recognition calls.
     pub fn pending(&self) -> u64 {

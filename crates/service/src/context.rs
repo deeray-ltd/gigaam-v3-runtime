@@ -48,6 +48,11 @@ pub struct ServiceCapabilities {
 }
 
 impl ServiceCapabilities {
+    /// Immutable interpretation of the selected decoder's mask.
+    pub fn silence_capability(&self) -> gigaam_recognition::SilenceCapability {
+        self.scheduler.silence_capability()
+    }
+
     pub(crate) fn native_runtime(&self) -> Result<&NativeRuntime, String> {
         self.native_runtime
             .as_ref()

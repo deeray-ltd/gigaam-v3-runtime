@@ -45,6 +45,8 @@ pub(crate) fn precision_name(precision: EncoderPrecision) -> &'static str {
 struct CliOptions {
     model: Option<PathBuf>,
     variant: Option<String>,
+    decoding: Option<String>,
+    beam_width: Option<String>,
     port: Option<u16>,
     provider: Option<String>,
     ort_dylib: Option<PathBuf>,
@@ -59,6 +61,7 @@ struct CliOptions {
 pub(crate) struct Startup {
     pub(crate) model: PathBuf,
     pub(crate) variant: VariantId,
+    pub(crate) decoding: gigaam_recognition::DecodingMode,
     pub(crate) port: u16,
     pub(crate) plan: ProviderPlan,
     pub(crate) ort_dylib: PathBuf,
@@ -72,6 +75,8 @@ pub(crate) struct Startup {
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct StartupEnvironment<'a> {
     pub(crate) variant: Option<&'a str>,
+    pub(crate) decoding: Option<&'a str>,
+    pub(crate) beam_width: Option<&'a str>,
     pub(crate) ctc_precision: Option<&'a str>,
     pub(crate) rnnt_precision: Option<&'a str>,
     pub(crate) encoder_ep: Option<&'a str>,
@@ -94,6 +99,8 @@ impl Startup {
     pub(crate) fn from_process() -> Result<Self, String> {
         let args: Vec<String> = std::env::args().skip(1).collect();
         let variant = process_env("ASR_MODEL_VARIANT")?;
+        let decoding = process_env("ASR_DECODING")?;
+        let beam_width = process_env("ASR_BEAM_WIDTH")?;
         let ctc_precision = process_env("ASR_CTC_PRECISION")?;
         let rnnt_precision = process_env("ASR_RNNT_PRECISION")?;
         let encoder_ep = process_env("ASR_ENCODER_EP")?;
@@ -114,6 +121,8 @@ impl Startup {
             &args,
             StartupEnvironment {
                 variant: variant.as_deref(),
+                decoding: decoding.as_deref(),
+                beam_width: beam_width.as_deref(),
                 ctc_precision: ctc_precision.as_deref(),
                 rnnt_precision: rnnt_precision.as_deref(),
                 encoder_ep: encoder_ep.as_deref(),
@@ -139,6 +148,12 @@ impl Startup {
         environment: StartupEnvironment<'_>,
     ) -> Result<Self, String> {
         let cli = parse_cli(args)?;
+        let decoding = gigaam_recognition::DecodingMode::resolve(
+            cli.decoding.as_deref(),
+            environment.decoding,
+            cli.beam_width.as_deref(),
+            environment.beam_width,
+        )?;
         let cli_variant = cli
             .variant
             .as_deref()
@@ -245,6 +260,7 @@ impl Startup {
         Ok(Self {
             model: cli.model.unwrap_or_else(|| PathBuf::from(DEFAULT_MODEL)),
             variant,
+            decoding,
             port: cli.port.unwrap_or(DEFAULT_PORT),
             plan,
             ort_dylib,
@@ -323,6 +339,16 @@ fn parse_cli(args: &[String]) -> Result<CliOptions, String> {
                 &mut options.model,
                 PathBuf::from(next_value(args, &mut position, "--model")?),
                 "--model",
+            )?,
+            "--decoding" => set_once(
+                &mut options.decoding,
+                next_value(args, &mut position, "--decoding")?,
+                "--decoding",
+            )?,
+            "--beam-width" => set_once(
+                &mut options.beam_width,
+                next_value(args, &mut position, "--beam-width")?,
+                "--beam-width",
             )?,
             "--variant" => set_once(
                 &mut options.variant,
@@ -804,6 +830,43 @@ mod tests {
                     StartupEnvironment {
                         variant: Some(invalid),
                         ..StartupEnvironment::default()
+                    }
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn beam_mode_requires_consistent_explicit_width() {
+        let args = arguments(&["--ep", "cpu", "--ort-dylib", "/runtime/libonnxruntime.so"]);
+        for variant in ["v3_ctc", "v3_rnnt"] {
+            let env = StartupEnvironment {
+                variant: Some(variant),
+                decoding: Some("beam"),
+                beam_width: Some("4"),
+                ..StartupEnvironment::default()
+            };
+            assert!(matches!(
+                Startup::parse(&args, env).expect("valid beam").decoding,
+                gigaam_recognition::DecodingMode::Beam { .. }
+            ));
+            assert!(
+                Startup::parse(
+                    &args,
+                    StartupEnvironment {
+                        beam_width: None,
+                        ..env
+                    }
+                )
+                .is_err()
+            );
+            assert!(
+                Startup::parse(
+                    &args,
+                    StartupEnvironment {
+                        decoding: Some("greedy"),
+                        ..env
                     }
                 )
                 .is_err()

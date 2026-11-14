@@ -30,10 +30,14 @@ pub mod rnnt;
 pub mod rnnt_beam;
 pub mod vad;
 
-pub use assembly::{DirectRecognizer, RnntBeamSelection, RnntPrecisionSelection, VariantPrecision};
+pub use assembly::{
+    DirectRecognizer, RnntBeamSelection, RnntPrecisionSelection, VariantDecodeSelection,
+    VariantPrecision, validate_variant_mode,
+};
 pub use contracts::{
-    Decoded, DecodedTokensInput, Encoder, FrameRate, ScoreDetail, SilenceCapability,
-    SpeechProbabilityDetector, Token, WindowDecoder, Word,
+    Decoded, DecodedFrameLabelsInput, DecodedTokensInput, DecodingMode, Encoder, FrameLabelKind,
+    FrameLabels, FrameRate, ScoreDetail, SilenceCapability, SpeechProbabilityDetector, Token,
+    WindowDecoder, Word,
 };
 pub use execution::{ExecutionControl, ExecutionState};
 pub use ort_assignment::CudaAssignmentEvidence;

@@ -539,6 +539,10 @@ struct PreparedStream {
 impl PreparedStream {
     fn parse(raw: Option<&str>, context: &ApplicationContext) -> Result<Self, String> {
         let query = StreamQuery::parse(raw, StreamDefaults::from(context))?;
+        validate_endpoint_capability(
+            query.config.endpoint_source(),
+            context.capabilities.silence_capability(),
+        )?;
         if query.config.silence_skip() != SilenceSkipPolicy::Off {
             preflight_skip_vad(
                 &context.capabilities.pack,
@@ -551,6 +555,18 @@ impl PreparedStream {
             applied_config: query.applied_config,
         })
     }
+}
+
+fn validate_endpoint_capability(
+    endpoint: EndpointSource,
+    capability: gigaam_recognition::SilenceCapability,
+) -> Result<(), String> {
+    if endpoint == EndpointSource::Blank
+        && capability != gigaam_recognition::SilenceCapability::LegacyBlank
+    {
+        return Err("selected decoder does not support blank stream endpointing".into());
+    }
+    Ok(())
 }
 
 fn preflight_skip_vad(pack: &VariantPackage, runtime_available: bool) -> Result<(), String> {
@@ -1921,6 +1937,38 @@ mod tests {
         assert_eq!(pre_upgrade_snapshot.delivered, 0);
         assert_eq!(pre_upgrade_snapshot.queue_full, 0);
         assert_eq!(pre_upgrade_snapshot.sink_closed, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn selected_decoder_capability_refuses_blank_before_stream_setup() -> Result<(), String> {
+        use gigaam_recognition::SilenceCapability;
+        let omitted = StreamQuery::parse(Some("rate=16000"), defaults())?;
+        let blank = StreamQuery::parse(Some("rate=16000&endpoint=blank"), defaults())?;
+        let vad = StreamQuery::parse(Some("rate=16000&endpoint=vad"), defaults())?;
+        for query in [&omitted, &blank] {
+            assert!(
+                super::validate_endpoint_capability(
+                    query.config.endpoint_source(),
+                    SilenceCapability::RepresentativeAlignment
+                )
+                .is_err()
+            );
+            assert!(
+                super::validate_endpoint_capability(
+                    query.config.endpoint_source(),
+                    SilenceCapability::LegacyBlank
+                )
+                .is_ok()
+            );
+        }
+        assert!(
+            super::validate_endpoint_capability(
+                vad.config.endpoint_source(),
+                SilenceCapability::RepresentativeAlignment
+            )
+            .is_ok()
+        );
         Ok(())
     }
 

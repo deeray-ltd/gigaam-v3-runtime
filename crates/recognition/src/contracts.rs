@@ -125,6 +125,94 @@ impl Word {
     }
 }
 
+/// One immutable selected search policy.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DecodingMode {
+    Greedy,
+    Beam { width: std::num::NonZeroUsize },
+}
+impl DecodingMode {
+    /// Resolves exact process choices; beam always requires an explicit positive width.
+    pub fn resolve(
+        cli: Option<&str>,
+        environment: Option<&str>,
+        cli_width: Option<&str>,
+        environment_width: Option<&str>,
+    ) -> Result<Self, String> {
+        fn choice(value: &str) -> Result<bool, String> {
+            match value {
+                "greedy" => Ok(false),
+                "beam" => Ok(true),
+                _ => Err("decoding must be greedy or beam".into()),
+            }
+        }
+        fn width(value: &str) -> Result<std::num::NonZeroUsize, String> {
+            if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+                return Err("beam width must be a positive integer".into());
+            }
+            value
+                .parse::<std::num::NonZeroUsize>()
+                .map_err(|_| "beam width must be a positive integer".into())
+        }
+        let a = cli.map(choice).transpose()?;
+        let b = environment.map(choice).transpose()?;
+        let beam = match (a, b) {
+            (Some(a), Some(b)) if a != b => return Err("decoding settings conflict".into()),
+            (Some(value), _) | (_, Some(value)) => value,
+            (None, None) => false,
+        };
+        let a = cli_width.map(width).transpose()?;
+        let b = environment_width.map(width).transpose()?;
+        let width = match (a, b) {
+            (Some(a), Some(b)) if a != b => return Err("beam width settings conflict".into()),
+            (Some(value), _) | (_, Some(value)) => Some(value),
+            (None, None) => None,
+        };
+        match (beam, width) {
+            (false, None) => Ok(Self::Greedy),
+            (false, Some(_)) => Err("beam width requires beam decoding".into()),
+            (true, Some(width)) => Ok(Self::Beam { width }),
+            (true, None) => Err("beam decoding requires explicit width".into()),
+        }
+    }
+}
+
+/// Meaning of a CTC per-frame label sequence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameLabelKind {
+    GreedyArgmax,
+    CtcRepresentativePath,
+}
+
+/// Owned frame labels with their decoding semantics.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FrameLabels {
+    kind: FrameLabelKind,
+    values: Vec<usize>,
+}
+impl FrameLabels {
+    pub fn new(kind: FrameLabelKind, values: Vec<usize>) -> Self {
+        Self { kind, values }
+    }
+    pub const fn kind(&self) -> FrameLabelKind {
+        self.kind
+    }
+    pub fn values(&self) -> &[usize] {
+        &self.values
+    }
+}
+
+/// Inputs for a decoded CTC window with typed frame alignment.
+pub struct DecodedFrameLabelsInput {
+    pub words: Vec<Word>,
+    pub silence: Vec<bool>,
+    pub output_frames: usize,
+    pub encoder_seconds: f64,
+    pub frame_labels: FrameLabels,
+    pub tokens: Vec<Token>,
+    pub word_spans: Vec<(usize, usize)>,
+}
+
 /// One coherent decoded recognition window.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Decoded {
@@ -132,7 +220,7 @@ pub struct Decoded {
     silence: Vec<bool>,
     output_frames: usize,
     encoder_seconds: f64,
-    labels: Option<Vec<usize>>,
+    labels: Option<FrameLabels>,
     tokens: Option<Vec<Token>>,
     word_spans: Option<Vec<(usize, usize)>>,
 }
@@ -184,9 +272,24 @@ impl Decoded {
             silence,
             output_frames,
             encoder_seconds,
-            Some(labels),
+            Some(FrameLabels::new(FrameLabelKind::GreedyArgmax, labels)),
             Some(tokens),
             Some(word_spans),
+        )
+    }
+
+    pub fn new_with_frame_labels(input: DecodedFrameLabelsInput) -> Result<Self, String> {
+        if input.words.len() != input.word_spans.len() {
+            return Err("each word must have one token span".into());
+        }
+        Self::assemble(
+            input.words,
+            input.silence,
+            input.output_frames,
+            input.encoder_seconds,
+            Some(input.frame_labels),
+            Some(input.tokens),
+            Some(input.word_spans),
         )
     }
 
@@ -208,7 +311,7 @@ impl Decoded {
         silence: Vec<bool>,
         output_frames: usize,
         encoder_seconds: f64,
-        labels: Option<Vec<usize>>,
+        labels: Option<FrameLabels>,
         tokens: Option<Vec<Token>>,
         word_spans: Option<Vec<(usize, usize)>>,
     ) -> Result<Self, String> {
@@ -222,11 +325,11 @@ impl Decoded {
             return Err("recognition encoder duration must be finite and nonnegative".into());
         }
         if let Some(labels) = &labels
-            && labels.len() != output_frames
+            && labels.values().len() != output_frames
         {
             return Err(format!(
                 "recognition label sequence has {} frames, expected {output_frames}",
-                labels.len()
+                labels.values().len()
             ));
         }
         if let Some(tokens) = &tokens {
@@ -289,19 +392,26 @@ impl Decoded {
     }
 
     /// Returns the raw per-frame argmax labels behind this window's tokens and words, one per
-    /// output frame including blank, or `None` for a decoder that exposes no per-frame labels.
+    /// output frame including blank, or `None` for representative beam labels or no labels.
     pub fn labels(&self) -> Option<&[usize]> {
-        self.labels.as_deref()
+        self.labels.as_ref().and_then(|labels| match labels.kind() {
+            FrameLabelKind::GreedyArgmax => Some(labels.values()),
+            FrameLabelKind::CtcRepresentativePath => None,
+        })
+    }
+
+    pub fn frame_labels(&self) -> Option<&FrameLabels> {
+        self.labels.as_ref()
     }
 
     /// Returns the collapsed pre-word-merge tokens behind this window's words, or `None` for a
-    /// decoder that exposes no per-frame labels.
+    /// decoder that exposes no token occurrences.
     pub fn tokens(&self) -> Option<&[Token]> {
         self.tokens.as_deref()
     }
 
     /// Returns the token-index span behind each of this window's words, in word order, or `None`
-    /// for a decoder that exposes no per-frame labels. Each span's indices refer to this
+    /// for a decoder that exposes no word spans. Each span's indices refer to this
     /// window's own `tokens()` list.
     pub fn word_spans(&self) -> Option<&[(usize, usize)]> {
         self.word_spans.as_deref()
@@ -354,6 +464,8 @@ pub fn selected_log_probability(row: &[f32], selected: usize) -> Result<f64, Str
 pub enum SilenceCapability {
     /// The existing CTC blank/space endpoint heuristic.
     LegacyBlank,
+    /// CTC beam alignment mask is not an acoustic silence observation.
+    RepresentativeAlignment,
     /// No token was emitted; this is not acoustic silence.
     TokenAbsence,
     /// No usable interpretation has been declared.
@@ -440,10 +552,56 @@ pub trait SpeechProbabilityDetector {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn decoding_configuration_requires_explicit_positive_consistent_width() {
+        use super::DecodingMode;
+        assert_eq!(
+            DecodingMode::resolve(None, None, None, None).expect("default"),
+            DecodingMode::Greedy
+        );
+        assert!(matches!(
+            DecodingMode::resolve(Some("beam"), None, Some("4"), None),
+            Ok(DecodingMode::Beam { .. })
+        ));
+        for (mode, env, width, env_width) in [
+            (Some("beam"), None, None, None),
+            (None, None, Some("4"), None),
+            (Some("beam"), None, Some("0"), None),
+            (Some("beam"), None, Some("+1"), None),
+            (Some("greedy"), Some("beam"), None, None),
+            (Some("beam"), None, Some("1"), Some("2")),
+        ] {
+            assert!(DecodingMode::resolve(mode, env, width, env_width).is_err());
+        }
+    }
+
     use super::{Decoded, DecodedTokensInput, Token, Word};
 
     fn word() -> Word {
         Word::new("word".into(), 0.0, 0.1).expect("test word timestamps are valid")
+    }
+
+    #[test]
+    fn representative_alignment_is_typed_and_requires_complete_word_spans() {
+        use super::{DecodedFrameLabelsInput, FrameLabelKind, FrameLabels};
+        let make = |labels: Vec<usize>, spans: Vec<(usize, usize)>| DecodedFrameLabelsInput {
+            words: vec![word()],
+            silence: vec![false, true],
+            output_frames: 2,
+            encoder_seconds: 0.0,
+            frame_labels: FrameLabels::new(FrameLabelKind::CtcRepresentativePath, labels),
+            tokens: vec![Token::new(1, 0)],
+            word_spans: spans,
+        };
+        let decoded = Decoded::new_with_frame_labels(make(vec![1, 0], vec![(0, 0)]))
+            .expect("valid alignment");
+        assert_eq!(decoded.labels(), None);
+        assert_eq!(
+            decoded.frame_labels().expect("typed labels").values(),
+            &[1, 0]
+        );
+        assert!(Decoded::new_with_frame_labels(make(vec![1], vec![(0, 0)])).is_err());
+        assert!(Decoded::new_with_frame_labels(make(vec![1, 0], Vec::new())).is_err());
     }
 
     #[test]

@@ -39,6 +39,8 @@ pub(crate) enum Invocation {
 pub(crate) struct RuntimeRequest {
     pub(crate) provider: Option<String>,
     pub(crate) variant: Option<String>,
+    pub(crate) decoding: Option<String>,
+    pub(crate) beam_width: Option<String>,
     pub(crate) ort_dylib: Option<PathBuf>,
 }
 
@@ -104,6 +106,7 @@ pub(crate) enum DecoderChoice {
 pub(crate) enum EvidenceVersion {
     V1,
     V2,
+    V3,
 }
 
 /// Validated encoder benchmark input and command choices.
@@ -314,6 +317,9 @@ impl Command {
         if option == "--variant" {
             return true;
         }
+        if option == "--decoding" || option == "--beam-width" {
+            return matches!(self, Self::Transcribe | Self::Stream | Self::Dialog);
+        }
         if option == "--ctc-precision" {
             return match self {
                 Self::Transcribe | Self::Bench | Self::Stream | Self::Dialog => true,
@@ -449,6 +455,8 @@ impl ParsedArguments {
         RuntimeRequest {
             provider: self.value("--ep").map(str::to_owned),
             variant: self.value("--variant").map(str::to_owned),
+            decoding: self.value("--decoding").map(str::to_owned),
+            beam_width: self.value("--beam-width").map(str::to_owned),
             ort_dylib: self.value("--ort-dylib").map(PathBuf::from),
         }
     }
@@ -613,7 +621,8 @@ fn transcribe(parsed: ParsedArguments) -> Result<Invocation, String> {
         }
         Some("1") => EvidenceVersion::V1,
         Some("2") => EvidenceVersion::V2,
-        Some(_) => return Err("--evidence-version must be 1 or 2".into()),
+        Some("3") => EvidenceVersion::V3,
+        Some(_) => return Err("--evidence-version must be 1, 2 or 3".into()),
     };
     let vad = if parsed.has_flag("--vad") {
         Some(vad_policy(&parsed, VadOptionNames::BATCH)?)
@@ -1423,6 +1432,7 @@ mod tests {
             (vec![], super::EvidenceVersion::V1),
             (vec!["--evidence-version", "1"], super::EvidenceVersion::V1),
             (vec!["--evidence-version", "2"], super::EvidenceVersion::V2),
+            (vec!["--evidence-version", "3"], super::EvidenceVersion::V3),
         ] {
             let mut values = vec!["transcribe", "audio.wav", "--evidence", "out.txt"];
             values.extend(suffix);
@@ -1439,7 +1449,7 @@ mod tests {
                 "--evidence",
                 "out.txt",
                 "--evidence-version",
-                "3",
+                "4",
             ],
         ] {
             assert!(parse_text(&arguments(&values)).is_err());

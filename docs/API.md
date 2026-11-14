@@ -45,7 +45,7 @@ same defaults and constraints; no `response_version` field is used in this API.
 Multichannel files are averaged to mono before recognition.
 
 Verbose language is `russian`, the declared model language rather than a detection.
-Segment tokens and average log probability come from the retained native greedy decoder
+Segment tokens and average log probability come from the retained native selected decoder
 emissions. `seek` identifies the owning recognition window in centiseconds; segment
 compression ratio uses UTF-8 bytes and zlib DEFLATE level 6. `no_speech_prob` is one
 minus the maximum VAD speech observation over the owning window's real source coverage.
@@ -343,9 +343,9 @@ help or version command grammar.
 
 ~~~text
 asr transcribe FILE [--model DIR] [--variant ID] [--ep cpu|cuda|tensorrt] [--ort-dylib PATH]
-                    [--fp16] [--ctc-precision fp32|fp16io32|fp16] [--rnnt] [--rnnt-precision fp32|fp16] [--window S] [--overlap S] [--pad]
+                    [--fp16] [--ctc-precision fp32|fp16io32|fp16] [--decoding greedy|beam] [--beam-width N] [--rnnt] [--rnnt-precision fp32|fp16] [--window S] [--overlap S] [--pad]
                     [--words] [--split-channels] [--turns] [--turn-gap S]
-                    [--evidence PATH] [--evidence-version 1|2]
+                    [--evidence PATH] [--evidence-version 1|2|3]
                     [--vad] [--vad-threshold F] [--vad-neg-threshold F]
                     [--vad-min-speech-ms N] [--vad-min-silence-ms N] [--vad-speech-pad-ms N]
 
@@ -353,7 +353,7 @@ asr bench [--audio FILE] [--model DIR] [--variant ID] [--ep cpu|cuda|tensorrt] [
           [--fp16] [--ctc-precision fp32|fp16io32|fp16] [--window S] [--iters N] [--gap-ms N] [--alt-window S]
 
 asr stream FILE [--model DIR] [--variant ID] [--ep cpu|cuda|tensorrt] [--ort-dylib PATH]
-              [--fp16] [--ctc-precision fp32|fp16io32|fp16] [--chunk-ms N] [--step-ms N] [--horizon S]
+              [--fp16] [--ctc-precision fp32|fp16io32|fp16] [--decoding greedy|beam] [--beam-width N] [--chunk-ms N] [--step-ms N] [--horizon S]
               [--window S] [--overlap S] [--endpoint blank|vad] [--silence-ms N]
               [--no-speech-ms N] [--vad-threshold F] [--seam-after S] [--keep-silence S]
               [--ref FILE] [--lock] [--events] [--applied-config]
@@ -362,7 +362,7 @@ asr vad FILE [--model DIR] [--variant ID] [--ort-dylib PATH] [--threshold F] [--
            [--min-speech-ms N] [--min-silence-ms N] [--speech-pad-ms N] [--channels all|0,2]
 
 asr dialog FILE [--model DIR] [--variant ID] [--ep cpu|cuda|tensorrt] [--ort-dylib PATH]
-              [--ctc-precision fp32|fp16io32|fp16]
+              [--decoding greedy|beam] [--beam-width N] [--ctc-precision fp32|fp16io32|fp16]
               [--turn-gap S] [--endpoint blank|vad] [--no-dedup]
               [--backchannel-max-ms N] [--window S] [--overlap S] [--step-ms N]
               [--horizon S] [--silence-ms N] [--no-speech-ms N] [--vad-threshold F]
@@ -468,8 +468,8 @@ own word rule without re-implementing it. PATH is validated once, before any win
 its parent directory must already exist, and PATH itself must not already be a directory. The
 transcript is unaffected by --evidence; only CTC transcription supports it, so it conflicts with
 --rnnt. Version 1 remains the default and retains its existing bytes. `--evidence-version`
-requires a destination and accepts only `1` or `2`. With VAD enabled, evidence requires an
-explicit `--evidence-version 2`; version 1 cannot represent segmented origins and refuses
+requires a destination and accepts `1`, `2` or `3`. Beam requires version 3; RNN-T
+evidence is unsupported. With VAD enabled, evidence requires version 2 or 3; version 1 cannot represent segmented origins and refuses
 before file creation. Version 2 also works with VAD disabled.
 
 `evidence v2` retains each window's existing local feature/token coordinates and adds
@@ -505,6 +505,24 @@ when both are supplied they must agree. Omission retains the legacy V1/V2 CLI pa
 RNN-T transcribe needs no `--rnnt`; that flag is an optional RNN-T assertion. `--model` defaults to model. --ort-dylib or ORT_DYLIB_PATH is
 required; when both are present, they must be identical. Provider selection and runtime
 environment follow [OPERATIONS.md](OPERATIONS.md).
+
+### Search mode and CTC evidence
+
+For Service and CLI transcribe, stream and dialog, `--decoding` / `ASR_DECODING` selects
+`greedy` or `beam`; absent selects greedy. Beam requires an explicit positive `--beam-width`
+or `ASR_BEAM_WIDTH`; equal command/environment values agree, conflicting values and a width
+with greedy refuse. Beam requires a selected V3 package. Native WebSocket remains CTC-only;
+beam uses a VAD endpoint and a blank endpoint request refuses before upgrade. CLI stream and
+dialog follow the same endpoint rule. Native RNN-T streaming is not exposed by this route.
+
+CTC evidence version 3 retains version 2 channel, source-crop, VAD and completion fields.
+Its header contains `decoding ctc-greedy width none` or `decoding ctc-prefix-beam width N`;
+each window declares `label_kind greedy-argmax mask_kind legacy-blank` or
+`label_kind ctc-representative-path mask_kind representative-alignment`. The latter is an
+alignment mask, not acoustic silence. V1/V2 remain greedy-only and retain their bytes; beam
+with either refuses before file creation. RNN-T evidence remains unsupported. The Rust
+`WindowEvidence::labels()` accessor returns only greedy argmax as an option; callers that
+need both CTC kinds use `frame_labels()` and inspect its kind.
 
 ### CUDA graph-assignment verification
 
