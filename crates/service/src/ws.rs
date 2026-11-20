@@ -23,7 +23,7 @@ use axum::http::StatusCode;
 use axum::response::Response;
 use gigaam_audio::{FrontendProcessor, RatePair, SampleFormat, SampleRate};
 use gigaam_model_package::VariantPackage;
-use gigaam_recognition::{ExecutionControl, ExecutionScheduler, ScheduledRecognizer, Vad};
+use gigaam_recognition::{ExecutionControl, ExecutionScheduler, ScheduledRecognizer, VadDetector};
 use gigaam_transcription::{
     BackchannelDuration, BackchannelPolicy, CorrelationThreshold, EndpointDetector, EndpointRules,
     EndpointSource, MultiChannelFailure, MultiChannelSession, MultiChannelStep,
@@ -36,7 +36,7 @@ use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
 
-type Session = MultiChannelSession<ScheduledRecognizer, Vad>;
+type Session = MultiChannelSession<ScheduledRecognizer, VadDetector>;
 
 const MAX_CHANNELS: usize = 8;
 
@@ -473,6 +473,7 @@ struct ServiceStreamChannelFactory {
     scheduler: Arc<ExecutionScheduler>,
     intra_threads: Option<NonZeroUsize>,
     native_runtime: Option<gigaam_recognition::NativeRuntime>,
+    vad_provider: gigaam_recognition::SelectedVadProvider,
 }
 
 impl ServiceStreamChannelFactory {
@@ -483,13 +484,14 @@ impl ServiceStreamChannelFactory {
             scheduler: Arc::clone(&capabilities.scheduler),
             intra_threads: capabilities.intra_threads,
             native_runtime: capabilities.native_runtime.clone(),
+            vad_provider: capabilities.vad_provider.clone(),
         }
     }
 }
 
 impl StreamChannelFactory for ServiceStreamChannelFactory {
     type Decoder = ScheduledRecognizer;
-    type Detector = Vad;
+    type Detector = gigaam_recognition::VadDetector;
 
     fn create_stream(
         &mut self,
@@ -498,16 +500,13 @@ impl StreamChannelFactory for ServiceStreamChannelFactory {
     ) -> Result<StreamSetup<Self::Decoder, Self::Detector>, String> {
         let control = ExecutionControl::without_deadline();
         let decoder = self.scheduler.tick_channel(control.clone());
-        let needs_detector = config.endpoint_source() == EndpointSource::Vad
-            || config.silence_skip() != SilenceSkipPolicy::Off;
+        let needs_detector = needs_vad(&config);
         let detector = if needs_detector {
-            let vad = Vad::from_variant(
-                &self.pack,
-                self.native_runtime
-                    .as_ref()
-                    .ok_or_else(|| "native runtime capability is required for VAD".to_owned())?,
-                self.intra_threads,
-            )?;
+            let vad = self.vad_provider.create(gigaam_recognition::VadContext {
+                package: gigaam_recognition::VadPackage::Variant(&self.pack),
+                native_runtime: self.native_runtime.as_ref(),
+                intra_threads: self.intra_threads,
+            })?;
             match config.endpoint_source() {
                 EndpointSource::Manual => EndpointDetector::ManualWithVad(vad),
                 EndpointSource::Blank => EndpointDetector::BlankWithVad(vad),
@@ -530,6 +529,11 @@ impl StreamChannelFactory for ServiceStreamChannelFactory {
     }
 }
 
+fn needs_vad(config: &StreamConfig) -> bool {
+    config.endpoint_source() == EndpointSource::Vad
+        || config.silence_skip() != SilenceSkipPolicy::Off
+}
+
 /// Validated setup data that is safe to compute before reserving an upgrade token.
 struct PreparedStream {
     setup: MultiChannelStreamSetup,
@@ -543,11 +547,11 @@ impl PreparedStream {
             query.config.endpoint_source(),
             context.capabilities.silence_capability(),
         )?;
-        if query.config.silence_skip() != SilenceSkipPolicy::Off {
-            preflight_skip_vad(
-                &context.capabilities.pack,
-                context.capabilities.native_runtime.is_some(),
-            )?;
+        if needs_vad(&query.config) {
+            context
+                .capabilities
+                .vad_provider
+                .preflight(context.capabilities.vad_context())?;
         }
         let setup = multi_channel_setup(&query, context)?;
         Ok(Self {
@@ -565,16 +569,6 @@ fn validate_endpoint_capability(
         && capability != gigaam_recognition::SilenceCapability::LegacyBlank
     {
         return Err("selected decoder does not support blank stream endpointing".into());
-    }
-    Ok(())
-}
-
-fn preflight_skip_vad(pack: &VariantPackage, runtime_available: bool) -> Result<(), String> {
-    pack.vad_model()
-        .map_err(|error| error.to_string())?
-        .ok_or_else(|| "selected variant has no VAD asset for silence skipping".to_owned())?;
-    if !runtime_available {
-        return Err("native runtime capability is required for silence skipping".into());
     }
     Ok(())
 }
@@ -2031,10 +2025,14 @@ mod tests {
             super::PreparedStream::parse(Some("rate=16000&silence_skip=true"), &state.context)
                 .is_err()
         );
-        assert!(super::preflight_skip_vad(&fixture.pack, true).is_err());
+        assert!(
+            super::PreparedStream::parse(Some("rate=16000&endpoint=vad"), &state.context).is_err()
+        );
         fixture.write_injected_vad_asset()?;
-        assert!(super::preflight_skip_vad(&fixture.pack, false).is_err());
-        assert!(super::preflight_skip_vad(&fixture.pack, true).is_ok());
+        assert!(
+            super::PreparedStream::parse(Some("rate=16000&silence_skip=true"), &state.context)
+                .is_err()
+        );
         Ok(())
     }
 
@@ -2439,6 +2437,10 @@ mod tests {
             let query = format!(
                 "rate=16000&endpoint={endpoint}&window=1&overlap=0&step_ms=125&silence_ms=250&applied_config=1"
             );
+            if endpoint == "vad" {
+                assert!(super::PreparedStream::parse(Some(&query), &state.context).is_err());
+                continue;
+            }
             let prepared = super::PreparedStream::parse(Some(&query), &state.context)?;
             let expected =
                 crate::stream_response::applied_config_event(prepared.setup.stream_config());

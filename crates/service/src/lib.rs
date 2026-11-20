@@ -43,7 +43,12 @@ pub use context::{
 
 /// Runs the configured production service process and exits directly on fatal startup errors.
 pub fn run_process() {
-    lifecycle::run_process(|parameters, metrics, telemetry| {
+    run_with_vad_registry(gigaam_recognition::VadRegistry::with_silero());
+}
+
+/// Runs the service with providers linked by the embedding process.
+pub fn run_with_vad_registry(registry: gigaam_recognition::VadRegistry) {
+    lifecycle::run_process(registry, |parameters, metrics, telemetry| {
         ServiceApplication::assemble_prepared(parameters, metrics, telemetry)
             .map(ServiceApplication::into_process_parts)
     });

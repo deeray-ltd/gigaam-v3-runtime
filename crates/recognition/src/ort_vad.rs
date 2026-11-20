@@ -135,15 +135,46 @@ impl SpeechProbabilityDetector for Vad {
                 self.cell.as_str() => cell,
             ])
             .map_err(|error| error.to_string())?;
-        let (shape, probabilities) = outputs[self.output.as_str()]
+        let (shape, probabilities) = outputs
+            .get(self.output.as_str())
+            .ok_or_else(|| format!("missing VAD output: {}", self.output))?
             .try_extract_tensor::<f32>()
             .map_err(|error| error.to_string())?;
-        validate_f32_output(
-            NativeOutputRole::Vad,
-            shape,
-            probabilities,
-            ExpectedCardinality::Exact(frames),
-        )?;
+        validate_vad_output(shape, probabilities, frames)?;
         Ok(probabilities.to_vec())
+    }
+}
+
+fn validate_vad_output(shape: &[i64], probabilities: &[f32], frames: usize) -> Result<(), String> {
+    validate_f32_output(
+        NativeOutputRole::Vad,
+        shape,
+        probabilities,
+        ExpectedCardinality::Exact(frames),
+    )?;
+    let frames = i64::try_from(frames).map_err(|_| "VAD frame count exceeds i64")?;
+    if shape != [frames] {
+        return Err(format!("invalid VAD output shape: {shape:?}"));
+    }
+    if probabilities
+        .iter()
+        .any(|value| !(0.0..=1.0).contains(value))
+    {
+        return Err("VAD output probabilities must be in 0..=1".into());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_vad_output;
+
+    #[test]
+    fn native_probability_layout_and_domain_are_checked() {
+        assert!(validate_vad_output(&[2], &[0.0, 1.0], 2).is_ok());
+        assert!(validate_vad_output(&[1, 2], &[0.0, 1.0], 2).is_err());
+        assert!(validate_vad_output(&[2], &[0.0], 2).is_err());
+        assert!(validate_vad_output(&[2], &[0.0, f32::NAN], 2).is_err());
+        assert!(validate_vad_output(&[2], &[0.0, 1.1], 2).is_err());
     }
 }

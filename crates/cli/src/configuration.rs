@@ -54,6 +54,14 @@ pub(crate) fn runtime(
     request: &RuntimeRequest,
     required_roles: RequiredEncoderRoles,
 ) -> Result<RuntimeConfig, String> {
+    runtime_with_native(request, required_roles, true)
+}
+
+pub(crate) fn runtime_with_native(
+    request: &RuntimeRequest,
+    required_roles: RequiredEncoderRoles,
+    native_required: bool,
+) -> Result<RuntimeConfig, String> {
     let encoder_ep = process_env("ASR_ENCODER_EP")?;
     let device = Device::resolve_with_config(request.provider.as_deref(), encoder_ep.as_deref())?;
     let memory_pattern = process_env("ASR_ORT_MEMPATTERN")?;
@@ -86,12 +94,16 @@ pub(crate) fn runtime(
         },
     )?;
     let ort_dylib = process_env("ORT_DYLIB_PATH")?;
-    let dylib = configured_path(
-        request.ort_dylib.clone(),
-        ort_dylib.as_deref(),
-        "--ort-dylib",
-        "ORT_DYLIB_PATH",
-    )?;
+    let dylib = if !native_required && request.ort_dylib.is_none() && ort_dylib.is_none() {
+        PathBuf::new()
+    } else {
+        configured_path(
+            request.ort_dylib.clone(),
+            ort_dylib.as_deref(),
+            "--ort-dylib",
+            "ORT_DYLIB_PATH",
+        )?
+    };
     Ok(RuntimeConfig { plan, dylib })
 }
 

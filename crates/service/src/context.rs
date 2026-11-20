@@ -12,7 +12,10 @@
 use crate::admission::{RequestBodyLimit, ServiceAdmission};
 use gigaam_audio::{FrontendProcessor, SampleRate};
 use gigaam_model_package::VariantPackage;
-use gigaam_recognition::{Device, ExecutionScheduler, NativeRuntime};
+use gigaam_recognition::{
+    Device, ExecutionScheduler, NativeRuntime, SelectedVadProvider, VadContext, VadPackage,
+    VadRegistry,
+};
 use gigaam_transcription::{BatchConfig, ObservationMode, PadPolicy, StreamConfig};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -45,6 +48,7 @@ pub struct ServiceCapabilities {
     pub(crate) native_runtime: Option<NativeRuntime>,
     pub(crate) provider: Device,
     pub(crate) intra_threads: Option<NonZeroUsize>,
+    pub(crate) vad_provider: SelectedVadProvider,
 }
 
 impl ServiceCapabilities {
@@ -53,10 +57,25 @@ impl ServiceCapabilities {
         self.scheduler.silence_capability()
     }
 
+    #[cfg(test)]
     pub(crate) fn native_runtime(&self) -> Result<&NativeRuntime, String> {
         self.native_runtime
             .as_ref()
             .ok_or_else(|| "native runtime capability is required for VAD".to_owned())
+    }
+
+    /// Replaces the default provider with one selected from an embedding application's registry.
+    pub fn with_vad_provider(mut self, provider: SelectedVadProvider) -> Self {
+        self.vad_provider = provider;
+        self
+    }
+
+    pub(crate) fn vad_context(&self) -> VadContext<'_> {
+        VadContext {
+            package: VadPackage::Variant(&self.pack),
+            native_runtime: self.native_runtime.as_ref(),
+            intra_threads: self.intra_threads,
+        }
     }
 
     /// Validates that the supplied frontend and model package describe the same model-rate input.
@@ -80,6 +99,7 @@ impl ServiceCapabilities {
             provider,
             native_runtime,
             intra_threads,
+            vad_provider: VadRegistry::with_silero().select("silero")?,
         })
     }
 }
