@@ -13,12 +13,12 @@ use std::collections::BTreeMap;
 
 /// Decoded query parameters with one exact value per key.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub(crate) struct QueryParameters {
+pub struct QueryParameters {
     values: BTreeMap<String, String>,
 }
 
 impl QueryParameters {
-    pub(crate) fn parse(raw: Option<&str>) -> Result<Self, String> {
+    pub fn parse(raw: Option<&str>) -> Result<Self, String> {
         let Some(raw) = raw else {
             return Ok(Self::default());
         };
@@ -50,7 +50,7 @@ impl QueryParameters {
         Ok(Self { values })
     }
 
-    pub(crate) fn from_fields(fields: Vec<(String, String)>) -> Result<Self, String> {
+    pub fn from_fields(fields: Vec<(String, String)>) -> Result<Self, String> {
         let mut values = BTreeMap::new();
         for (key, value) in fields {
             if key.is_empty() || value.is_empty() {
@@ -63,11 +63,11 @@ impl QueryParameters {
         Ok(Self { values })
     }
 
-    pub(crate) fn get(&self, key: &str) -> Option<&str> {
+    pub fn get(&self, key: &str) -> Option<&str> {
         self.values.get(key).map(String::as_str)
     }
 
-    pub(crate) fn reject_unknown(&self, accepted: &[&str]) -> Result<(), String> {
+    pub fn reject_unknown(&self, accepted: &[&str]) -> Result<(), String> {
         for key in self.values.keys() {
             if !accepted.contains(&key.as_str()) {
                 return Err(format!("unknown query parameter {key:?}"));
@@ -115,11 +115,7 @@ fn hex_value(byte: u8, location: &str) -> Result<u8, String> {
     }
 }
 
-pub(crate) fn query_bool(
-    parameters: &QueryParameters,
-    key: &str,
-    default: bool,
-) -> Result<bool, String> {
+pub fn query_bool(parameters: &QueryParameters, key: &str, default: bool) -> Result<bool, String> {
     match parameters.get(key) {
         None => Ok(default),
         Some("1") | Some("true") => Ok(true),
@@ -128,7 +124,7 @@ pub(crate) fn query_bool(
     }
 }
 
-pub(crate) fn query_finite_f32(
+pub fn query_finite_f32(
     parameters: &QueryParameters,
     key: &str,
     default: f32,

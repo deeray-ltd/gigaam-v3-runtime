@@ -22,10 +22,9 @@ and release material describe the same behavior in more detail and do not contra
 
 ### RUST-001 · Supported Rust contract
 
-- Requirement: The seven-package workspace uses resolver 3, Edition 2024, and Rust 1.98.0.
-  gigaam-primitives, gigaam-model-package, gigaam-audio, gigaam-recognition,
-  gigaam-transcription, gigaam-service, and gigaam-cli inherit the workspace edition and
-  rust-version contract.
+- Requirement: The workspace uses resolver 3, Edition 2024, and Rust 1.98.0. Each local
+  package, including the service host and API adapters, inherits the workspace edition
+  and rust-version contract.
 - Scope: The Cargo workspace and all crate targets, enforced by `rust-toolchain.toml` and
   Cargo metadata across local, CI, and release builds.
 

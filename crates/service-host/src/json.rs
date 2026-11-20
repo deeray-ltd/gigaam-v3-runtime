@@ -14,7 +14,7 @@
 use gigaam_primitives::integral_f64_to_i64;
 
 /// Shared media type for every Service JSON response envelope.
-pub(crate) const JSON_CONTENT_TYPE: &str = "application/json; charset=utf-8";
+pub const JSON_CONTENT_TYPE: &str = "application/json; charset=utf-8";
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Json {
@@ -137,7 +137,7 @@ pub fn obj(fields: Vec<(&str, Json)>) -> Json {
 }
 
 /// The one canonical Service error object, preserving the public field order.
-pub(crate) fn error_object(message: impl Into<String>) -> String {
+pub fn error_object(message: impl Into<String>) -> String {
     obj(vec![("error", Json::str(message))]).to_string()
 }
 

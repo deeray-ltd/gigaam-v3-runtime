@@ -6,6 +6,9 @@ members = [
     "crates/recognition",
     "crates/transcription",
     "crates/service",
+    "crates/service-host",
+    "crates/api-native",
+    "crates/api-openai",
     "crates/cli",
 ]
 resolver = "3"

@@ -9,10 +9,9 @@
 
 //! Build `POST /v1/transcribe` JSON responses to the contract schema with pure functions over
 //! Transcription application results and HTTP wire envelopes using the service JSON writer.
-use crate::json::{JSON_CONTENT_TYPE, Json, error_object, obj};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use gigaam_recognition::Device;
+use gigaam_service_host::wire::json::{JSON_CONTENT_TYPE, Json, error_object, obj};
 use gigaam_transcription::{
     ChannelTranscript, DuplicateClassification, SourceChannelCount, TranscriptWord, Turn,
     VadPolicyConfig, words_to_text,
@@ -117,19 +116,6 @@ impl TranscribeErrorCode {
             Self::Draining => "draining",
             Self::Timeout => "timeout",
         }
-    }
-}
-
-/// Validated immutable capability text retained by the health endpoint.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct HealthProjection {
-    provider: Device,
-    variant: gigaam_model_package::VariantId,
-}
-
-impl HealthProjection {
-    pub(crate) const fn new(provider: Device, variant: gigaam_model_package::VariantId) -> Self {
-        Self { provider, variant }
     }
 }
 
@@ -294,41 +280,6 @@ pub(crate) fn transcribe_error_response(
             .to_string(),
         )
             .into_response(),
-    }
-}
-
-pub(crate) fn health_response(projection: HealthProjection) -> Response {
-    let models = vec![Json::str(projection.variant.as_str())];
-    json_ok(
-        obj(vec![
-            ("status", Json::str("ok")),
-            ("models", Json::Array(models)),
-            ("provider", Json::str(projection.provider.as_str())),
-        ])
-        .to_string(),
-    )
-}
-
-pub(crate) fn liveness_response() -> Response {
-    json_ok(obj(vec![("status", Json::str("alive"))]).to_string())
-}
-
-/// Typed not-ready reason. The wire body names the actual cause instead of a generic refusal,
-/// so a stopped recognition worker is never reported as an in-progress shutdown.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ReadinessOutcome {
-    Ready,
-    Draining,
-    WorkerStopped,
-}
-
-pub(crate) fn readiness_response(outcome: ReadinessOutcome) -> Response {
-    match outcome {
-        ReadinessOutcome::Ready => json_ok(obj(vec![("status", Json::str("ready"))]).to_string()),
-        ReadinessOutcome::Draining => json_err(StatusCode::SERVICE_UNAVAILABLE, "draining"),
-        ReadinessOutcome::WorkerStopped => {
-            json_err(StatusCode::SERVICE_UNAVAILABLE, "worker stopped")
-        }
     }
 }
 

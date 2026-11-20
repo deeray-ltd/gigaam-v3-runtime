@@ -4,11 +4,11 @@
 
 //! OpenAI-compatible batch request validation and response projection.
 
-use crate::json::{JSON_CONTENT_TYPE, Json, obj};
 use axum::{
     http::{StatusCode, header},
     response::{IntoResponse, Response},
 };
+use gigaam_service_host::wire::json::{JSON_CONTENT_TYPE, Json, obj};
 use std::path::Path;
 
 use crate::openai_response::Format;
@@ -281,9 +281,9 @@ pub(crate) fn parse_fields(
     if format == Format::Verbose && granularities.is_empty() {
         segment = true;
     }
-    let vad_parameters = crate::protocol::QueryParameters::from_fields(vad_fields)
+    let vad_parameters = gigaam_service_host::wire::QueryParameters::from_fields(vad_fields)
         .map_err(|error| ApiError::bad(error, None))?;
-    let vad = crate::http::bind_vad_policy(&vad_parameters, crate::response::ResponseVersion::V2)
+    let vad = gigaam_service_host::wire::bind_vad_policy(&vad_parameters, true)
         .map_err(|error| ApiError::bad(error, None))?;
     Ok(Input {
         vad,

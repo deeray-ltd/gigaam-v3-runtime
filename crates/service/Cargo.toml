@@ -20,27 +20,28 @@ name = "gigaam_service"
 path = "src/lib.rs"
 
 [dependencies]
-gigaam-model-package = { path = "../model-package" }
-gigaam-primitives = { path = "../primitives" }
-gigaam-audio = { path = "../audio", features = ["decoders"] }
+gigaam-service-host = { path = "../service-host", default-features = false }
+gigaam-api-native = { path = "../api-native" }
+gigaam-api-openai = { path = "../api-openai" }
 gigaam-recognition = { path = "../recognition", default-features = false }
+axum = { version = "0.8.9" }
+
+[dev-dependencies]
+gigaam-audio = { path = "../audio", features = ["decoders"] }
+gigaam-model-package = { path = "../model-package" }
 gigaam-transcription = { path = "../transcription" }
-axum = { version = "0.8.9", features = ["ws", "multipart"] }
-flate2 = { version = "=1.1.9", default-features = false, features = ["miniz_oxide"] }
+axum = { version = "0.8.9", features = ["ws"] }
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "net", "io-util", "signal", "sync", "time"] }
-tungstenite = { version = "0.29.0", default-features = false }
-# Axum provides the HTTP/WebSocket routes, while Tokio owns the asynchronous runtime, networking, and graceful shutdown.
-# Tungstenite names the WebSocket close-frame and capacity-error types that axum's WebSocket support already pulls in.
 
 [features]
 # Preserve the established CUDA default for normal service builds. Disable default features
 # for a CPU-only service artifact; TensorRT depends on CUDA and is selected explicitly at runtime.
 default = ["cuda"]
-cuda = ["gigaam-recognition/cuda"]
+cuda = ["gigaam-service-host/cuda"]
 # Opt-in service integration test requiring the external model pack and binary fixtures.
 golden-tests = []
 # TensorRT selects Recognition's TRT execution provider and its required CUDA support.
-tensorrt = ["cuda", "gigaam-recognition/tensorrt"]
+tensorrt = ["cuda", "gigaam-service-host/tensorrt"]
 
 [[test]]
 name = "http_golden"
