@@ -18,6 +18,7 @@ mod multi_batch;
 mod multi_stream;
 mod observations;
 mod padding;
+mod sample_windows;
 mod stitch;
 mod stream;
 mod text;

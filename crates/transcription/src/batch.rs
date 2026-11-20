@@ -18,7 +18,8 @@ use crate::observations::{
     ObservationMode, WindowEvidence, WindowEvidenceInput, WindowKind, WindowTiming,
 };
 use crate::padding::pad_noise;
-use crate::stitch::{WindowWords, stitch_aligned, windows};
+use crate::sample_windows::{SampleStride, SampleWindows};
+use crate::stitch::{Window, WindowWords, stitch_aligned};
 use crate::vad_policy::{SpeechSegment, VadPolicyConfig, segments_from_probabilities};
 use gigaam_audio::{ChannelAudio, FeatureMatrix, FrontendProcessor};
 use gigaam_primitives::{trunc_f32_to_usize, usize_to_f32, usize_to_u64_checked};
@@ -500,7 +501,6 @@ impl<D: WindowDecoder> BatchTranscriber<D> {
         } else {
             input_samples
         };
-        let total_seconds = usize_to_f32(samples.len()) / sample_rate_f32;
         // Keep a small punctuation tail but never include a word beginning in synthetic padding.
         let keep_until = real_seconds + 0.5;
         let frontend_started = std::time::Instant::now();
@@ -511,11 +511,18 @@ impl<D: WindowDecoder> BatchTranscriber<D> {
         let feature_count = features.frames();
         let hop = self.frontend.hop_length();
         let fft_length = self.frontend.fft_length();
-        let windows = windows(
-            total_seconds,
-            self.config.window_sec(),
-            self.config.overlap_sec(),
-        )?;
+        let length = usize_to_u64_checked(samples.len())
+            .map_err(|error| format!("batch span length: {error}"))?;
+        let width = usize_to_u64_checked(full_length)
+            .map_err(|error| format!("batch window length: {error}"))?;
+        let stride = SampleStride::new(
+            self.config.window_sec() - self.config.overlap_sec(),
+            self.config.sample_rate().hertz(),
+            width,
+        );
+        let windows = SampleWindows::new(length, width, stride)?;
+        let window_count = usize::try_from(windows.planned_count())
+            .map_err(|_| "batch window count exceeds usize".to_owned())?;
         let subsampling_factor = if self.observations.evidence_enabled() {
             Some(subsampling_factor(
                 self.sample_rate,
@@ -525,16 +532,15 @@ impl<D: WindowDecoder> BatchTranscriber<D> {
         } else {
             None
         };
-        let mut window_words = Vec::with_capacity(windows.len());
-        for (window_index, window) in windows.iter().enumerate() {
+        let mut window_words = Vec::new();
+        for (window_index, window) in windows.enumerate() {
             checkpoint(&self.control)?;
-            let start = window.start();
-            let end = window.end();
-            let first_sample = trunc_f32_to_usize(start * sample_rate_f32)
-                .map_err(|error| format!("batch window start {start}: {error}"))?;
-            let unclamped_end = trunc_f32_to_usize(end * sample_rate_f32)
-                .map_err(|error| format!("batch window end {end}: {error}"))?;
-            let last_sample = unclamped_end.min(samples.len());
+            let first_sample = usize::try_from(window.start)
+                .map_err(|_| "batch window start exceeds usize".to_owned())?;
+            let last_sample = usize::try_from(window.end)
+                .map_err(|_| "batch window end exceeds usize".to_owned())?;
+            let start = usize_to_f32(first_sample) / sample_rate_f32;
+            let end = usize_to_f32(last_sample) / sample_rate_f32;
             let first_frame = first_sample.div_ceil(hop);
             let span = last_sample
                 .checked_sub(first_sample)
@@ -552,7 +558,7 @@ impl<D: WindowDecoder> BatchTranscriber<D> {
                 continue;
             }
             let offset = usize_to_f32(first_frame) * usize_to_f32(hop) / sample_rate_f32;
-            let kind = if window_index + 1 == windows.len() {
+            let kind = if window.tail {
                 WindowKind::Tail
             } else {
                 WindowKind::Body
@@ -581,7 +587,7 @@ impl<D: WindowDecoder> BatchTranscriber<D> {
                         .ok_or_else(|| "window real end overflows".to_owned())?,
                 },
             )?;
-            window_words.push(WindowWords::new(*window, words));
+            window_words.push(WindowWords::new(Window::new(start, end)?, words));
         }
         checkpoint(&self.control)?;
         let words = stitch_aligned(&window_words, 0.25)?
@@ -593,7 +599,7 @@ impl<D: WindowDecoder> BatchTranscriber<D> {
             })
             .collect::<Result<Vec<_>, _>>()?;
         checkpoint(&self.control)?;
-        Ok(Transcript::new(words, windows.len()))
+        Ok(Transcript::new(words, window_count))
     }
 }
 
@@ -875,6 +881,91 @@ mod tests {
 
     fn pcm(length: usize) -> ChannelAudio {
         ChannelAudio::new(vec![0.25; length]).expect("test PCM is finite")
+    }
+
+    #[test]
+    fn eof_tail_selects_crop_local_frame_from_exact_sample() {
+        let evidence = Arc::new(EvidenceRecordingObserver {
+            observations: Mutex::new(Vec::new()),
+        });
+        let mut batch = vad_batch(
+            EvidenceDecoder {
+                calls: Arc::new(AtomicUsize::new(0)),
+            },
+            BatchConfig::new(
+                SampleRate::new(16_000).expect("positive rate"),
+                30.0,
+                6.0,
+                PadPolicy::Exact,
+            )
+            .expect("valid batch geometry"),
+            ObservationMode::disabled().with_evidence(evidence.clone()),
+            ExecutionControl::without_deadline(),
+        );
+        let result = batch
+            .transcribe_channel(&pcm(480_481))
+            .expect("batch succeeds");
+        assert_eq!(result.windows(), 2);
+        let records = evidence.observations();
+        assert_eq!(records[1].first_sample(), 481);
+        assert_eq!(records[1].first_feature_frame(), 241);
+        assert_eq!(records[1].kind(), WindowKind::Tail);
+    }
+
+    #[test]
+    fn exact_empty_input_plans_one_window_without_decoding() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut batch = vad_batch(
+            EvidenceDecoder {
+                calls: calls.clone(),
+            },
+            vad_config(PadPolicy::Exact, 0.128),
+            ObservationMode::disabled(),
+            ExecutionControl::without_deadline(),
+        );
+        let result = batch
+            .transcribe_channel(&pcm(0))
+            .expect("uncentered empty input is accepted");
+        assert_eq!(result.windows(), 1);
+        assert!(result.words().is_empty());
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn fractional_width_uses_fixed_sample_shape_in_decoder_evidence() {
+        let evidence = Arc::new(EvidenceRecordingObserver {
+            observations: Mutex::new(Vec::new()),
+        });
+        let mut batch = BatchTranscriber::new(BatchSetup {
+            frontend: test_support::frontend_at_sample_rate(64),
+            decoder: EvidenceDecoder {
+                calls: Arc::new(AtomicUsize::new(0)),
+            },
+            config: BatchConfig::new(
+                SampleRate::new(64).expect("positive rate"),
+                64.75 / 64.0,
+                18.25 / 64.0,
+                PadPolicy::Exact,
+            )
+            .expect("valid fractional configuration"),
+            control: ExecutionControl::without_deadline(),
+            observations: ObservationMode::disabled().with_evidence(evidence.clone()),
+        })
+        .expect("matching frontend and configuration");
+        let result = batch.transcribe_channel(&pcm(140)).expect("batch succeeds");
+        assert_eq!(result.windows(), 3);
+        let records = evidence.observations();
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| record.first_sample())
+                .collect::<Vec<_>>(),
+            vec![0, 46, 76]
+        );
+        assert_eq!(records[1].first_feature_frame(), 23);
+        assert_eq!(records[1].end_sec(), 110.0 / 64.0);
+        assert_eq!(records[1].kind(), WindowKind::Body);
+        assert_eq!(records[2].kind(), WindowKind::Tail);
     }
 
     #[test]

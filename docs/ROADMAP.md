@@ -155,6 +155,19 @@ with backpressure. Validate disconnect, slow consumers, shutdown, model-specific
 latency and CPU capacity. Native WebSocket currently supports CTC; RNN-T support requires
 an actual model-specific streaming path and acceptance. WebRTC is deferred.
 
+### Long batch recordings
+
+Batch window scheduling uses a lazy source-sample clock, including a unique EOF tail, without
+allocating the complete window schedule. Fractional advances below one sample coalesce repeated
+starts; advances wider than the fixed full-window shape are capped to avoid uncovered samples.
+A fractional window width can also alter decoder frames because every full window uses the
+validated shape. At 64 Hz, a 64.75-sample window with 18.25 samples of overlap gives the second
+window [46, 110), rather than the former seconds-derived [46, 111). At 16 kHz, an EOF tail
+starting at sample 481 selects frame 4 for a 160-sample hop, rather than frame 3 from the former
+seconds round trip. Public word times remain floating-point seconds and do not gain acoustic
+alignment precision. Whole-crop features, input audio, decoded words and provider workspaces
+remain separate memory costs; long-duration acceptance and bounded end-to-end storage remain open.
+
 ### VAD and configuration
 
 Batch VAD groups consecutive padded detector spans within the configured recognition window;

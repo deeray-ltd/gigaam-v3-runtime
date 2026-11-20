@@ -139,6 +139,19 @@ and release material describe the same behavior in more detail and do not contra
   particular placement fingerprint. Consumers include Service, CLI, operators, and image
   definitions.
 
+### BATCH-CLOCK-001 · Batch sample-window clock
+
+- Requirement: Batch recognition schedules each channel or VAD crop on its bound source
+  sample clock. The full window retains the validated sample shape; the advance is the exact
+  integer-rate product of the rounded `f32` window-minus-overlap duration, clamped between one
+  sample and that shape. Body starts are the floors of successive advances before the EOF tail,
+  which appears once and ends at the presented crop length. Planning does not collect the
+  schedule. Frontend frame selection uses crop-local sample bounds, while public timestamps
+  remain `f32` seconds. The clock correction can change decoder input for fractional settings
+  and for EOF positions previously rounded through seconds.
+- Scope: Transcription batch execution for direct and VAD crops; consumers include batch
+  callers, CLI and Service. Public seconds-based window collectors and streaming are unchanged.
+
 ### AUDIO-VALID-001 · Validated audio boundary
 
 - Requirement: Audio rejects invalid sample rates, non-finite decoded samples, zero or
