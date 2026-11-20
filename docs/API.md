@@ -50,8 +50,9 @@ emissions. `seek` identifies the owning recognition window in centiseconds; segm
 compression ratio uses UTF-8 bytes and zlib DEFLATE level 6. `no_speech_prob` is one
 minus the maximum VAD speech observation over the owning window's real source coverage.
 These scores are native estimates and are not calibrated Whisper confidence values.
-Segment output requires a compatible VAD asset; ordinary formats and word-only verbose
-output do not require the diagnostic detector unless VAD is enabled.
+Segment output uses the selected VAD provider for scores even when segmentation is disabled;
+ordinary formats and word-only verbose output do not require a detector unless VAD is enabled.
+The default Silero provider requires a compatible VAD asset.
 
 ## HTTP batch transcription
 
@@ -83,7 +84,7 @@ Tuning keys require `vad=true`; disabled tuning is refused rather than ignored. 
 accept zero and fractional milliseconds when their sample counts, including doubled padding,
 are representable. Thresholds and durations bind to the same validated policy as CLI batch
 VAD. The enabled detector requires a 16000 Hz model/frontend; other supported source rates
-are resampled before detection. VAD-off requests do not select or construct a VAD asset.
+are resampled before detection. Native VAD-off requests do not preflight or construct a detector.
 
 Enabled VAD processes each selected physical channel independently, after the existing
 channel-selection and dual-mono policy. Silent selected channels remain present. Accepted
