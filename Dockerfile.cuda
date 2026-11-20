@@ -4,11 +4,7 @@
 # Copyright (C) 2026 Yuriy Krasilnikov
 # Copyright (C) 2026 Deeray Ltd.
 
-FROM ubuntu:24.04@sha256:1e0a86e57d247923571b75e0aaf48a1449cf8c543d51fb3e07a4a7d7bfa79316 AS builder
-
-ENV CARGO_HOME=/usr/local/cargo \
-    RUSTUP_HOME=/usr/local/rustup \
-    PATH=/usr/local/cargo/bin:${PATH}
+FROM ubuntu:24.04@sha256:1e0a86e57d247923571b75e0aaf48a1449cf8c543d51fb3e07a4a7d7bfa79316 AS build-tools
 
 ADD --checksum=sha256:6bac2a01979e210d9eac1d4d56747ec709ea60654744d66705dc3c36e7629e50 https://snapshot.ubuntu.com/ubuntu/20260827T000000Z/pool/main/c/ca-certificates/ca-certificates_20260601~24.04.1_all.deb /tmp/ca-certificates.deb
 
@@ -21,8 +17,14 @@ RUN dpkg-deb --extract /tmp/ca-certificates.deb /tmp/ca-certificates \
         /etc/apt/sources.list.d/ubuntu.sources \
     && sed --in-place '/^Signed-By:/a Snapshot: no' /etc/apt/sources.list.d/ubuntu.sources \
     && apt-get update \
-    && apt-get install --yes --no-install-recommends binutils gcc libc6-dev \
+    && apt-get install --yes --no-install-recommends binutils gcc libc6-dev unzip \
     && rm -rf /var/lib/apt/lists/* /tmp/ca-certificates /tmp/ca-certificates.deb
+
+FROM build-tools AS builder
+
+ENV CARGO_HOME=/usr/local/cargo \
+    RUSTUP_HOME=/usr/local/rustup \
+    PATH=/usr/local/cargo/bin:${PATH}
 
 ADD --checksum=sha256:4acc9acc76d5079515b46346a485974457b5a79893cfb01112423c89aeb5aa10 https://static.rust-lang.org/rustup/archive/1.29.0/x86_64-unknown-linux-gnu/rustup-init /tmp/rustup-init
 
@@ -42,22 +44,23 @@ RUN --mount=type=cache,id=gigaam-v3-cargo-registry,target=/usr/local/cargo/regis
     && install --directory /out \
     && install --mode=0755 target/release/asr-serve /out/asr-serve
 
-FROM ubuntu:24.04@sha256:1e0a86e57d247923571b75e0aaf48a1449cf8c543d51fb3e07a4a7d7bfa79316 AS ort
+FROM build-tools AS ort
 
-ADD --checksum=sha256:844c64acfc43ab9423215c26493055ea229268e28283146cc644ecef0bdae048 https://github.com/microsoft/onnxruntime/releases/download/v1.29.0/onnxruntime-linux-x64-gpu_cuda13-1.29.0.tgz /tmp/onnxruntime.tgz
+ADD --checksum=sha256:3d01949bc846d41961b37988d1e63d782a6effcb93b650a6e0577fef982d38b5 https://api.nuget.org/v3-flatcontainer/microsoft.ml.onnxruntime.gpu.linux/1.32.0/microsoft.ml.onnxruntime.gpu.linux.1.32.0.nupkg /tmp/onnxruntime.nupkg
 
-RUN mkdir --parents /opt/ort \
-    && tar --extract --gzip --file /tmp/onnxruntime.tgz --directory /opt/ort --strip-components=1 \
-        onnxruntime-linux-x64-gpu_cuda13-1.29.0/lib/libonnxruntime.so \
-        onnxruntime-linux-x64-gpu_cuda13-1.29.0/lib/libonnxruntime.so.1 \
-        onnxruntime-linux-x64-gpu_cuda13-1.29.0/lib/libonnxruntime.so.1.29.0 \
-        onnxruntime-linux-x64-gpu_cuda13-1.29.0/lib/libonnxruntime_providers_shared.so \
-        onnxruntime-linux-x64-gpu_cuda13-1.29.0/lib/libonnxruntime_providers_cuda.so \
-        onnxruntime-linux-x64-gpu_cuda13-1.29.0/LICENSE \
-        onnxruntime-linux-x64-gpu_cuda13-1.29.0/ThirdPartyNotices.txt \
-    && rm /tmp/onnxruntime.tgz
+RUN mkdir --parents /opt/ort/lib \
+    && unzip -j /tmp/onnxruntime.nupkg \
+        runtimes/linux-x64/native/libonnxruntime.so \
+        runtimes/linux-x64/native/libonnxruntime_providers_shared.so \
+        runtimes/linux-x64/native/libonnxruntime_providers_cuda.so \
+        -d /opt/ort/lib \
+    && mv /opt/ort/lib/libonnxruntime.so /opt/ort/lib/libonnxruntime.so.1.32.0 \
+    && ln -s libonnxruntime.so.1.32.0 /opt/ort/lib/libonnxruntime.so.1 \
+    && ln -s libonnxruntime.so.1 /opt/ort/lib/libonnxruntime.so \
+    && unzip -j /tmp/onnxruntime.nupkg LICENSE ThirdPartyNotices.txt -d /opt/ort \
+    && rm /tmp/onnxruntime.nupkg
 
-FROM nvidia/cuda:13.0.2-cudnn-runtime-ubuntu24.04@sha256:4d242f206abc4b9588a6506cce2d88932cc879849395aae3785075179718cc49
+FROM nvidia/cuda:13.5.0-cudnn-runtime-ubuntu24.04@sha256:6c863df514b3ec495d60ffe89380af2bec3d13a14fde43dab02563a0f5f1a5fd
 
 RUN groupadd --gid 10001 gigaam \
     && useradd --uid 10001 --gid gigaam --no-create-home --home-dir /app --shell /usr/sbin/nologin gigaam
@@ -72,7 +75,7 @@ COPY crates/service/licenses/rust/ /usr/share/licenses/gigaam-v3-runtime/rust/
 
 ENV ASR_ENCODER_EP=cuda \
     LD_LIBRARY_PATH=/app/ort/lib:/usr/local/cuda/lib64:/usr/local/nvidia/lib:/usr/local/nvidia/lib64 \
-    ORT_DYLIB_PATH=/app/ort/lib/libonnxruntime.so.1.29.0
+    ORT_DYLIB_PATH=/app/ort/lib/libonnxruntime.so.1.32.0
 
 LABEL org.opencontainers.image.title="GigaAM v3 Runtime (CUDA)" \
       org.opencontainers.image.description="GigaAM v3 speech-recognition service and CLI, ONNX Runtime CUDA provider" \

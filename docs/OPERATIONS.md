@@ -162,9 +162,9 @@ documentation, model packages, and build output.
 
 | File | Service build | Final native payload |
 | --- | --- | --- |
-| Dockerfile.cpu | gigaam-service with --no-default-features | Ubuntu 24.04 and selected ONNX Runtime 1.29.0 CPU libraries. |
-| Dockerfile.cuda | gigaam-service with --no-default-features --features cuda | NVIDIA CUDA 13.0.2 cuDNN runtime and selected ONNX Runtime CUDA provider. |
-| Dockerfile.tensorrt | gigaam-service with --no-default-features --features tensorrt | The same NVIDIA CUDA/cuDNN runtime, selected ONNX Runtime TensorRT provider, and selected TensorRT 10.13.3.9 wheel libraries. |
+| Dockerfile.cpu | gigaam-service with --no-default-features | Ubuntu 24.04 and ONNX Runtime 1.32.0 CPU libraries. |
+| Dockerfile.cuda | gigaam-service with --no-default-features --features cuda | CUDA 13.5.0, cuDNN 9.28.0.42, and ONNX Runtime 1.32.0 with CUDA. |
+| Dockerfile.tensorrt | gigaam-service with --no-default-features --features tensorrt | The same NVIDIA base, ONNX Runtime 1.32.0 with TensorRT, and TensorRT 10.16.1.11 engine, plugin, and parser libraries. |
 
 Each source build uses pinned selected inputs, strips the final asr-serve binary, copies
 the relevant ONNX Runtime and TensorRT notices, runs as uid/gid 10001 named gigaam, exposes
@@ -186,14 +186,23 @@ docker run --rm -p 8080:8080 \
 ~~~
 
 CUDA and TensorRT additionally need the host NVIDIA runtime and a supported GPU platform.
+Use a driver that supports CUDA 13.5. NVIDIA specifies the R620 series or later for the
+full CUDA 13.5 feature set. The base image retains NVIDIA's own driver admission rules.
+Qualify the exact driver, GPU, and model profile together before deployment.
+
+Prepare a TensorRT engine for the serving TensorRT release, platform, GPU architecture,
+tensor precision, and shape profile. Rebuild it offline from the same model inputs when
+changing that combination unless the engine's compatibility mode covers the target and
+loading and inference have been verified. A V3 package references the prepared engine
+through a file-backed EPContext wrapper. See [model preparation](MODELS.md#version-2-gpu-artifacts).
+
 TensorRT creates a writable /app/trt-cache owned by the non-root image user. No Dockerfile
 performs its own test suite: CI owns Rust checks, external-golden target compilation, the
 Docker build-context allowlist, and Dockerfile construction policy; the images themselves are
 built and accepted outside CI. Those checks do not prove real model or accelerator inference.
 
-The published release images are deerayltd/asr:0.1.0-cpu, deerayltd/asr:0.1.0-cuda, and
-deerayltd/asr:0.1.0-tensorrt on Docker Hub; their digests are listed in the README. Pull by
-digest when an exact artifact matters.
+See the [README](../README.md#docker-images) for published release images and their
+digests. Pull by digest when an exact artifact matters.
 
 ## Metrics
 

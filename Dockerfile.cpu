@@ -4,11 +4,7 @@
 # Copyright (C) 2026 Yuriy Krasilnikov
 # Copyright (C) 2026 Deeray Ltd.
 
-FROM ubuntu:24.04@sha256:1e0a86e57d247923571b75e0aaf48a1449cf8c543d51fb3e07a4a7d7bfa79316 AS builder
-
-ENV CARGO_HOME=/usr/local/cargo \
-    RUSTUP_HOME=/usr/local/rustup \
-    PATH=/usr/local/cargo/bin:${PATH}
+FROM ubuntu:24.04@sha256:1e0a86e57d247923571b75e0aaf48a1449cf8c543d51fb3e07a4a7d7bfa79316 AS build-tools
 
 ADD --checksum=sha256:6bac2a01979e210d9eac1d4d56747ec709ea60654744d66705dc3c36e7629e50 https://snapshot.ubuntu.com/ubuntu/20260827T000000Z/pool/main/c/ca-certificates/ca-certificates_20260601~24.04.1_all.deb /tmp/ca-certificates.deb
 
@@ -21,8 +17,14 @@ RUN dpkg-deb --extract /tmp/ca-certificates.deb /tmp/ca-certificates \
         /etc/apt/sources.list.d/ubuntu.sources \
     && sed --in-place '/^Signed-By:/a Snapshot: no' /etc/apt/sources.list.d/ubuntu.sources \
     && apt-get update \
-    && apt-get install --yes --no-install-recommends binutils gcc libc6-dev \
+    && apt-get install --yes --no-install-recommends binutils gcc libc6-dev unzip \
     && rm -rf /var/lib/apt/lists/* /tmp/ca-certificates /tmp/ca-certificates.deb
+
+FROM build-tools AS builder
+
+ENV CARGO_HOME=/usr/local/cargo \
+    RUSTUP_HOME=/usr/local/rustup \
+    PATH=/usr/local/cargo/bin:${PATH}
 
 ADD --checksum=sha256:4acc9acc76d5079515b46346a485974457b5a79893cfb01112423c89aeb5aa10 https://static.rust-lang.org/rustup/archive/1.29.0/x86_64-unknown-linux-gnu/rustup-init /tmp/rustup-init
 
@@ -42,19 +44,19 @@ RUN --mount=type=cache,id=gigaam-v3-cargo-registry,target=/usr/local/cargo/regis
     && install --directory /out \
     && install --mode=0755 target/release/asr-serve /out/asr-serve
 
-FROM ubuntu:24.04@sha256:1e0a86e57d247923571b75e0aaf48a1449cf8c543d51fb3e07a4a7d7bfa79316 AS ort
+FROM build-tools AS ort
 
-ADD --checksum=sha256:c3fddc4f139a045b0c4902c57410f0694f1c2fdf9b6939fbe38b1aeae7cd14ba https://github.com/microsoft/onnxruntime/releases/download/v1.29.0/onnxruntime-linux-x64-1.29.0.tgz /tmp/onnxruntime.tgz
+ADD --checksum=sha256:5a34fc4dfeb5a7b4a74c95dcba1e773d722abda720b474edf1b0c419dc6d163d https://files.pythonhosted.org/packages/1d/46/e6f356c9539d2eed44126de3421a81e217da2ad91b22dc11b379cb1e384f/onnxruntime-1.32.0-cp311-cp311-manylinux_2_28_x86_64.whl /tmp/onnxruntime.whl
 
-RUN mkdir --parents /opt/ort \
-    && tar --extract --gzip --file /tmp/onnxruntime.tgz --directory /opt/ort --strip-components=1 \
-        onnxruntime-linux-x64-1.29.0/lib/libonnxruntime.so \
-        onnxruntime-linux-x64-1.29.0/lib/libonnxruntime.so.1 \
-        onnxruntime-linux-x64-1.29.0/lib/libonnxruntime.so.1.29.0 \
-        onnxruntime-linux-x64-1.29.0/lib/libonnxruntime_providers_shared.so \
-        onnxruntime-linux-x64-1.29.0/LICENSE \
-        onnxruntime-linux-x64-1.29.0/ThirdPartyNotices.txt \
-    && rm /tmp/onnxruntime.tgz
+RUN mkdir --parents /opt/ort/lib \
+    && unzip -j /tmp/onnxruntime.whl \
+        onnxruntime/capi/libonnxruntime.so.1.32.0 \
+        onnxruntime/capi/libonnxruntime_providers_shared.so \
+        -d /opt/ort/lib \
+    && ln -s libonnxruntime.so.1.32.0 /opt/ort/lib/libonnxruntime.so.1 \
+    && ln -s libonnxruntime.so.1 /opt/ort/lib/libonnxruntime.so \
+    && unzip -j /tmp/onnxruntime.whl onnxruntime/LICENSE onnxruntime/ThirdPartyNotices.txt -d /opt/ort \
+    && rm /tmp/onnxruntime.whl
 
 FROM ubuntu:24.04@sha256:1e0a86e57d247923571b75e0aaf48a1449cf8c543d51fb3e07a4a7d7bfa79316
 
@@ -71,7 +73,7 @@ COPY crates/service/licenses/rust/ /usr/share/licenses/gigaam-v3-runtime/rust/
 
 ENV ASR_ENCODER_EP=cpu \
     LD_LIBRARY_PATH=/app/ort/lib \
-    ORT_DYLIB_PATH=/app/ort/lib/libonnxruntime.so.1.29.0
+    ORT_DYLIB_PATH=/app/ort/lib/libonnxruntime.so.1.32.0
 
 LABEL org.opencontainers.image.title="GigaAM v3 Runtime (CPU)" \
       org.opencontainers.image.description="GigaAM v3 speech-recognition service and CLI, ONNX Runtime CPU provider" \

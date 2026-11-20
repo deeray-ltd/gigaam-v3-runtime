@@ -9,13 +9,13 @@ advice, and each component's distributed notice and license remain authoritative
 
 | Component | Current role and acquisition | Notice or terms |
 | --- | --- | --- |
-| ONNX Runtime 1.29.0 | Loaded dynamically by Recognition. The CPU image extracts selected libraries, LICENSE, and ThirdPartyNotices.txt from the official Linux x64 archive. The CUDA image selects the CUDA provider from the official CUDA 13 GPU archive. The TensorRT image selects TensorRT and packages `libonnxruntime_providers_cuda.so` as its native dependency; TensorRT selection does not register CUDA as a fallback provider. | MIT; the archive LICENSE and ThirdPartyNotices.txt are copied into the final image. |
-| NVIDIA CUDA and cuDNN | The CUDA and TensorRT final images inherit the pinned NVIDIA CUDA 13.0.2 cuDNN runtime for Ubuntu 24.04. | NVIDIA-distributed terms and notices in the base image. |
-| NVIDIA TensorRT 10.13.3.9 | The TensorRT image extracts its selected runtime libraries and LICENSE from the pinned tensorrt-cu13-libs wheel. Its TensorRT ONNX Runtime provider requires the packaged `libonnxruntime_providers_cuda.so` native dependency, but the runtime registers TensorRT rather than CUDA fallback. | NVIDIA-distributed terms; the selected wheel LICENSE is copied into the final image. |
+| ONNX Runtime 1.32.0 | Loaded dynamically by Recognition through C API 24. The CPU image extracts the native core and shared provider from the official Linux x86-64 wheel. The CUDA and TensorRT images extract their libraries from `Microsoft.ML.OnnxRuntime.Gpu.Linux`. The TensorRT image includes the CUDA provider DSO for native linking and registers TensorRT for inference. | MIT. Each image includes the upstream LICENSE and ThirdPartyNotices.txt for its distribution. |
+| NVIDIA CUDA and cuDNN | The CUDA and TensorRT images inherit the pinned NVIDIA CUDA 13.5.0 runtime with cuDNN 9.28.0.42 for Ubuntu 24.04. | NVIDIA-distributed terms and notices in the base image. |
+| NVIDIA TensorRT 10.16.1.11 | The TensorRT image extracts the engine runtime, plugin library, and ONNX parser from the matching NVIDIA Ubuntu 24.04 packages. | NVIDIA-distributed terms and per-package documentation under the TensorRT license directory in the image. |
 | GigaAM model artifacts, vocabularies, and VAD graph | External model-package inputs selected at runtime. | Upstream terms for the exact artifact; this repository grants no rights to them. |
 
 The three Dockerfiles are source builds. They pin their selected base images, Rust bootstrap,
-ONNX Runtime archives, and, for TensorRT, the selected wheel with checksum verification.
+ONNX Runtime archives, and the selected TensorRT packages with checksum verification.
 They copy the runtime binary, selected native libraries, this file, project licenses, and
 required native notices into their final images. They do not use a host-prepared native
 payload, bundle a model package, or include Python, source, Cargo state, or build state in
