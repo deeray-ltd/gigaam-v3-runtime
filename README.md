@@ -59,7 +59,7 @@ terms remain external to this repository.
 cargo build --release --package gigaam-cli --no-default-features --features decoders
 cargo build --release --package gigaam-service --no-default-features
 
-export ORT_DYLIB_PATH=/path/to/libonnxruntime.so.1.29.0
+export ORT_DYLIB_PATH=/path/to/libonnxruntime.so.1.32.0
 export LD_LIBRARY_PATH=/path/to/onnxruntime/lib
 
 # The example package declares variant=v3_ctc.
