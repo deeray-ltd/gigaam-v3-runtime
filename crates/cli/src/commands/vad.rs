@@ -15,18 +15,34 @@ use gigaam_transcription::{SpeechSegment, VadPolicyConfig, speech_segments};
 use std::time::{Duration, Instant};
 
 /// Executes direct fixed-domain VAD with package binding before native construction.
-pub(crate) fn run(invocation: VadInvocation) -> Result<(), String> {
-    let runtime = configuration::runtime(&invocation.runtime, RequiredEncoderRoles::none())
-        .map_err(|error| format!("runtime configuration: {error}"))?;
+pub(crate) fn run(
+    invocation: VadInvocation,
+    provider: &gigaam_recognition::SelectedVadProvider,
+) -> Result<(), String> {
+    let runtime = configuration::runtime_with_native(
+        &invocation.runtime,
+        RequiredEncoderRoles::none(),
+        provider.native_runtime() == gigaam_recognition::VadNativeRuntime::Required,
+    )
+    .map_err(|error| format!("runtime configuration: {error}"))?;
     let config = invocation.policy.bind()?;
 
     let package = composition::open_package(
         &invocation.model,
         composition::resolve_variant(&invocation.runtime)?,
     )?;
-    let native = composition::initialize_runtime(&runtime)?;
-    let mut detector = composition::vad(&package, &native, runtime.plan().intra_threads())
-        .map_err(|error| format!("vad: {error}"))?;
+    let native = if provider.native_runtime() == gigaam_recognition::VadNativeRuntime::Required {
+        Some(composition::initialize_runtime(&runtime)?)
+    } else {
+        None
+    };
+    let mut detector = composition::vad(
+        &package,
+        provider,
+        native.as_ref(),
+        runtime.plan().intra_threads(),
+    )
+    .map_err(|error| format!("vad: {error}"))?;
     let loaded = load(&invocation.input)?;
     let target_rate = SampleRate::new(usize_to_u32(VAD_SR, "VAD sample rate")?)?;
     let audio = composition::resample_to(loaded, target_rate)

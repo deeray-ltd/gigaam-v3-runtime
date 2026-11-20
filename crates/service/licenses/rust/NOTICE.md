@@ -15,7 +15,7 @@ locked Cargo metadata and checksum-verified local registry crate archives.
   is a procedural macro are excluded because their code is executed during compilation,
   not statically linked into `asr-serve`.
 - Registry packages: 111; the three selected closures are identical.
-- Cargo.lock SHA-256: `15f10f0e31fe28a0dfc37c52e89e725543896ef0e044885a639126833a55f326`.
+- Cargo.lock SHA-256: `621712c72e2cb223b5d738151ede4747c3a55f92b736f9a257e4e45bf922052b`.
 - Closure SHA-256: `58308d0dde4371edaded6ed1c6aa6a7a84767bedc1b8f756e85b4fb4695a06e2`.
 - Project workspace code is covered by the parent `COPYING` and `COPYING.LESSER` files.
 

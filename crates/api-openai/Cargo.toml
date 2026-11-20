@@ -1,0 +1,20 @@
+[package]
+name = "gigaam-api-openai"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "OpenAI-compatible file transcription adapter for GigaAM v3 Runtime."
+publish = false
+
+[dependencies]
+gigaam-service-host = { path = "../service-host", default-features = false }
+gigaam-model-package = { path = "../model-package" }
+gigaam-transcription = { path = "../transcription" }
+axum = { version = "0.8.9", features = ["multipart"] }
+flate2 = { version = "=1.1.9", default-features = false, features = ["miniz_oxide"] }
+
+[dev-dependencies]
+tokio = { version = "1.53.1", features = ["macros", "rt"] }

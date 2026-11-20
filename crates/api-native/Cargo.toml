@@ -1,0 +1,21 @@
+[package]
+name = "gigaam-api-native"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Native HTTP and WebSocket API adapter for GigaAM v3 Runtime."
+publish = false
+
+[dependencies]
+gigaam-service-host = { path = "../service-host", default-features = false }
+gigaam-audio = { path = "../audio" }
+gigaam-model-package = { path = "../model-package" }
+gigaam-transcription = { path = "../transcription" }
+gigaam-primitives = { path = "../primitives" }
+gigaam-recognition = { path = "../recognition", default-features = false }
+axum = { version = "0.8.9", features = ["ws"] }
+tokio = { version = "1.53.1", features = ["macros", "sync", "time"] }
+tungstenite = { version = "0.29.0", default-features = false }

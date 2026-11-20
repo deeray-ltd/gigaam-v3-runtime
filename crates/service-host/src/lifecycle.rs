@@ -179,26 +179,37 @@ fn with_runtime_owner<T, R>(
 
 /// Runs the process lifecycle and delegates application assembly to the crate facade.
 pub(super) fn run_process(
+    registry: gigaam_recognition::VadRegistry,
+    apis: &crate::api::ApiRegistry,
     assemble: impl FnOnce(
         ServiceApplicationParameters,
         Arc<Metrics>,
         PreparedTelemetry,
+        &dyn crate::api::ApiAdapter,
     ) -> Result<(Router, Arc<AdmissionState>), String>,
 ) {
-    if let Err(error) = run_scoped(assemble) {
+    if let Err(error) = run_scoped(registry, apis, assemble) {
         fatal(&error);
     }
 }
 
 fn run_scoped(
+    registry: gigaam_recognition::VadRegistry,
+    apis: &crate::api::ApiRegistry,
     assemble: impl FnOnce(
         ServiceApplicationParameters,
         Arc<Metrics>,
         PreparedTelemetry,
+        &dyn crate::api::ApiAdapter,
     ) -> Result<(Router, Arc<AdmissionState>), String>,
 ) -> Result<(), String> {
-    let (startup, limits, pack) =
-        continue_after_configuration(ProcessConfiguration::from_process(), open_model)?;
+    let vad_provider = gigaam_recognition::process_vad_provider(&registry)?;
+    let (startup, limits, pack, api) =
+        continue_after_configuration(ProcessConfiguration::from_process(), |configuration| {
+            let api = apis.select(configuration.limits.admission().api_mode())?;
+            let (startup, limits, pack) = open_model(configuration)?;
+            Ok((startup, limits, pack, api))
+        })?;
     let sample_rate_config = pack.frontend().sample_rate();
     let sample_rate = model_sample_rate(sample_rate_config)?;
     let window_seconds = WINDOW_DURATION.as_secs_f32();
@@ -322,14 +333,15 @@ fn run_scoped(
             provider: startup.plan.device(),
             intra_threads: startup.plan.intra_threads(),
         })
-        .map_err(|error| format!("service capabilities: {error}"))?;
+        .map_err(|error| format!("service capabilities: {error}"))?
+        .with_vad_provider(vad_provider);
         let request_body_limit = limits.request_body_limit();
-        let api_mode = limits.admission.api_mode();
         let admission = limits.admission;
         let (app, admission) = assemble(
             ServiceApplicationParameters::new(capabilities, policy, admission, request_body_limit),
             metrics,
             telemetry,
+            api,
         )
         .map_err(|error| format!("service application: {error}"))?;
 
@@ -342,11 +354,10 @@ fn run_scoped(
         let listener = tokio::net::TcpListener::bind(&address)
             .await
             .map_err(|error| format!("bind {address}: {error}"))?;
-        let api = match api_mode {
-            crate::admission::ApiMode::Native => "POST /v1/transcribe, WS /v1/stream",
-            crate::admission::ApiMode::OpenAi => "POST /v1/audio/transcriptions, GET /v1/models",
-        };
-        eprintln!("# asr-serve listening on http://{address} ({api}; GET /health, /livez, /readyz)");
+        eprintln!(
+            "# asr-serve listening on http://{address} ({} API; GET /health, /livez, /readyz)",
+            api.name()
+        );
         let (signal_tx, mut signal_rx) = tokio::sync::oneshot::channel();
         let shutdown = async move {
             if let Err(error) = wait_signal().await {

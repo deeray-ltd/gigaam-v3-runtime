@@ -12,9 +12,8 @@ not separate application topologies.
 
 ## Logical capability graph
 
-The runtime has six product capabilities, implemented by six product Cargo packages, plus
-the dependency-free Primitives support package. Primitives does not create a seventh
-product capability or a generic Core facade.
+The runtime has six product capabilities. Service is split into a host, protocol adapters,
+and a stock executable composition. Primitives provides dependency-free numeric support.
 
 ~~~text
 Primitives (support) -> Model Package -> Audio -> Recognition -> Transcription -> Service
@@ -31,7 +30,9 @@ capability owns a reverse dependency.
 | Audio | gigaam-audio | Validated file and frame ingestion, codecs, resampling, channel analysis, and log-mel frontend construction. | Process environment, provider selection, or transcript policy. |
 | Recognition | gigaam-recognition | Decoder contracts and algorithms, native-output validation, the only ONNX Runtime/provider assembly, execution control, and scheduler. | HTTP, WebSocket, dialogs, or process output. |
 | Transcription | gigaam-transcription | Batch and stream workflows, channel policy, window stitching, endpointing, revisions, dialog reconstruction, and observations. | Process environment, direct sockets, or ONNX Runtime ownership. |
-| Service | gigaam-service | HTTP/WebSocket adapters, process configuration, admission, lifecycle, wire projection, metrics, and bounded runtime telemetry. | Audio/recognition business policy or a second model/runtime path. |
+| Service | gigaam-service-host | Transcription operations, process configuration, admission, physical work ownership, lifecycle, and operational routes. | Protocol-specific transcription routes and wire responses. |
+| Service | gigaam-api-native, gigaam-api-openai | Each family's routes, request binding, response projection, and protocol errors. | Model initialization, worker capacity, and process shutdown. |
+| Service | gigaam-service | Registers both stock adapters and composes the service executable. | Recognition or protocol implementation. |
 | CLI | gigaam-cli | Offline grammar, configuration, direct composition, and terminal projection. | A service listener, scheduler wrapper, or generic application facade. |
 
 Primitives support (`gigaam-primitives`) provides checked numeric conversions at typed
@@ -42,6 +43,11 @@ This split stays in one process because the model session, audio-to-window trans
 streaming frontier state require low-latency in-process ownership. It does not imply
 independent deployment, independent scaling, or independent failure domains for the
 logical capabilities.
+
+The host resolves one linked API family at startup. The stock CPU, CUDA, and TensorRT
+builds include native and OpenAI-compatible adapters. Embedding applications can register
+other implementations of the same route factory. The host supplies the operational routes
+and owns capacity and cancellation for each family.
 
 ## C1 system context
 

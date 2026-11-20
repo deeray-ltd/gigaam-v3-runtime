@@ -10,7 +10,7 @@
 //! Liveness, readiness, and capability probes over the shared admission state.
 
 use crate::admission::{AdmissionPhase, AdmissionState};
-use crate::response::{
+use crate::health_response::{
     HealthProjection, ReadinessOutcome, health_response, liveness_response, readiness_response,
 };
 use axum::extract::State;
@@ -77,7 +77,7 @@ mod tests {
     use super::{HealthState, health, livez, readiness_with_workers, readyz};
     use crate::admission::ServiceAdmission;
     use crate::admission::{AdmissionPhase, AdmissionState, DrainTransition};
-    use crate::response::HealthProjection;
+    use crate::health_response::HealthProjection;
     use axum::body::to_bytes;
     use axum::extract::State;
     use axum::http::header;

@@ -19,7 +19,10 @@ use gigaam_transcription::{
 use std::time::Instant;
 
 /// Executes the direct stream simulator and preserves incremental client projection.
-pub(crate) fn run(invocation: StreamInvocation) -> Result<(), String> {
+pub(crate) fn run(
+    invocation: StreamInvocation,
+    provider: &gigaam_recognition::SelectedVadProvider,
+) -> Result<(), String> {
     let mode = configuration::decoding(&invocation.runtime)?;
     let precision = configuration::ctc_precision(
         invocation.ctc_precision,
@@ -108,8 +111,13 @@ pub(crate) fn run(invocation: StreamInvocation) -> Result<(), String> {
         gigaam_transcription::EndpointSource::Manual => EndpointDetector::Manual,
         gigaam_transcription::EndpointSource::Blank => EndpointDetector::Blank,
         gigaam_transcription::EndpointSource::Vad => EndpointDetector::Vad(
-            composition::vad(&package, &native, runtime.plan().intra_threads())
-                .map_err(|error| format!("vad: {error}"))?,
+            composition::vad(
+                &package,
+                provider,
+                Some(&native),
+                runtime.plan().intra_threads(),
+            )
+            .map_err(|error| format!("vad: {error}"))?,
         ),
     };
     let mut session = StreamSession::new(StreamSetup {

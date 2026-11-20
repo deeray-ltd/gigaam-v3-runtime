@@ -9,9 +9,9 @@
 
 //! Pure WebSocket wire projections over committed Transcription events.
 
-use crate::json::{JSON_CONTENT_TYPE, Json, error_object, obj};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
+use gigaam_service_host::wire::json::{JSON_CONTENT_TYPE, Json, error_object, obj};
 use gigaam_transcription::{
     DialogTurn, EndpointSource, FinalReason, MultiChannelStep, SilenceSkipPolicy,
     SourceChannelCount, StreamConfig, StreamEvent, StreamLockPolicy, StreamWord, TurnsPatch,

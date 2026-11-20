@@ -17,22 +17,6 @@ use std::time::Duration;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ApiMode {
-    Native,
-    OpenAi,
-}
-
-impl ApiMode {
-    pub(crate) fn parse(value: Option<&str>) -> Result<Self, String> {
-        match value {
-            None | Some("native") => Ok(Self::Native),
-            Some("openai") => Ok(Self::OpenAi),
-            Some(_) => Err("ASR_API_MODE must be native or openai".into()),
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RecognitionLanguage {
     Russian,
 }
@@ -52,7 +36,7 @@ pub struct ServiceAdmission {
     max_http: NonZeroUsize,
     max_ws: NonZeroUsize,
     request_timeout: Duration,
-    api_mode: ApiMode,
+    api_mode: String,
     max_uploads: NonZeroUsize,
     upload_timeout: Duration,
 }
@@ -76,22 +60,21 @@ impl ServiceAdmission {
             max_http,
             max_ws,
             request_timeout,
-            api_mode: ApiMode::Native,
+            api_mode: "native".into(),
             max_uploads: max_http,
             upload_timeout: request_timeout,
         })
     }
 
-    pub(crate) fn with_api_policy(mut self, mode: ApiMode, language: RecognitionLanguage) -> Self {
-        self.api_mode = mode;
-        match language {
-            RecognitionLanguage::Russian => {}
-        }
-        self
+    /// Selects the family to resolve against the application's linked adapters.
+    pub fn with_api_mode(mut self, mode: &str) -> Result<Self, String> {
+        crate::api::validate_name(mode)?;
+        self.api_mode = mode.into();
+        Ok(self)
     }
 
-    pub(crate) const fn api_mode(&self) -> ApiMode {
-        self.api_mode
+    pub(crate) fn api_mode(&self) -> &str {
+        &self.api_mode
     }
 
     pub(crate) fn with_uploads(
@@ -158,7 +141,7 @@ pub(crate) enum DrainTransition {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum AdmissionRefusal {
+pub enum AdmissionRefusal {
     Overloaded,
     Draining,
 }
