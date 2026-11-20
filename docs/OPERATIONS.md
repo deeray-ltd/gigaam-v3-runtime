@@ -68,6 +68,7 @@ processing deadline configured by ASR_REQ_TIMEOUT_SEC returns 504 instead.
 
 | Variable | Default | Accepted value and effect |
 | --- | --- | --- |
+| ASR_VAD_PROVIDER | silero | Selects a statically linked VAD provider for the service and CLI. This build registers `silero`; unknown or empty values refuse at startup. Silero uses CPU and requires the package `vad.model` asset when VAD is used. |
 | ASR_CTC_PRECISION | Absent | `fp32`, `fp16io32`, or `fp16` CTC encoder precision. |
 | ASR_RNNT_PRECISION | Absent | `fp32` or `fp16`; selects precision for all RNN-T roles. |
 | ASR_ENCODER_EP | Compiled default | cpu, cuda, or tensorrt. It must agree with --ep when both are set. |

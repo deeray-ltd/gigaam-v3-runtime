@@ -16,7 +16,10 @@ use gigaam_transcription::{
 };
 
 /// Executes offline dialogue reconstruction using direct channel-local recognition composition.
-pub(crate) fn run(invocation: DialogInvocation) -> Result<(), String> {
+pub(crate) fn run(
+    invocation: DialogInvocation,
+    provider: &gigaam_recognition::SelectedVadProvider,
+) -> Result<(), String> {
     let mode = configuration::decoding(&invocation.runtime)?;
     let precision = configuration::ctc_precision(invocation.ctc_precision, false)?;
     let runtime = configuration::runtime(&invocation.runtime, RequiredEncoderRoles::ctc())
@@ -62,6 +65,7 @@ pub(crate) fn run(invocation: DialogInvocation) -> Result<(), String> {
         (&runtime, &native),
         frontend,
         composition::CtcSelection { precision, mode },
+        provider,
     );
     let result = transcribe_offline_dialog(setup, &mut factory, audio.channels())
         .map_err(|failure| projection::dialog_failure_message(&failure))?;

@@ -29,6 +29,7 @@ mod provider;
 pub mod rnnt;
 pub mod rnnt_beam;
 pub mod vad;
+mod vad_provider;
 
 pub use assembly::{
     DirectRecognizer, RnntBeamSelection, RnntPrecisionSelection, VariantDecodeSelection,
@@ -49,5 +50,9 @@ pub use provider::{
     EncoderRole, MemoryPattern, OrtConfig, OrtEnvironment, ProviderPlan, RequiredEncoderRoles,
 };
 pub use scheduler::{ExecutionScheduler, ScheduledRecognizer};
+pub use vad_provider::{
+    SelectedVadProvider, VadContext, VadDetector, VadNativeRuntime, VadPackage, VadProvider,
+    VadRegistry, process_vad_provider,
+};
 
 pub use tokenizer::{ProjectedWord, TokenTextProjection, TokenTextProjector};

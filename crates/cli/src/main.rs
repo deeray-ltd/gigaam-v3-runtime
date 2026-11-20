@@ -15,6 +15,8 @@ mod projection;
 fn main() {
     let result = grammar::parse(std::env::args_os().skip(1))
         .map_err(projection::CliFailure::from)
-        .and_then(commands::dispatch);
+        .and_then(|invocation| {
+            commands::dispatch(invocation, &gigaam_recognition::VadRegistry::with_silero())
+        });
     projection::terminal(result);
 }
