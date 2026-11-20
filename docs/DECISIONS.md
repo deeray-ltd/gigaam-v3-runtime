@@ -1,7 +1,7 @@
 # Design decisions
 
 These are the current durable design choices for GigaAM v3 Runtime. They explain the
-present seven-package modular-monolith structure; they do not claim that every earlier
+present modular-monolith structure; they do not claim that every earlier
 revision used the same structure.
 
 ## 1. One modular monolith, not distributed services

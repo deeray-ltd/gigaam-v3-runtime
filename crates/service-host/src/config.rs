@@ -9,7 +9,7 @@
 
 //! Strict command-line and environment grammar for the service process.
 
-use crate::admission::{ApiMode, RecognitionLanguage, RequestBodyLimit, ServiceAdmission};
+use crate::admission::{RecognitionLanguage, RequestBodyLimit, ServiceAdmission};
 use gigaam_audio::{FrontendMode, SampleRate};
 use gigaam_model_package::{EncoderPrecision, ModelFamily, VariantId};
 use gigaam_recognition::{
@@ -636,8 +636,9 @@ impl ServerLimits {
 
     pub(crate) fn parse(environment: ServerLimitEnvironment<'_>) -> Result<Self, String> {
         // Parse every raw input before runtime work.
-        let api_mode = ApiMode::parse(environment.api_mode)?;
-        let language = RecognitionLanguage::parse(environment.language)?;
+        let api_mode = environment.api_mode.unwrap_or("native");
+        crate::api::validate_name(api_mode)?;
+        RecognitionLanguage::parse(environment.language)?;
         let max_http = required_positive_usize(environment.max_http, "ASR_MAX_CONCURRENCY", 8)?;
         let max_ws = required_positive_usize(environment.max_ws, "ASR_MAX_STREAMS", 32)?;
         let body_mb = required_positive_usize(environment.body_mb, "ASR_BODY_LIMIT_MB", 64)?;
@@ -677,7 +678,7 @@ impl ServerLimits {
         let admission =
             ServiceAdmission::new(max_http, max_ws, Duration::from_secs(timeout_seconds))?
                 .with_uploads(max_uploads, Duration::from_secs(upload_timeout))?
-                .with_api_policy(api_mode, language);
+                .with_api_mode(api_mode)?;
         Ok(Self {
             admission,
             request_body_limit,
@@ -1211,7 +1212,7 @@ mod tests {
 
     #[test]
     fn api_mode_and_language_are_validated_before_runtime() {
-        for mode in ["", "both", "OPENAI"] {
+        for mode in ["", "native openai", "OPENAI"] {
             assert!(
                 ServerLimits::parse(ServerLimitEnvironment {
                     api_mode: Some(mode),
@@ -1235,10 +1236,7 @@ mod tests {
             ..ServerLimitEnvironment::default()
         })
         .expect("documented mode and language");
-        assert_eq!(
-            openai.admission.api_mode(),
-            crate::admission::ApiMode::OpenAi
-        );
+        assert_eq!(openai.admission.api_mode(), "openai");
     }
 
     #[test]

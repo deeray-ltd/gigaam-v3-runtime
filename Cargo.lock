@@ -379,6 +379,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "gigaam-api-native"
+version = "0.1.1"
+dependencies = [
+ "axum",
+ "gigaam-audio",
+ "gigaam-model-package",
+ "gigaam-primitives",
+ "gigaam-recognition",
+ "gigaam-service-host",
+ "gigaam-transcription",
+ "tokio",
+ "tungstenite",
+]
+
+[[package]]
+name = "gigaam-api-openai"
+version = "0.1.1"
+dependencies = [
+ "axum",
+ "flate2",
+ "gigaam-model-package",
+ "gigaam-service-host",
+ "gigaam-transcription",
+ "tokio",
+]
+
+[[package]]
 name = "gigaam-audio"
 version = "0.1.1"
 dependencies = [
@@ -428,6 +455,21 @@ dependencies = [
 
 [[package]]
 name = "gigaam-service"
+version = "0.1.1"
+dependencies = [
+ "axum",
+ "gigaam-api-native",
+ "gigaam-api-openai",
+ "gigaam-audio",
+ "gigaam-model-package",
+ "gigaam-recognition",
+ "gigaam-service-host",
+ "gigaam-transcription",
+ "tokio",
+]
+
+[[package]]
+name = "gigaam-service-host"
 version = "0.1.1"
 dependencies = [
  "axum",
