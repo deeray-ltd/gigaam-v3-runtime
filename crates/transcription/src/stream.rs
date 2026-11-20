@@ -441,12 +441,12 @@ impl<D: WindowDecoder, V: SpeechProbabilityDetector> StreamSession<D, V> {
     fn open_line(&self) -> Result<Vec<TranscriptWord>, String> {
         let now = self.now();
         match &self.previous {
-            Some(previous) => {
+            Some(previous) if !previous.words().is_empty() => {
                 let current =
                     WindowWords::new(Window::new(self.start_time, now)?, self.open_words());
                 stitch_aligned(&[previous.clone(), current], 0.25)
             }
-            None => Ok(self.open_words()),
+            Some(_) | None => Ok(self.open_words()),
         }
     }
 
@@ -463,6 +463,9 @@ impl<D: WindowDecoder, V: SpeechProbabilityDetector> StreamSession<D, V> {
         let Some(previous) = self.previous.take() else {
             return Ok(());
         };
+        if previous.words().is_empty() {
+            return Ok(());
+        }
         let current = WindowWords::new(Window::new(self.start_time, now)?, self.open_words());
         let seam = seam(previous.words(), previous.end(), &current, 0.25)?;
         let committed = previous
@@ -849,6 +852,220 @@ mod tests {
     };
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct ScriptDecoder {
+        lines: std::collections::VecDeque<Vec<Word>>,
+    }
+
+    impl WindowDecoder for ScriptDecoder {
+        fn silence_capability(&self) -> gigaam_recognition::SilenceCapability {
+            gigaam_recognition::SilenceCapability::LegacyBlank
+        }
+        fn frame_rate(&self) -> FrameRate {
+            FrameRate::new(8.0).expect("the fixed test frame rate is valid")
+        }
+        fn decode(&mut self, features: FeatureMatrixView<'_>) -> Result<Decoded, String> {
+            let words = self.lines.pop_front().ok_or("script exhausted")?;
+            Decoded::new(
+                words,
+                vec![false; features.frames()],
+                features.frames(),
+                0.0,
+            )
+        }
+    }
+
+    fn scripted_word(text: &str, start: f32, end: f32) -> Result<Word, String> {
+        Word::new(text.into(), start, end)
+    }
+
+    fn apply_patches(events: Vec<StreamEvent>, client: &mut Vec<crate::StreamWord>) {
+        for event in events {
+            match event {
+                StreamEvent::Words(patch) => {
+                    client.truncate(patch.revise_from());
+                    client.extend_from_slice(patch.words());
+                }
+                StreamEvent::Stable(frontier) => {
+                    for word in &mut client[..frontier.upto()] {
+                        *word = word.clone().with_stability(crate::WordStability::Stable);
+                    }
+                }
+                StreamEvent::Final(frontier) => {
+                    for word in &mut client[..frontier.upto()] {
+                        *word = word.clone().with_stability(crate::WordStability::Stable);
+                    }
+                }
+            }
+        }
+    }
+
+    fn script_session(
+        lines: Vec<Vec<Word>>,
+        seam_delay: f32,
+    ) -> Result<StreamSession<ScriptDecoder, NonFiniteDetector>, String> {
+        let rate = SampleRate::new(16_000)?;
+        let config = StreamConfig::timing_changes()
+            .with_window_sec(2.0)?
+            .with_overlap_sec(0.5)?
+            .with_step_sec(0.5)?
+            .with_seam_after_sec(seam_delay)?
+            .apply(StreamConfig::checked_default(rate)?)?
+            .with_endpoint_source(EndpointSource::Manual)?;
+        StreamSession::new(StreamSetup {
+            frontend: crate::test_support::frontend_at_sample_rate(rate.hertz()),
+            decoder: ScriptDecoder {
+                lines: lines.into(),
+            },
+            config,
+            detector: EndpointDetector::Manual,
+            control: ExecutionControl::without_deadline(),
+        })
+    }
+
+    fn assert_line(client: &[crate::StreamWord], expected: &[(&str, f32, f32)]) {
+        assert_eq!(client.len(), expected.len());
+        for (word, (text, start, end)) in client.iter().zip(expected) {
+            assert_eq!(word.text(), *text);
+            assert!((word.start() - start).abs() < 0.0001);
+            assert!((word.end() - end).abs() < 0.0001);
+        }
+    }
+
+    #[test]
+    fn wordless_window_keeps_provisional_revision_and_repetition() -> Result<(), String> {
+        let mut session = script_session(
+            vec![
+                vec![],
+                vec![],
+                vec![],
+                vec![],
+                vec![scripted_word("Dob", 0.1, 0.3)?],
+                vec![
+                    scripted_word("Dobry", 0.1, 0.35)?,
+                    scripted_word("day", 0.6, 0.8)?,
+                ],
+                vec![
+                    scripted_word("Dobry", 0.1, 0.35)?,
+                    scripted_word("day", 0.6, 0.8)?,
+                    scripted_word("day", 1.0, 1.2)?,
+                ],
+            ],
+            1.0,
+        )?;
+        let mut client = Vec::new();
+        apply_patches(
+            session.push(&ChannelAudio::new(vec![0.0; 32_000])?)?,
+            &mut client,
+        );
+        assert_line(&client, &[]);
+        apply_patches(
+            session.push(&ChannelAudio::new(vec![0.0; 8_000])?)?,
+            &mut client,
+        );
+        assert_line(&client, &[("Dob", 1.6, 1.8)]);
+        apply_patches(
+            session.push(&ChannelAudio::new(vec![0.0; 8_000])?)?,
+            &mut client,
+        );
+        assert_line(&client, &[("Dobry", 1.6, 1.85), ("day", 2.1, 2.3)]);
+        apply_patches(session.flush()?, &mut client);
+        assert_line(
+            &client,
+            &[("Dobry", 1.6, 1.85), ("day", 2.1, 2.3), ("day", 2.5, 2.7)],
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn wordless_seam_resolved_before_first_word_does_not_cut_it() -> Result<(), String> {
+        let mut session = script_session(
+            vec![
+                vec![],
+                vec![],
+                vec![],
+                vec![],
+                vec![],
+                vec![scripted_word("first", 0.1, 0.3)?],
+                vec![scripted_word("first", 0.1, 0.3)?],
+            ],
+            0.5,
+        )?;
+        let mut client = Vec::new();
+        apply_patches(
+            session.push(&ChannelAudio::new(vec![0.0; 40_000])?)?,
+            &mut client,
+        );
+        assert_line(&client, &[]);
+        apply_patches(
+            session.push(&ChannelAudio::new(vec![0.0; 8_000])?)?,
+            &mut client,
+        );
+        assert_line(&client, &[("first", 1.6, 1.8)]);
+        apply_patches(session.flush()?, &mut client);
+        assert_line(&client, &[("first", 1.6, 1.8)]);
+        Ok(())
+    }
+
+    #[test]
+    fn overlap_matching_keeps_committed_prefix_and_real_repetition() -> Result<(), String> {
+        let prefix = || scripted_word("prefix", 0.1, 0.2);
+        let mut session = script_session(
+            vec![
+                vec![prefix()?],
+                vec![prefix()?],
+                vec![prefix()?],
+                vec![prefix()?, scripted_word("same", 1.6, 1.8)?],
+                vec![
+                    scripted_word("same", 0.1, 0.3)?,
+                    scripted_word("same", 0.6, 0.8)?,
+                ],
+                vec![
+                    scripted_word("same", 0.1, 0.3)?,
+                    scripted_word("same", 0.6, 0.8)?,
+                ],
+                vec![
+                    scripted_word("same", 0.1, 0.3)?,
+                    scripted_word("same", 0.6, 0.8)?,
+                ],
+            ],
+            1.0,
+        )?;
+        session.config = session
+            .config
+            .clone()
+            .with_horizon_sec(0.5)?
+            .with_lock_policy(crate::StreamLockPolicy::CommitStable)?;
+        let mut client = Vec::new();
+        for _ in 0..3 {
+            apply_patches(
+                session.push(&ChannelAudio::new(vec![0.0; 8_000])?)?,
+                &mut client,
+            );
+            assert_line(&client, &[("prefix", 0.1, 0.2)]);
+        }
+        apply_patches(
+            session.push(&ChannelAudio::new(vec![0.0; 8_000])?)?,
+            &mut client,
+        );
+        assert_line(&client, &[("prefix", 0.1, 0.2), ("same", 1.6, 1.8)]);
+        for _ in 0..2 {
+            apply_patches(
+                session.push(&ChannelAudio::new(vec![0.0; 8_000])?)?,
+                &mut client,
+            );
+            assert_line(
+                &client,
+                &[("prefix", 0.1, 0.2), ("same", 1.6, 1.8), ("same", 2.1, 2.3)],
+            );
+        }
+        apply_patches(session.flush()?, &mut client);
+        assert_line(
+            &client,
+            &[("prefix", 0.1, 0.2), ("same", 1.6, 1.8), ("same", 2.1, 2.3)],
+        );
+        Ok(())
+    }
 
     struct CandidateDecoder {
         calls: Arc<AtomicUsize>,
