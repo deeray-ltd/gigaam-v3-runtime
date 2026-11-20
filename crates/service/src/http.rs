@@ -258,23 +258,27 @@ async fn openai_transcribe(State(state): State<HttpState>, request: Request) -> 
         progress,
     };
     let result = execute_admitted_work(execution, move |control| {
-        let query = TranscribeQuery {
+        let request = BatchRequest {
             model: match input.engine {
                 crate::openai::Engine::Ctc => BatchModel::Ctc,
                 crate::openai::Engine::Rnnt => BatchModel::Rnnt,
             },
             extension: input.extension.clone(),
-            options: Options::default(),
-            response_version: ResponseVersion::V1,
+            audio,
+            channel_policy: http_batch_channel_policy(Options::default()),
+            turn_gap: TurnGap::new(Options::default().turn_gap)
+                .map_err(TranscribeError::BadRequest)?,
             vad: input.vad,
+            scored: input.segment,
+            downmix: true,
         };
+        let gap = request.turn_gap;
         let capabilities = &context.capabilities;
         let (batch, duration, _, _) = run_batch(
-            BatchWork {
+            BatchExecution {
                 context: &context,
                 metrics: &metrics,
-                query: &query,
-                bytes: audio,
+                request,
                 control,
                 progress: &work_progress,
             },
@@ -285,8 +289,6 @@ async fn openai_transcribe(State(state): State<HttpState>, request: Request) -> 
                     capabilities.intra_threads,
                 )
             },
-            input.segment,
-            true,
         )?;
         work_progress.stage(BatchStage::ResponseProjection, || {
             crate::openai_response::project(crate::openai_response::ProjectionInput {
@@ -295,7 +297,7 @@ async fn openai_transcribe(State(state): State<HttpState>, request: Request) -> 
                 format: input.format,
                 word: input.word,
                 segment: input.segment,
-                gap: TurnGap::new(query.options.turn_gap).map_err(TranscribeError::BadRequest)?,
+                gap,
             })
             .map_err(TranscribeError::Unavailable)
         })
@@ -1160,7 +1162,26 @@ fn do_transcribe_with_vad_factory<D: SpeechProbabilityDetector>(
     let query = work.query;
     let work_variant = work.context.capabilities.pack.variant().as_str();
     let progress = work.progress;
-    let (result, duration, source_rate, rtf) = run_batch(work, factory, false, false)?;
+    let request = BatchRequest {
+        model: query.model,
+        extension: query.extension.clone(),
+        audio: work.bytes,
+        channel_policy: http_batch_channel_policy(query.options),
+        turn_gap: TurnGap::new(query.options.turn_gap).map_err(TranscribeError::BadRequest)?,
+        vad: query.vad,
+        scored: false,
+        downmix: false,
+    };
+    let (result, duration, source_rate, rtf) = run_batch(
+        BatchExecution {
+            context: work.context,
+            metrics: work.metrics,
+            request,
+            control: work.control,
+            progress,
+        },
+        factory,
+    )?;
     let options = query.options;
     progress.stage(BatchStage::ResponseProjection, || {
         let response = transcribe_response(ResponseInput {
@@ -1184,17 +1205,44 @@ fn do_transcribe_with_vad_factory<D: SpeechProbabilityDetector>(
     })
 }
 
-fn run_batch<D: SpeechProbabilityDetector>(
-    work: BatchWork<'_>,
-    factory: impl FnOnce() -> Result<D, String>,
+// Transport-independent input to the shared decode and transcription path.
+struct BatchRequest {
+    model: BatchModel,
+    extension: Option<String>,
+    audio: Vec<u8>,
+    channel_policy: BatchChannelPolicy,
+    turn_gap: TurnGap,
+    vad: Option<VadPolicyConfig>,
     scored: bool,
     downmix: bool,
+}
+
+struct BatchExecution<'a> {
+    context: &'a ApplicationContext,
+    metrics: &'a Metrics,
+    request: BatchRequest,
+    control: &'a ExecutionControl,
+    progress: &'a RequestProgress,
+}
+
+fn run_batch<D: SpeechProbabilityDetector>(
+    work: BatchExecution<'_>,
+    factory: impl FnOnce() -> Result<D, String>,
 ) -> Result<(MultiChannelBatchResult, f32, u32, f32), TranscribeError> {
-    let BatchWork {
+    let BatchExecution {
         context,
         metrics,
-        query,
-        bytes,
+        request:
+            BatchRequest {
+                model,
+                extension,
+                audio,
+                channel_policy,
+                turn_gap,
+                vad,
+                scored,
+                downmix,
+            },
         control,
         progress,
     } = work;
@@ -1202,13 +1250,13 @@ fn run_batch<D: SpeechProbabilityDetector>(
         gigaam_model_package::ModelFamily::Ctc => BatchModel::Ctc,
         gigaam_model_package::ModelFamily::Rnnt => BatchModel::Rnnt,
     };
-    if query.model != selected {
+    if model != selected {
         return Err(TranscribeError::UnsupportedCapability(
             "requested model is not loaded".into(),
         ));
     }
     let scheduler = &context.capabilities.scheduler;
-    if query.vad.is_some() || scored {
+    if vad.is_some() || scored {
         if context
             .capabilities
             .frontend
@@ -1229,8 +1277,7 @@ fn run_batch<D: SpeechProbabilityDetector>(
             .ok_or_else(|| TranscribeError::UnsupportedCapability("VAD is not declared".into()))?;
     }
     let loaded = progress.stage(BatchStage::AudioDecode, || {
-        let encoded = EncodedAudio::new(bytes, query.extension.clone())
-            .map_err(TranscribeError::BadRequest)?;
+        let encoded = EncodedAudio::new(audio, extension).map_err(TranscribeError::BadRequest)?;
         load_bytes(encoded).map_err(|error| TranscribeError::BadRequest(error.to_string()))
     })?;
     let source_rate = loaded.sample_rate().hertz();
@@ -1249,9 +1296,6 @@ fn run_batch<D: SpeechProbabilityDetector>(
             .map_err(TranscribeError::BadRequest)
     })?;
     let audio = if downmix { mono_downmix(audio)? } else { audio };
-    let options = query.options;
-    let channel_policy = http_batch_channel_policy(options);
-    let turn_gap = TurnGap::new(options.turn_gap).map_err(TranscribeError::BadRequest)?;
     let batch_options = MultiChannelBatchOptions::new(channel_policy, turn_gap);
     let transcriber = MultiChannelBatchTranscriber::new(MultiChannelBatchSetup::new(
         BatchSetup {
@@ -1265,7 +1309,7 @@ fn run_batch<D: SpeechProbabilityDetector>(
     ))
     .map_err(TranscribeError::Unavailable)?;
     let started = Instant::now();
-    let result = match (query.vad, scored) {
+    let result = match (vad, scored) {
         (policy, true) => {
             let mut detector = request_vad(factory, control, progress)?;
             let result = progress.stage(BatchStage::BatchTranscription, || {
