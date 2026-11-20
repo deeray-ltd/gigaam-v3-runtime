@@ -179,24 +179,27 @@ fn with_runtime_owner<T, R>(
 
 /// Runs the process lifecycle and delegates application assembly to the crate facade.
 pub(super) fn run_process(
+    registry: gigaam_recognition::VadRegistry,
     assemble: impl FnOnce(
         ServiceApplicationParameters,
         Arc<Metrics>,
         PreparedTelemetry,
     ) -> Result<(Router, Arc<AdmissionState>), String>,
 ) {
-    if let Err(error) = run_scoped(assemble) {
+    if let Err(error) = run_scoped(registry, assemble) {
         fatal(&error);
     }
 }
 
 fn run_scoped(
+    registry: gigaam_recognition::VadRegistry,
     assemble: impl FnOnce(
         ServiceApplicationParameters,
         Arc<Metrics>,
         PreparedTelemetry,
     ) -> Result<(Router, Arc<AdmissionState>), String>,
 ) -> Result<(), String> {
+    let vad_provider = gigaam_recognition::process_vad_provider(&registry)?;
     let (startup, limits, pack) =
         continue_after_configuration(ProcessConfiguration::from_process(), open_model)?;
     let sample_rate_config = pack.frontend().sample_rate();
@@ -322,7 +325,8 @@ fn run_scoped(
             provider: startup.plan.device(),
             intra_threads: startup.plan.intra_threads(),
         })
-        .map_err(|error| format!("service capabilities: {error}"))?;
+        .map_err(|error| format!("service capabilities: {error}"))?
+        .with_vad_provider(vad_provider);
         let request_body_limit = limits.request_body_limit();
         let api_mode = limits.admission.api_mode();
         let admission = limits.admission;

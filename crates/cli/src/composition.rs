@@ -12,7 +12,8 @@ use gigaam_model_package::{
     VariantPackage,
 };
 use gigaam_recognition::{
-    DirectRecognizer, ExecutionControl, NativeRuntime, OrtEncoder, ProviderPlan, Vad, init_runtime,
+    DirectRecognizer, ExecutionControl, NativeRuntime, OrtEncoder, ProviderPlan,
+    SelectedVadProvider, VadContext, VadDetector, VadPackage, init_runtime,
 };
 use gigaam_transcription::{
     EndpointDetector, EndpointSource, OriginalChannel, StreamChannelFactory, StreamConfig,
@@ -276,13 +277,19 @@ pub(crate) fn ctc_encoder(
 /// Builds the package-selected CPU-only VAD capability.
 pub(crate) fn vad(
     package: &Package,
-    native: &NativeRuntime,
+    provider: &SelectedVadProvider,
+    native: Option<&NativeRuntime>,
     intra_threads: Option<NonZeroUsize>,
-) -> Result<Vad, String> {
-    match package {
-        Package::Legacy(pack) => Vad::from_pack(pack, native, intra_threads),
-        Package::Variant(pack) => Vad::from_variant(pack, native, intra_threads),
-    }
+) -> Result<VadDetector, String> {
+    let package = match package {
+        Package::Legacy(pack) => VadPackage::Legacy(pack),
+        Package::Variant(pack) => VadPackage::Variant(pack),
+    };
+    provider.create(VadContext {
+        package,
+        native_runtime: native,
+        intra_threads,
+    })
 }
 
 /// Creates channel-local direct-recognition stream capabilities for offline dialog execution.
@@ -292,6 +299,7 @@ pub(crate) struct DialogStreamFactory<'a> {
     native: &'a NativeRuntime,
     frontend: Arc<FrontendProcessor>,
     selection: CtcSelection,
+    vad_provider: &'a SelectedVadProvider,
 }
 
 impl<'a> DialogStreamFactory<'a> {
@@ -301,6 +309,7 @@ impl<'a> DialogStreamFactory<'a> {
         context: (&'a RuntimeConfig, &'a NativeRuntime),
         frontend: Arc<FrontendProcessor>,
         selection: CtcSelection,
+        vad_provider: &'a SelectedVadProvider,
     ) -> Self {
         let (runtime, native) = context;
         Self {
@@ -309,13 +318,14 @@ impl<'a> DialogStreamFactory<'a> {
             frontend,
             native,
             selection,
+            vad_provider,
         }
     }
 }
 
 impl StreamChannelFactory for DialogStreamFactory<'_> {
     type Decoder = DirectRecognizer;
-    type Detector = Vad;
+    type Detector = VadDetector;
 
     fn create_stream(
         &mut self,
@@ -357,8 +367,13 @@ impl StreamChannelFactory for DialogStreamFactory<'_> {
             EndpointSource::Manual => EndpointDetector::Manual,
             EndpointSource::Blank => EndpointDetector::Blank,
             EndpointSource::Vad => EndpointDetector::Vad(
-                vad(self.package, self.native, self.plan.intra_threads())
-                    .map_err(|error| format!("vad: {error}"))?,
+                vad(
+                    self.package,
+                    self.vad_provider,
+                    Some(self.native),
+                    self.plan.intra_threads(),
+                )
+                .map_err(|error| format!("vad: {error}"))?,
             ),
         };
         Ok(StreamSetup {

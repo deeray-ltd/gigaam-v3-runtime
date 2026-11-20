@@ -27,7 +27,10 @@ use std::sync::Arc;
 use std::time::Instant;
 
 /// Executes a complete direct batch transcription without a service scheduler.
-pub(crate) fn run(invocation: TranscribeInvocation) -> Result<(), String> {
+pub(crate) fn run(
+    invocation: TranscribeInvocation,
+    provider: &gigaam_recognition::SelectedVadProvider,
+) -> Result<(), String> {
     let variant = composition::resolve_variant(&invocation.runtime)?;
     let mode = configuration::decoding(&invocation.runtime)?;
     let decoder = selected_decoder(
@@ -103,9 +106,14 @@ pub(crate) fn run(invocation: TranscribeInvocation) -> Result<(), String> {
     let native = composition::initialize_runtime(&runtime)?;
     let mut vad = vad_policy
         .map(|policy| {
-            composition::vad(&package, &native, runtime.plan().intra_threads())
-                .map(|detector| (detector, policy))
-                .map_err(|error| format!("vad: {error}"))
+            composition::vad(
+                &package,
+                provider,
+                Some(&native),
+                runtime.plan().intra_threads(),
+            )
+            .map(|detector| (detector, policy))
+            .map_err(|error| format!("vad: {error}"))
         })
         .transpose()?;
     let frontend = composition::frontend_for_package(&package, frontend_mode)

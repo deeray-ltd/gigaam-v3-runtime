@@ -30,7 +30,7 @@ use axum::routing::{get, post};
 use gigaam_audio::{
     ChannelAudio, ChannelAudioView, DecodedAudio, EncodedAudio, load_bytes, resample_audio,
 };
-use gigaam_recognition::{ExecutionControl, ExecutionState, SpeechProbabilityDetector, Vad};
+use gigaam_recognition::{ExecutionControl, ExecutionState, SpeechProbabilityDetector};
 use gigaam_transcription::{
     BatchChannelPolicy, BatchSetup, MultiChannelBatchError, MultiChannelBatchOptions,
     MultiChannelBatchResult, MultiChannelBatchSetup, MultiChannelBatchTranscriber, TurnGap,
@@ -278,13 +278,7 @@ async fn openai_transcribe(State(state): State<HttpState>, request: Request) -> 
                 control,
                 progress: &work_progress,
             },
-            || {
-                Vad::from_variant(
-                    &capabilities.pack,
-                    capabilities.native_runtime()?,
-                    capabilities.intra_threads,
-                )
-            },
+            || capabilities.vad_provider.create(capabilities.vad_context()),
             input.segment,
             true,
         )?;
@@ -1143,11 +1137,7 @@ struct BatchWork<'a> {
 fn do_transcribe(work: BatchWork<'_>) -> Result<String, TranscribeError> {
     let capabilities = &work.context.capabilities;
     do_transcribe_with_vad_factory(work, || {
-        Vad::from_variant(
-            &capabilities.pack,
-            capabilities.native_runtime()?,
-            capabilities.intra_threads,
-        )
+        capabilities.vad_provider.create(capabilities.vad_context())
     })
 }
 
@@ -1223,10 +1213,9 @@ fn run_batch<D: SpeechProbabilityDetector>(
         }
         context
             .capabilities
-            .pack
-            .vad_model()
-            .map_err(|error| TranscribeError::UnsupportedCapability(error.to_string()))?
-            .ok_or_else(|| TranscribeError::UnsupportedCapability("VAD is not declared".into()))?;
+            .vad_provider
+            .preflight(context.capabilities.vad_context())
+            .map_err(TranscribeError::UnsupportedCapability)?;
     }
     let loaded = progress.stage(BatchStage::AudioDecode, || {
         let encoded = EncodedAudio::new(bytes, query.extension.clone())
@@ -1427,6 +1416,30 @@ mod tests {
     impl SpeechProbabilityDetector for SilentVad {
         fn probabilities(&mut self, samples: ChannelAudioView<'_>) -> Result<Vec<f32>, String> {
             Ok(vec![0.0; samples.samples().len().div_ceil(512)])
+        }
+    }
+
+    struct InjectedProvider;
+    impl gigaam_recognition::VadProvider for InjectedProvider {
+        fn id(&self) -> &'static str {
+            "injected"
+        }
+        fn preflight(&self, context: gigaam_recognition::VadContext<'_>) -> Result<(), String> {
+            match context.package {
+                gigaam_recognition::VadPackage::Variant(pack) => {
+                    pack.vad_model()
+                        .map_err(|e| e.to_string())?
+                        .ok_or_else(|| "missing test asset".to_owned())?;
+                    Ok(())
+                }
+                _ => Err("unexpected test package".into()),
+            }
+        }
+        fn create(
+            &self,
+            _: gigaam_recognition::VadContext<'_>,
+        ) -> Result<Box<dyn SpeechProbabilityDetector + Send>, String> {
+            Ok(Box::new(SilentVad))
         }
     }
 
@@ -1950,6 +1963,9 @@ mod tests {
             provider: Device::Cpu,
             intra_threads: None,
         })?;
+        let mut registry = gigaam_recognition::VadRegistry::with_silero();
+        registry.register(Arc::new(InjectedProvider))?;
+        let capabilities = capabilities.with_vad_provider(registry.select("injected")?);
         let policy = ServicePolicy::new(ServicePolicyParameters {
             model_sample_rate: fixture.frontend.sample_rate(),
             window_seconds: 1.0,
