@@ -249,20 +249,24 @@ pub fn select_batch_channels(
     policy: BatchChannelPolicy,
 ) -> Result<BatchChannelSelection, String> {
     let source_channels = SourceChannelCount::new(channels.len())?;
-    select_batch_by(source_channels, policy, |first, second| {
-        channel_correlation(channels[first.index()], channels[second.index()])
-    })
+    select_batch_by(
+        source_channels,
+        policy,
+        |first, second| channel_correlation(channels[first.index()], channels[second.index()]),
+        std::convert::identity,
+    )
 }
 
-fn select_batch_by(
+pub(crate) fn select_batch_by<E>(
     source_channels: SourceChannelCount,
     policy: BatchChannelPolicy,
-    correlation: impl FnOnce(OriginalChannel, OriginalChannel) -> Result<f64, String>,
-) -> Result<BatchChannelSelection, String> {
+    correlation: impl FnOnce(OriginalChannel, OriginalChannel) -> Result<f64, E>,
+    invalid_selection: impl Fn(String) -> E,
+) -> Result<BatchChannelSelection, E> {
     let duplicate = match source_channels.get() {
         2 => {
-            let first = OriginalChannel::new(0, source_channels)?;
-            let second = OriginalChannel::new(1, source_channels)?;
+            let first = OriginalChannel::new(0, source_channels).map_err(&invalid_selection)?;
+            let second = OriginalChannel::new(1, source_channels).map_err(&invalid_selection)?;
             if correlation(first, second)? > FIXED_DUPLICATE_THRESHOLD.0 {
                 DuplicateClassification::DualMono
             } else {
@@ -275,10 +279,10 @@ fn select_batch_by(
         (DuplicateClassification::DualMono, BatchProjection::SingleOutput)
         | (DuplicateClassification::DualMono, BatchProjection::SeparateChannels)
         | (DuplicateClassification::NotDualMono, BatchProjection::SingleOutput) => {
-            ChannelSelection::first(source_channels)?
+            ChannelSelection::first(source_channels).map_err(&invalid_selection)?
         }
         (DuplicateClassification::NotDualMono, BatchProjection::SeparateChannels) => {
-            ChannelSelection::all(source_channels)?
+            ChannelSelection::all(source_channels).map_err(&invalid_selection)?
         }
     };
     Ok(BatchChannelSelection {
@@ -412,16 +416,41 @@ mod tests {
     }
 
     #[test]
+    fn batch_selection_preserves_the_correlation_failure_kind() -> Result<(), String> {
+        #[derive(Debug, PartialEq)]
+        enum Failure {
+            InvalidSelection,
+            Storage,
+        }
+        let result = select_batch_by(
+            SourceChannelCount::new(2)?,
+            BatchChannelPolicy::separate_channels(),
+            |_, _| Err(Failure::Storage),
+            |_| Failure::InvalidSelection,
+        );
+        assert_eq!(
+            result.expect_err("correlation must fail selection"),
+            Failure::Storage
+        );
+        Ok(())
+    }
+
+    #[test]
     fn batch_fixed_threshold_retains_equality_and_suppresses_strict_exceedance()
     -> Result<(), String> {
         let source = SourceChannelCount::new(2)?;
-        let retained = select_batch_by(source, BatchChannelPolicy::separate_channels(), |_, _| {
-            Ok(0.98)
-        })?;
-        let suppressed =
-            select_batch_by(source, BatchChannelPolicy::separate_channels(), |_, _| {
-                Ok(0.980_000_000_1)
-            })?;
+        let retained = select_batch_by(
+            source,
+            BatchChannelPolicy::separate_channels(),
+            |_, _| Ok(0.98),
+            std::convert::identity,
+        )?;
+        let suppressed = select_batch_by(
+            source,
+            BatchChannelPolicy::separate_channels(),
+            |_, _| Ok(0.980_000_000_1),
+            std::convert::identity,
+        )?;
 
         assert_eq!(retained.duplicate(), DuplicateClassification::NotDualMono);
         assert_eq!(indices(retained.selection()), vec![0, 1]);

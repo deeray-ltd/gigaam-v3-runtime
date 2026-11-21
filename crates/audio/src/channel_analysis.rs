@@ -47,6 +47,14 @@ pub fn channel_correlation(
         left_energy += left_delta * left_delta;
         right_energy += right_delta * right_delta;
     }
+    finish_correlation(numerator, left_energy, right_energy)
+}
+
+pub(crate) fn finish_correlation(
+    numerator: f64,
+    left_energy: f64,
+    right_energy: f64,
+) -> Result<f64, String> {
     let denominator = (left_energy * right_energy).sqrt();
     if denominator == 0.0 {
         return Ok(0.0);

@@ -548,6 +548,22 @@ impl WindowDecoder for Box<dyn WindowDecoder> {
 /// The Audio view carries no rate, so callers must establish the fixed rate before execution.
 pub trait SpeechProbabilityDetector {
     fn probabilities(&mut self, audio: ChannelAudioView<'_>) -> Result<Vec<f32>, String>;
+
+    /// Processes one independent 16 kHz waveform with workspace independent of its length.
+    ///
+    /// `read` fills each supplied nonempty slice with consecutive samples up to `audio_length`.
+    /// `emit` receives consecutive nonempty probability slices in frame order, totaling exactly
+    /// `audio_length.div_ceil(512)` on success. Empty input requires neither callback. Callback
+    /// errors end processing, and any previously emitted probabilities are provisional on error.
+    /// Providers without bounded execution can continue to implement the complete-waveform method.
+    fn probabilities_bounded(
+        &mut self,
+        _audio_length: usize,
+        _read: &mut dyn FnMut(&mut [f32]) -> Result<(), String>,
+        _emit: &mut dyn FnMut(&[f32]) -> Result<(), String>,
+    ) -> Result<(), String> {
+        Err("selected VAD detector does not support bounded waveform processing".into())
+    }
 }
 
 #[cfg(test)]

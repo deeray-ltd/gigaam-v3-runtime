@@ -20,7 +20,7 @@
 use crate::grammar::EvidenceVersion;
 use gigaam_recognition::{Token, vad::VAD_SR};
 use gigaam_transcription::{
-    DuplicateClassification, MultiChannelBatchResult, VadPolicyConfig, WindowEvidence,
+    BatchChannelSelection, DuplicateClassification, VadPolicyConfig, WindowEvidence,
     WindowEvidenceObserver, WindowKind,
 };
 use std::collections::BTreeMap;
@@ -155,7 +155,7 @@ impl EvidenceWriter {
 
     /// Flushes the file and returns the first window-write failure observed during decoding, if
     /// any occurred.
-    pub(crate) fn finish(&self, result: &MultiChannelBatchResult) -> Result<(), String> {
+    pub(crate) fn finish(&self, result: &BatchChannelSelection) -> Result<(), String> {
         if let Some(failure) = self
             .failure
             .lock()
@@ -172,9 +172,10 @@ impl EvidenceWriter {
             EvidenceVersion::V1 => writer.flush(),
             EvidenceVersion::V2 | EvidenceVersion::V3 => {
                 let selected = result
+                    .selection()
                     .channels()
                     .iter()
-                    .map(|channel| channel.channel())
+                    .map(|channel| channel.index())
                     .collect::<Vec<_>>();
                 let counts = self
                     .emitted_windows

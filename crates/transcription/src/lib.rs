@@ -10,6 +10,7 @@
 //! Batch and streaming transcription application contracts.
 
 mod batch;
+mod batch_replay;
 mod channel_selection;
 mod contracts;
 mod dialog;
@@ -19,16 +20,20 @@ mod multi_stream;
 mod observations;
 mod padding;
 mod sample_windows;
+mod scratch;
 mod stitch;
 mod stream;
 mod text;
 mod turns;
 mod vad_policy;
+mod word_lines;
+mod word_records;
 
 #[cfg(test)]
 mod test_support;
 
 pub use batch::{BatchSetup, BatchTranscriber, subsampling_factor};
+pub use batch_replay::ReplayObservations;
 pub use channel_selection::{
     BatchChannelPolicy, BatchChannelSelection, ChannelSelection, CorrelationThreshold,
     DuplicateClassification, OriginalChannel, PairwiseChannelPolicy, SelectionWindowSamples,
@@ -59,6 +64,7 @@ pub use observations::{
     ObservationMode, WindowEvidence, WindowEvidenceObserver, WindowKind, WindowTiming,
     WindowTimingObserver,
 };
+pub use scratch::{ScratchFile, ScratchSpace};
 pub use stitch::{
     Seam, Window, WindowWords, seam, stitch_aligned, window_shapes, windows, windows_bucketed,
     words_to_text,
@@ -69,3 +75,5 @@ pub use turns::{ChannelTranscript, ScoredSegment, TurnGap, dialog_text, merge, t
 pub use vad_policy::{
     SpeechSegment, VadDurations, VadPadding, VadPolicyConfig, VadThresholds, speech_segments,
 };
+pub use word_lines::{ChannelLines, StoredLine, TurnLines};
+pub use word_records::{StoredWords, WordCursor, WordRecords};

@@ -9,7 +9,12 @@
 
 //! Final batch dialogue ordering and turn construction.
 
-use crate::contracts::{ChannelWord, TranscriptWord, Turn};
+use crate::contracts::{ChannelWord, TranscriptWord, Turn, WordProvenance};
+use crate::word_records::StoredWords;
+use std::{
+    io::{Read, Seek},
+    sync::Arc,
+};
 
 /// A chronological final transcript belonging to one original audio channel.
 #[derive(Clone, Debug, PartialEq)]
@@ -43,73 +48,13 @@ impl ChannelTranscript {
         let mut segments = Vec::new();
         let mut first = 0;
         while first < self.words.len() {
-            let owner = self.words[first]
-                .provenance
-                .as_ref()
-                .ok_or_else(|| "missing word provenance".to_owned())?;
             let mut end = first + 1;
-            while end < self.words.len() {
-                let next = self.words[end]
-                    .provenance
-                    .as_ref()
-                    .ok_or_else(|| "missing word provenance".to_owned())?;
-                if !std::sync::Arc::ptr_eq(&owner.window, &next.window) {
-                    break;
-                }
-                let previous = self.words[end - 1]
-                    .provenance
-                    .as_ref()
-                    .ok_or_else(|| "missing word provenance".to_owned())?;
-                if previous.last >= next.first {
-                    return Err("overlapping or out-of-order token spans".into());
-                }
-                if self.words[end].start() - self.words[end - 1].end() > gap.seconds() {
-                    break;
-                }
+            while end < self.words.len()
+                && share_scored_segment(&self.words[end - 1], &self.words[end], gap)?
+            {
                 end += 1;
             }
-            let last = self.words[end - 1]
-                .provenance
-                .as_ref()
-                .ok_or_else(|| "missing word provenance".to_owned())?;
-            if owner.first > last.last {
-                return Err("inconsistent token span".into());
-            }
-            let tokens = owner
-                .window
-                .tokens
-                .get(owner.first..=last.last)
-                .ok_or_else(|| "token span outside window".to_owned())?
-                .to_vec();
-            let mut sum = 0.0;
-            for token in &tokens {
-                sum += token
-                    .log_probability()
-                    .ok_or_else(|| "missing token score".to_owned())?;
-            }
-            let count =
-                u32::try_from(tokens.len()).map_err(|_| "token count overflows".to_owned())?;
-            if count == 0 {
-                return Err("empty scored token span".into());
-            }
-            let seek = owner
-                .window
-                .origin
-                .checked_mul(100)
-                .ok_or_else(|| "window seek overflows".to_owned())?
-                / owner.window.sample_rate;
-            segments.push(ScoredSegment {
-                start: self.words[first].start(),
-                end: self.words[first..end]
-                    .iter()
-                    .map(TranscriptWord::end)
-                    .fold(self.words[first].end(), f32::max),
-                text: crate::contracts::words_to_text(&self.words[first..end]),
-                tokens,
-                seek,
-                no_speech_probability: owner.window.no_speech_probability,
-                average_log_probability: sum / f64::from(count),
-            });
+            segments.push(scored_segment(&self.words[first..end])?);
             first = end;
         }
         Ok(segments)
@@ -118,6 +63,101 @@ impl ChannelTranscript {
     pub fn into_words(self) -> Vec<TranscriptWord> {
         self.words
     }
+}
+
+impl<F: Read + Seek> StoredWords<F> {
+    /// Replays scored segments from one channel, retaining only the current
+    /// segment's words and at most one lookahead word from the next window.
+    pub fn replay_scored_segments(
+        &mut self,
+        channel: usize,
+        gap: TurnGap,
+        mut emit: impl FnMut(ScoredSegment) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let mut cursor = self.cursor(channel)?;
+        let mut group = Vec::new();
+        while let Some(word) = self.next(&mut cursor)? {
+            if let Some(previous) = group.last()
+                && !share_scored_segment(previous, &word, gap)?
+            {
+                emit(scored_segment(&group)?)?;
+                group.clear();
+            }
+            group.push(word);
+        }
+        if !group.is_empty() {
+            emit(scored_segment(&group)?)?;
+        }
+        Ok(())
+    }
+}
+
+fn word_provenance(word: &TranscriptWord) -> Result<&WordProvenance, String> {
+    word.provenance
+        .as_ref()
+        .ok_or_else(|| "missing word provenance".to_owned())
+}
+
+fn share_scored_segment(
+    previous: &TranscriptWord,
+    next: &TranscriptWord,
+    gap: TurnGap,
+) -> Result<bool, String> {
+    let previous_time = previous.end();
+    let next_time = next.start();
+    let previous = word_provenance(previous)?;
+    let next = word_provenance(next)?;
+    if !Arc::ptr_eq(&previous.window, &next.window) {
+        return Ok(false);
+    }
+    if previous.last >= next.first {
+        return Err("overlapping or out-of-order token spans".into());
+    }
+    Ok(next_time - previous_time <= gap.seconds())
+}
+
+fn scored_segment(words: &[TranscriptWord]) -> Result<ScoredSegment, String> {
+    let first_word = words.first().ok_or("empty scored word group")?;
+    let last_word = words.last().ok_or("empty scored word group")?;
+    let owner = word_provenance(first_word)?;
+    let last = word_provenance(last_word)?;
+    if owner.first > last.last {
+        return Err("inconsistent token span".into());
+    }
+    let tokens = owner
+        .window
+        .tokens
+        .get(owner.first..=last.last)
+        .ok_or_else(|| "token span outside window".to_owned())?
+        .to_vec();
+    let mut sum = 0.0;
+    for token in &tokens {
+        sum += token
+            .log_probability()
+            .ok_or_else(|| "missing token score".to_owned())?;
+    }
+    let count = u32::try_from(tokens.len()).map_err(|_| "token count overflows".to_owned())?;
+    if count == 0 {
+        return Err("empty scored token span".into());
+    }
+    let seek = owner
+        .window
+        .origin
+        .checked_mul(100)
+        .ok_or_else(|| "window seek overflows".to_owned())?
+        / owner.window.sample_rate;
+    Ok(ScoredSegment {
+        start: first_word.start(),
+        end: words
+            .iter()
+            .map(TranscriptWord::end)
+            .fold(first_word.end(), f32::max),
+        text: crate::contracts::words_to_text(words),
+        tokens,
+        seek,
+        no_speech_probability: owner.window.no_speech_probability,
+        average_log_probability: sum / f64::from(count),
+    })
 }
 
 /// A retained word group with native occurrence scores and source-window diagnostics.
@@ -415,7 +455,7 @@ mod tests {
             first: 0,
             last: 0,
         });
-        let mut b = TranscriptWord::new("b".into(), 0.2, 0.3)?;
+        let mut b = TranscriptWord::new("b".into(), 0.225, 0.3)?;
         b.provenance = Some(WordProvenance {
             window: owner,
             first: 2,
@@ -427,8 +467,21 @@ mod tests {
             first: 0,
             last: 0,
         });
-        let segments =
-            ChannelTranscript::new(0, vec![a, b, c])?.scored_segments(TurnGap::new(1.0)?)?;
+        let channel = ChannelTranscript::new(0, vec![a, b, c])?;
+        let segments = channel.scored_segments(TurnGap::new(1.0)?)?;
+        let mut records = crate::WordRecords::new(std::io::Cursor::new(Vec::new()), 1)?;
+        for item in channel.words() {
+            records.push(0, item.clone())?;
+        }
+        let mut words = records.finish()?;
+        for gap in [TurnGap::new(1.0)?, TurnGap::new(0.0)?] {
+            let mut replayed = Vec::new();
+            words.replay_scored_segments(0, gap, |segment| {
+                replayed.push(segment);
+                Ok(())
+            })?;
+            assert_eq!(replayed, channel.scored_segments(gap)?);
+        }
         assert_eq!(segments.len(), 2);
         assert_eq!(
             segments[0]

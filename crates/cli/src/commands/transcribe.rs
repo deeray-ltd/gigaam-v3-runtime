@@ -4,7 +4,6 @@
 
 //! Offline batch-transcription command adapter.
 
-use crate::audio_io::load;
 use crate::composition;
 use crate::composition::Package;
 use crate::configuration;
@@ -16,13 +15,15 @@ use crate::projection::{
     self, EvidenceAudioHeader, EvidenceModelHeader, EvidenceWriter, TranscribeSummary,
     evidence_token,
 };
-use gigaam_primitives::f64_to_f32;
+use gigaam_audio::{ReplayAudio, ReplayError};
+use gigaam_primitives::{f64_to_f32, u32_to_f32, usize_to_f32};
 use gigaam_recognition::{ExecutionControl, FrameRate, RequiredEncoderRoles, vad::VAD_SR};
 use gigaam_transcription::{
     BatchChannelPolicy, BatchConfig, BatchSetup, MultiChannelBatchOptions, MultiChannelBatchSetup,
-    MultiChannelBatchTranscriber, TurnGap, WindowEvidenceObserver, subsampling_factor,
+    MultiChannelBatchTranscriber, ReplayObservations, ScratchSpace, TurnGap,
+    WindowEvidenceObserver, WordRecords, subsampling_factor,
 };
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -79,10 +80,9 @@ pub(crate) fn run(
     let vad_policy = invocation.vad.map(|policy| policy.bind()).transpose()?;
     let runtime = configuration::runtime(&invocation.runtime, required_roles)
         .map_err(|error| format!("runtime configuration: {error}"))?;
-    let options = MultiChannelBatchOptions::new(
-        batch_channel_policy(invocation.output),
-        TurnGap::new(invocation.turn_gap_seconds)?,
-    );
+    let turn_gap = TurnGap::new(invocation.turn_gap_seconds)?;
+    let options = MultiChannelBatchOptions::new(batch_channel_policy(invocation.output), turn_gap);
+    let scratch = scratch_space()?;
     let trace_mode = configuration::trace_mode()?;
     let started = Instant::now();
     let frontend_mode =
@@ -190,50 +190,89 @@ pub(crate) fn run(
         .map_err(|error| format!("warmup: {error}"))?;
     let loading_elapsed = started.elapsed();
 
-    let loaded = load(&invocation.input)?;
-    let source_rate = loaded.sample_rate().hertz();
-    let audio = composition::resample_to(loaded, config.sample_rate())
-        .map_err(|error| format!("resample: {error}"))?;
+    let loaded = crate::audio_io::open(&invocation.input)?;
+    let source_rate = loaded.metadata().sample_rate().hertz();
+    let mut audio = ReplayAudio::prepare(
+        loaded,
+        scratch.create().map_err(scratch_error)?,
+        config.sample_rate(),
+        false,
+        || Ok(()),
+    )
+    .map_err(|error| match error {
+        ReplayError::Audio(message) | ReplayError::Cancelled(message) => message,
+        ReplayError::Storage(error) => scratch_error(error),
+    })?;
+    let duration = usize_to_f32(audio.frames()) / u32_to_f32(audio.sample_rate().hertz());
     if let Some(evidence) = &evidence {
         let audio_name = evidence_token(&invocation.input, "audio")?;
         evidence.write_audio_header(EvidenceAudioHeader {
             audio_name: &audio_name,
             sample_rate: audio.sample_rate().hertz(),
             samples: audio.frames(),
-            total_seconds: audio.duration_seconds(),
+            total_seconds: duration,
         })?;
         evidence.write_vad_policy(vad_policy)?;
     }
-    let inference_started = Instant::now();
-    let result = match &mut vad {
-        Some((detector, policy)) => transcriber.transcribe_with_vad(&audio, detector, *policy),
-        None => transcriber.transcribe(&audio),
-    }
-    .map_err(|error| error.to_string())?;
-    let inference_elapsed = inference_started.elapsed();
-    if let Some(evidence) = &evidence {
-        evidence.finish(&result)?;
-    }
-    projection::transcribe(TranscribeSummary {
-        result: &result,
-        audio: &audio,
-        source_rate,
-        config,
-        output: invocation.output,
-        precision: effective_precision,
-        rnnt_head_precision: match decoder_choice {
-            DecoderChoice::Ctc => None,
-            DecoderChoice::Rnnt => {
-                Some(rnnt_precision.unwrap_or(gigaam_recognition::RnntPrecisionSelection::Fp32))
-            }
-        },
-        window_seconds: invocation.window_seconds,
-        overlap_seconds: invocation.overlap_seconds,
-        loading_elapsed,
-        inference_elapsed,
-        vad_policy,
+    let mut records = WordRecords::new(scratch.create().map_err(scratch_error)?, audio.channels())?;
+    let observation = vad.as_mut().map(|(detector, policy)| ReplayObservations {
+        detector,
+        policy: Some(*policy),
+        scored: false,
     });
-    Ok(())
+    let inference_started = Instant::now();
+    let (selection, timings) = transcriber
+        .transcribe_replay(
+            &mut audio,
+            observation,
+            || scratch.create(),
+            |channel, word| records.push(channel.index(), word),
+        )
+        .map_err(|error| error.to_string())?;
+    let inference_elapsed = inference_started.elapsed();
+    let mut words = records.finish()?;
+    drop(audio);
+    if let Some(evidence) = &evidence {
+        evidence.finish(&selection)?;
+    }
+    projection::transcribe(
+        TranscribeSummary {
+            selection: &selection,
+            timings,
+            duration,
+            source_rate,
+            config,
+            output: invocation.output,
+            turn_gap,
+            precision: effective_precision,
+            rnnt_head_precision: match decoder_choice {
+                DecoderChoice::Ctc => None,
+                DecoderChoice::Rnnt => {
+                    Some(rnnt_precision.unwrap_or(gigaam_recognition::RnntPrecisionSelection::Fp32))
+                }
+            },
+            window_seconds: invocation.window_seconds,
+            overlap_seconds: invocation.overlap_seconds,
+            loading_elapsed,
+            inference_elapsed,
+            vad_policy,
+        },
+        &mut words,
+    )
+}
+
+fn scratch_space() -> Result<ScratchSpace, String> {
+    let directory = std::env::var_os("ASR_BATCH_SCRATCH_DIR").map(PathBuf::from);
+    let limit = match std::env::var("ASR_BATCH_SCRATCH_MAX_BYTES") {
+        Ok(value) => Some(value),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(error) => return Err(format!("ASR_BATCH_SCRATCH_MAX_BYTES: {error}")),
+    };
+    ScratchSpace::from_settings(directory, limit.as_deref()).map_err(scratch_error)
+}
+
+fn scratch_error(error: std::io::Error) -> String {
+    format!("batch scratch storage: {error}")
 }
 
 struct DecoderAssertions {

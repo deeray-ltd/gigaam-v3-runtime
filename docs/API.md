@@ -339,6 +339,13 @@ the stream session opens, the server sends only a close frame: no transcript, en
 open-session access record exists yet. A post-upgrade application error normally sends error
 and then a close frame without a close code or reason.
 
+Embedded VAD providers used for batch segmentation or scored batch output implement
+`SpeechProbabilityDetector::probabilities_bounded`. The implementation consumes consecutive
+16 kHz samples through the read callback and emits probabilities in 512-sample frame order,
+including the last partial frame. Providers offering only complete-waveform execution remain
+available to callers using that interface. A bounded batch request using such a provider
+receives an explicit refusal.
+
 ## Offline CLI
 
 The asr executable has exactly five commands. Each command places its required input file
@@ -381,6 +388,14 @@ asr dialog FILE [--model DIR] [--variant ID] [--ep cpu|cuda|tensorrt] [--ort-dyl
 | stream | chunk-ms is 100 and positive; horizon is 4 seconds; --events prints event projections. All streaming policy controls below are supported. |
 | vad | threshold is 0.5; neg-threshold is 0.35; both are finite in 0 through 1 and neg-threshold cannot exceed threshold; min-speech-ms and min-silence-ms default to 250 and 100; speech-pad-ms defaults to 30. All durations accept finite nonnegative fractional milliseconds, including zero. Without --channels only physical channel 0 is processed; explicit selection accepts all or unique comma-separated zero-based physical indices. |
 | dialog | turn-gap is 0.8 seconds and positive; horizon is 5 seconds; --no-dedup disables offline dialog deduplication; backchannel-max-ms defaults to 0 and is nonnegative. All streaming policy controls below are supported. |
+
+`transcribe` uses temporary storage for decoded model-rate audio and intermediate results.
+`ASR_BATCH_SCRATCH_DIR` selects an existing writable directory; when omitted, the system
+temporary directory is used. `ASR_BATCH_SCRATCH_MAX_BYTES` sets a positive byte limit shared
+by the command's temporary files and defaults to 8 GiB. Files are unlinked after creation
+and released when their owners close. The directory and accounts able to replace its entries
+must be trusted. Storage exhaustion or I/O failure fails the command. Container decoders may
+retain format-specific indexes, so this does not bound all memory independently of input length.
 
 ### Streaming CLI policy
 

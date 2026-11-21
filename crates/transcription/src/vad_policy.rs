@@ -238,30 +238,52 @@ pub(crate) fn segments_from_probabilities(
     audio_length: usize,
     config: VadPolicyConfig,
 ) -> Result<Vec<SpeechSegment>, String> {
-    let expected = audio_length.div_ceil(HOP_SAMPLES);
-    if probabilities.len() != expected {
-        return Err(format!(
-            "speech detector returned {} probabilities, expected {expected} for {audio_length} samples",
-            probabilities.len()
-        ));
+    let mut segmenter = VadSegmenter::new(audio_length, config);
+    segmenter.validate_coverage(probabilities.len())?;
+    let mut segments = Vec::new();
+    for &probability in probabilities {
+        segments.extend(segmenter.push(probability)?);
     }
-    let minimum_speech = config.durations.minimum_speech_samples().get();
-    let minimum_silence = config.durations.minimum_silence_samples().get();
-    let padding = config.padding.one_sided_samples().get();
-    let doubled_padding = config.padding.doubled_samples().get();
+    segments.extend(segmenter.finish()?.into_iter().flatten());
+    Ok(segments)
+}
 
-    let mut raw = Vec::new();
-    let mut state = DetectionState::Idle;
-    for (index, &probability) in probabilities.iter().enumerate() {
+/// Applies the same policy to one probability per 512 samples. The most recent
+/// accepted segment waits for the next accepted segment or EOF to bound its padding.
+pub(crate) struct VadSegmenter {
+    audio_length: usize,
+    expected_frames: usize,
+    frames: usize,
+    config: VadPolicyConfig,
+    state: DetectionState,
+    pending: Option<SpeechSegment>,
+}
+
+impl VadSegmenter {
+    pub(crate) fn new(audio_length: usize, config: VadPolicyConfig) -> Self {
+        Self {
+            audio_length,
+            expected_frames: audio_length.div_ceil(HOP_SAMPLES),
+            frames: 0,
+            config,
+            state: DetectionState::Idle,
+            pending: None,
+        }
+    }
+
+    pub(crate) fn push(&mut self, probability: f32) -> Result<Option<SpeechSegment>, String> {
+        if self.frames == self.expected_frames {
+            return Err(self.coverage_error(self.frames + 1));
+        }
         validate_probability_value(probability)?;
-        let current_sample = index
-            .checked_mul(HOP_SAMPLES)
-            .ok_or_else(|| "VAD probability frame offset overflows".to_owned())?;
-        let mut closure = None;
+        // Each accepted frame starts strictly before the declared input end.
+        let current_sample = self.frames * HOP_SAMPLES;
+        self.frames += 1;
 
-        match &mut state {
-            DetectionState::Idle if probability >= config.thresholds.speech.get() => {
-                state = DetectionState::Speech {
+        let mut closure = None;
+        match &mut self.state {
+            DetectionState::Idle if probability >= self.config.thresholds.speech.get() => {
+                self.state = DetectionState::Speech {
                     start_sample: current_sample,
                     tentative_end_sample: None,
                 };
@@ -270,110 +292,112 @@ pub(crate) fn segments_from_probabilities(
             DetectionState::Speech {
                 tentative_end_sample,
                 ..
-            } if probability >= config.thresholds.speech.get() => {
+            } if probability >= self.config.thresholds.speech.get() => {
                 *tentative_end_sample = None;
             }
             DetectionState::Speech {
                 start_sample,
                 tentative_end_sample,
-            } if probability < config.thresholds.silence.get() => {
-                let end_sample = tentative_end_sample.get_or_insert(current_sample);
-                let silence = current_sample
-                    .checked_sub(*end_sample)
-                    .ok_or_else(|| "VAD silence interval underflows".to_owned())?;
-                if silence >= minimum_silence {
-                    closure = Some((*start_sample, *end_sample));
+            } if probability < self.config.thresholds.silence.get() => {
+                let end_sample = *tentative_end_sample.get_or_insert(current_sample);
+                let silence = current_sample - end_sample;
+                if silence >= self.config.durations.minimum_silence_samples().get() {
+                    closure = Some((*start_sample, end_sample));
                 }
             }
             DetectionState::Speech { .. } => {}
         }
 
         if let Some((start_sample, end_sample)) = closure {
-            let speech = end_sample
-                .checked_sub(start_sample)
-                .ok_or_else(|| "VAD speech interval underflows".to_owned())?;
-            if speech > minimum_speech {
-                raw.push(SpeechSegment::new(start_sample, end_sample, audio_length)?);
+            self.state = DetectionState::Idle;
+            self.accept_segment(start_sample, end_sample)
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Checks complete coverage and emits up to two final segments in order.
+    pub(crate) fn finish(mut self) -> Result<[Option<SpeechSegment>; 2], String> {
+        self.validate_coverage(self.frames)?;
+        // An unconfirmed silence boundary keeps the final speech open to EOF.
+        let previous = match self.state {
+            DetectionState::Speech { start_sample, .. } => {
+                self.accept_segment(start_sample, self.audio_length)?
             }
-            state = DetectionState::Idle;
+            DetectionState::Idle => None,
+        };
+        let padding = self.config.padding.one_sided_samples().get();
+        let last = self
+            .pending
+            .map(|segment| self.with_right_padding(segment, padding))
+            .transpose()?;
+        Ok([previous, last])
+    }
+
+    fn accept_segment(
+        &mut self,
+        start_sample: usize,
+        end_sample: usize,
+    ) -> Result<Option<SpeechSegment>, String> {
+        if end_sample - start_sample <= self.config.durations.minimum_speech_samples().get() {
+            return Ok(None);
+        }
+        let padding = self.config.padding.one_sided_samples().get();
+        let (left_padding, emitted) = if let Some(previous) = self.pending {
+            let silence = start_sample
+                .checked_sub(previous.end_sample)
+                .ok_or_else(|| "VAD segments overlap before padding".to_owned())?;
+            let shared = if silence < self.config.padding.doubled_samples().get() {
+                silence / 2
+            } else {
+                padding
+            };
+            (shared, Some(self.with_right_padding(previous, shared)?))
+        } else {
+            (padding, None)
+        };
+
+        self.pending = Some(SpeechSegment::new(
+            start_sample.saturating_sub(left_padding),
+            end_sample,
+            self.audio_length,
+        )?);
+        Ok(emitted)
+    }
+
+    fn with_right_padding(
+        &self,
+        segment: SpeechSegment,
+        padding: usize,
+    ) -> Result<SpeechSegment, String> {
+        SpeechSegment::new(
+            segment.start_sample,
+            segment
+                .end_sample
+                .saturating_add(padding)
+                .min(self.audio_length),
+            self.audio_length,
+        )
+    }
+
+    fn validate_coverage(&self, frames: usize) -> Result<(), String> {
+        if frames == self.expected_frames {
+            Ok(())
+        } else {
+            Err(self.coverage_error(frames))
         }
     }
 
-    if let DetectionState::Speech { start_sample, .. } = state {
-        let speech = audio_length
-            .checked_sub(start_sample)
-            .ok_or_else(|| "VAD terminal speech interval underflows".to_owned())?;
-        if speech > minimum_speech {
-            raw.push(SpeechSegment::new(
-                start_sample,
-                audio_length,
-                audio_length,
-            )?);
-        }
+    fn coverage_error(&self, frames: usize) -> String {
+        format!(
+            "speech detector returned {frames} probabilities, expected {} for {} samples",
+            self.expected_frames, self.audio_length
+        )
     }
-
-    apply_padding(raw, padding, doubled_padding, audio_length)
 }
 
 fn fixed_vad_sample_rate() -> Result<SampleRate, String> {
     SampleRate::from_usize(VAD_SR, "VAD fixed sample rate")
-}
-
-fn apply_padding(
-    mut segments: Vec<SpeechSegment>,
-    padding: usize,
-    doubled_padding: usize,
-    audio_length: usize,
-) -> Result<Vec<SpeechSegment>, String> {
-    for index in 0..segments.len() {
-        if index == 0 {
-            segments[index].start_sample =
-                subtract_and_floor(segments[index].start_sample, padding);
-        }
-
-        if index + 1 < segments.len() {
-            let silence = segments[index + 1]
-                .start_sample
-                .checked_sub(segments[index].end_sample)
-                .ok_or_else(|| "VAD segments overlap before padding".to_owned())?;
-            if silence < doubled_padding {
-                let half_silence = silence / 2;
-                segments[index].end_sample =
-                    add_and_cap(segments[index].end_sample, half_silence, audio_length)?;
-                segments[index + 1].start_sample =
-                    subtract_and_floor(segments[index + 1].start_sample, half_silence);
-            } else {
-                segments[index].end_sample =
-                    add_and_cap(segments[index].end_sample, padding, audio_length)?;
-                segments[index + 1].start_sample =
-                    subtract_and_floor(segments[index + 1].start_sample, padding);
-            }
-        } else {
-            segments[index].end_sample =
-                add_and_cap(segments[index].end_sample, padding, audio_length)?;
-        }
-    }
-
-    segments
-        .into_iter()
-        .map(|segment| SpeechSegment::new(segment.start_sample, segment.end_sample, audio_length))
-        .collect()
-}
-
-fn subtract_and_floor(value: usize, amount: usize) -> usize {
-    value.saturating_sub(amount)
-}
-
-fn add_and_cap(value: usize, amount: usize, cap: usize) -> Result<usize, String> {
-    if value > cap {
-        return Err("speech segment end exceeds the detector input length".into());
-    }
-    let remaining = cap - value;
-    if amount >= remaining {
-        Ok(cap)
-    } else {
-        Ok(value + amount)
-    }
 }
 
 fn validate_probability_value(value: f32) -> Result<(), String> {
@@ -385,8 +409,8 @@ fn validate_probability_value(value: f32) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        SpeechSegment, TemporalField, VadDurations, VadPadding, VadPolicyConfig, VadThresholds,
-        doubled_temporal_sample_count, fixed_vad_sample_rate, speech_segments,
+        SpeechSegment, TemporalField, VadDurations, VadPadding, VadPolicyConfig, VadSegmenter,
+        VadThresholds, doubled_temporal_sample_count, fixed_vad_sample_rate, speech_segments,
         temporal_sample_count,
     };
     use crate::contracts::VadProbability;
@@ -625,6 +649,52 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn streaming_padding_waits_for_the_next_accepted_span_and_finishes_in_order()
+    -> Result<(), String> {
+        let config = policy(0.5, 0.35, 32.0, 32.0, 96.0);
+        let mut segmenter = VadSegmenter::new(4_609, config);
+        // [0, 1024) qualifies. [2048, 2560) is exactly the strict minimum.
+        // [3584, EOF) qualifies despite an unconfirmed silence at 4608.
+        for probability in [0.9, 0.9, 0.1, 0.1, 0.9, 0.1, 0.1, 0.9, 0.6, 0.1] {
+            assert_eq!(segmenter.push(probability)?, None);
+        }
+        // The valid spans share the full 2560 samples of intervening silence.
+        assert_eq!(
+            segmenter.finish()?,
+            [
+                Some(SpeechSegment::new(0, 2_304, 4_609)?),
+                Some(SpeechSegment::new(2_304, 4_609, 4_609)?),
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn streaming_closed_spans_emit_with_full_padding_and_check_coverage() -> Result<(), String> {
+        let config = policy(0.5, 0.35, 0.0, 0.0, 16.0);
+        let mut segmenter = VadSegmenter::new(2_049, config);
+        for probability in [0.9, 0.1, 0.0, 0.9] {
+            assert_eq!(segmenter.push(probability)?, None);
+        }
+        assert!(segmenter.push(f32::NAN).is_err());
+        // Gap of 1024 samples is larger than the combined 512 samples of padding.
+        assert_eq!(
+            segmenter.push(0.1)?,
+            Some(SpeechSegment::new(0, 768, 2_049)?)
+        );
+        assert!(segmenter.push(0.0).is_err());
+        assert_eq!(
+            segmenter.finish()?,
+            [None, Some(SpeechSegment::new(1_280, 2_049, 2_049)?)]
+        );
+
+        let mut incomplete = VadSegmenter::new(513, config);
+        assert_eq!(incomplete.push(0.9)?, None);
+        assert!(incomplete.finish().is_err());
+        Ok(())
     }
 
     #[test]

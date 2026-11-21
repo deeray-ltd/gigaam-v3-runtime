@@ -150,21 +150,7 @@ impl EncodedAudio {
         if bytes.is_empty() {
             return Err("encoded audio bytes must not be empty".into());
         }
-        let format_hint = match format_hint {
-            Some(hint) => {
-                if hint.is_empty() {
-                    return Err("encoded audio format hint must not be empty when present".into());
-                }
-                if !hint.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
-                    return Err(
-                        "encoded audio format hint must contain only ASCII letters and digits"
-                            .into(),
-                    );
-                }
-                Some(hint.to_ascii_lowercase())
-            }
-            None => None,
-        };
+        let format_hint = normalize_format_hint(format_hint.as_deref())?;
         Ok(Self { bytes, format_hint })
     }
 
@@ -179,6 +165,24 @@ impl EncodedAudio {
     pub fn into_parts(self) -> (Vec<u8>, Option<String>) {
         (self.bytes, self.format_hint)
     }
+}
+
+pub(crate) fn normalize_format_hint(format_hint: Option<&str>) -> Result<Option<String>, String> {
+    let normalized = match format_hint {
+        Some(hint) => {
+            if hint.is_empty() {
+                return Err("encoded audio format hint must not be empty when present".into());
+            }
+            if !hint.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
+                return Err(
+                    "encoded audio format hint must contain only ASCII letters and digits".into(),
+                );
+            }
+            Some(hint.to_ascii_lowercase())
+        }
+        None => None,
+    };
+    Ok(normalized)
 }
 
 impl DecodedAudio {

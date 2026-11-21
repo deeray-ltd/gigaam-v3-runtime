@@ -16,15 +16,15 @@ use crate::grammar::{
     AppliedConfigOutput, GrammarFailure, TranscribeOutput, TurnOutput, WordOutput,
 };
 use crate::numeric::count_to_f32;
-use gigaam_audio::DecodedAudio;
 use gigaam_model_package::EncoderPrecision;
 use gigaam_recognition::{CudaAssignmentEvidence, DirectRecognizer, EncoderRole, ProviderPlan};
 use gigaam_transcription::{
-    BackchannelMark, BatchConfig, DuplicateClassification, MultiChannelBatchResult,
-    ObservationMode, OfflineDialogFailure, OfflineDialogFailureOrigin, OfflineDialogResult,
-    SpeechSegment, StreamConfig, VadPolicyConfig, WindowTiming, WindowTimingObserver,
-    words_to_text,
+    BackchannelMark, BatchChannelSelection, BatchConfig, DuplicateClassification, ObservationMode,
+    OfflineDialogFailure, OfflineDialogFailureOrigin, OfflineDialogResult, SpeechSegment,
+    StageTimings, StoredWords, StreamConfig, TranscriptWord, TurnGap, TurnLines, VadPolicyConfig,
+    WindowTiming, WindowTimingObserver,
 };
+use std::io::{self, BufWriter, Read, Seek, Write};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -133,11 +133,13 @@ fn render_window_timing(offset_seconds: f32, frames: usize, encoder_seconds: f64
 
 /// Values needed to preserve batch-transcription process output after a successful workflow.
 pub(crate) struct TranscribeSummary<'a> {
-    pub(crate) result: &'a MultiChannelBatchResult,
-    pub(crate) audio: &'a DecodedAudio,
+    pub(crate) selection: &'a BatchChannelSelection,
+    pub(crate) timings: StageTimings,
+    pub(crate) duration: f32,
     pub(crate) source_rate: u32,
     pub(crate) config: BatchConfig,
     pub(crate) output: TranscribeOutput,
+    pub(crate) turn_gap: TurnGap,
     pub(crate) precision: EncoderPrecision,
     pub(crate) rnnt_head_precision: Option<gigaam_recognition::RnntPrecisionSelection>,
     pub(crate) window_seconds: f32,
@@ -148,33 +150,22 @@ pub(crate) struct TranscribeSummary<'a> {
 }
 
 /// Emits the exact established transcript and timing projections for batch transcription.
-pub(crate) fn transcribe(summary: TranscribeSummary<'_>) {
-    let channels = summary.result.channels();
-    if summary.output.turns == TurnOutput::Included && channels.len() > 1 {
-        for turn in summary.result.turns() {
-            println!(
-                "[channel {} {:.2}–{:.2}] {}",
-                turn.channel(),
-                turn.start(),
-                turn.end(),
-                turn.text()
-            );
-        }
-    } else {
-        for channel in channels {
-            if channels.len() > 1 {
-                println!("[channel {}]", channel.channel());
-            }
-            println!("{}", words_to_text(channel.words()));
-            if summary.output.words == WordOutput::Words {
-                for word in channel.words() {
-                    println!("  {:8.2} {:8.2}  {}", word.start(), word.end(), word.text());
-                }
-            }
-        }
-    }
-    let timings = summary.result.timings();
-    let dual_mono = summary.result.duplicate() == DuplicateClassification::DualMono;
+pub(crate) fn transcribe(
+    summary: TranscribeSummary<'_>,
+    words: &mut StoredWords<impl Read + Seek>,
+) -> Result<(), String> {
+    let mut stdout = BufWriter::new(io::stdout().lock());
+    write_transcript(
+        summary.selection,
+        summary.output,
+        summary.turn_gap,
+        words,
+        &mut stdout,
+    )?;
+    stdout.flush().map_err(stdout_error)?;
+
+    let timings = summary.timings;
+    let dual_mono = summary.selection.duplicate() == DuplicateClassification::DualMono;
     if let Some(policy) = summary.vad_policy {
         vad_policy(policy);
         eprintln!("# VAD: {:.3} s", timings.vad_seconds());
@@ -187,18 +178,89 @@ pub(crate) fn transcribe(summary: TranscribeSummary<'_>) {
     );
     eprintln!(
         "# {:.2} s audio ({} Hz → {}), channels {}, dual-mono={}, {} window {}/{} s | load {:.2} s | inference {:.3} s | RTF {:.4}",
-        summary.audio.duration_seconds(),
+        summary.duration,
         summary.source_rate,
         summary.config.sample_rate().hertz(),
-        summary.result.source_channels().get(),
+        summary.selection.source_channels().get(),
         dual_mono,
         transcribe_precision_label(summary.precision, summary.rnnt_head_precision),
         summary.window_seconds,
         summary.overlap_seconds,
         summary.loading_elapsed.as_secs_f32(),
         summary.inference_elapsed.as_secs_f32(),
-        summary.inference_elapsed.as_secs_f32() / summary.audio.duration_seconds()
+        summary.inference_elapsed.as_secs_f32() / summary.duration
     );
+    Ok(())
+}
+
+fn write_transcript(
+    selection: &BatchChannelSelection,
+    options: TranscribeOutput,
+    gap: TurnGap,
+    words: &mut StoredWords<impl Read + Seek>,
+    output: &mut impl Write,
+) -> Result<(), String> {
+    let channels = selection.selection().channels();
+    let multi = channels.len() > 1;
+    if options.turns == TurnOutput::Included && multi {
+        let mut turns = TurnLines::new(channels, words, gap)?;
+        while let Some(turn) = turns.next(words)? {
+            write!(
+                output,
+                "[channel {} {:.2}–{:.2}] ",
+                turn.channel(),
+                turn.start(),
+                turn.end()
+            )
+            .map_err(stdout_error)?;
+            write_word_line(output, turn.words(words))?;
+        }
+        return Ok(());
+    }
+
+    for channel in channels {
+        if multi {
+            writeln!(output, "[channel {}]", channel.index()).map_err(stdout_error)?;
+        }
+        let mut cursor = words.cursor(channel.index())?;
+        write_word_line(
+            output,
+            std::iter::from_fn(|| words.next(&mut cursor).transpose()),
+        )?;
+        if options.words == WordOutput::Words {
+            let mut cursor = words.cursor(channel.index())?;
+            while let Some(word) = words.next(&mut cursor)? {
+                writeln!(
+                    output,
+                    "  {:8.2} {:8.2}  {}",
+                    word.start(),
+                    word.end(),
+                    word.text()
+                )
+                .map_err(stdout_error)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn write_word_line(
+    output: &mut impl Write,
+    words: impl Iterator<Item = Result<TranscriptWord, String>>,
+) -> Result<(), String> {
+    for (index, word) in words.enumerate() {
+        if index != 0 {
+            output.write_all(b" ").map_err(stdout_error)?;
+        }
+        output
+            .write_all(word?.text().as_bytes())
+            .map_err(stdout_error)?;
+    }
+    output.write_all(b"\n").map_err(stdout_error)
+}
+
+fn stdout_error(error: io::Error) -> String {
+    format!("stdout: {error}")
 }
 
 /// Values needed to project a completed encoder benchmark.
@@ -374,6 +436,73 @@ mod tests {
     };
     use gigaam_model_package::EncoderPrecision;
     use gigaam_transcription::{OfflineDialogFailure, OfflineDialogFailureOrigin};
+
+    #[test]
+    fn replayed_transcript_preserves_console_format_and_channel_order() -> Result<(), String> {
+        use super::{TurnGap, write_transcript};
+        use crate::grammar::{ChannelOutput, TranscribeOutput, TurnOutput, WordOutput};
+        use gigaam_audio::ChannelAudio;
+        use gigaam_transcription::{
+            BatchChannelPolicy, TranscriptWord, WordRecords, select_batch_channels,
+        };
+        use std::io::Cursor;
+
+        let first = ChannelAudio::new(vec![1.0, 0.0, -1.0, 0.0])?;
+        let second = ChannelAudio::new(vec![0.0, 1.0, 0.0, -1.0])?;
+        let input = [first.view(), second.view()];
+        let split = select_batch_channels(&input, BatchChannelPolicy::separate_channels())?;
+        let single = select_batch_channels(&input, BatchChannelPolicy::single_output())?;
+        let mut records = WordRecords::new(Cursor::new(Vec::new()), 2)?;
+        for (channel, text, start, end) in [
+            (0, "first", 0.25, 0.75),
+            (0, "overlap", 0.375, 0.625),
+            (0, "later", 0.75, 0.875),
+            (1, "another", 0.25, 0.375),
+        ] {
+            records.push(channel, TranscriptWord::new(text.into(), start, end)?)?;
+        }
+        let mut words = records.finish()?;
+        for (selection, options, expected) in [
+            (
+                &single,
+                TranscribeOutput {
+                    words: WordOutput::Text,
+                    channels: ChannelOutput::Combined,
+                    turns: TurnOutput::Omitted,
+                },
+                "first overlap later\n",
+            ),
+            (
+                &split,
+                TranscribeOutput {
+                    words: WordOutput::Words,
+                    channels: ChannelOutput::Split,
+                    turns: TurnOutput::Omitted,
+                },
+                "[channel 0]\nfirst overlap later\n      0.25     0.75  first\n      0.38     0.62  overlap\n      0.75     0.88  later\n[channel 1]\nanother\n      0.25     0.38  another\n",
+            ),
+            (
+                &split,
+                TranscribeOutput {
+                    words: WordOutput::Text,
+                    channels: ChannelOutput::Combined,
+                    turns: TurnOutput::Included,
+                },
+                "[channel 0 0.25–0.75] first overlap\n[channel 1 0.25–0.38] another\n[channel 0 0.75–0.88] later\n",
+            ),
+        ] {
+            let mut output = Vec::new();
+            write_transcript(
+                selection,
+                options,
+                TurnGap::new(0.125)?,
+                &mut words,
+                &mut output,
+            )?;
+            assert_eq!(output, expected.as_bytes());
+        }
+        Ok(())
+    }
 
     #[test]
     fn window_timing_trace_projection_preserves_the_exact_line() {
