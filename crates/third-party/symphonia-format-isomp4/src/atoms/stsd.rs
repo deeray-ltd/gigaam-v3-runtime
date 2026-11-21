@@ -113,6 +113,14 @@ impl Atom for StsdAtom {
 }
 
 impl StsdAtom {
+    /// Returns a frame width only when the sample entry establishes packed interleaved PCM.
+    pub(crate) fn interleaved_pcm_frame_bytes(&self) -> Option<u64> {
+        match &self.sample_entry {
+            SampleEntry::Audio(entry) => entry.interleaved_pcm_frame_bytes,
+            _ => None,
+        }
+    }
+
     /// Fill the provided `CodecParameters` using the sample entry.
     pub fn make_codec_params(&self) -> Option<CodecParameters> {
         // Audio sample entry.
@@ -151,6 +159,7 @@ pub struct AudioSampleEntry {
     pub channels: Option<Channels>,
     pub verification_check: Option<VerificationCheck>,
     pub extra_data: Option<Box<[u8]>>,
+    interleaved_pcm_frame_bytes: Option<u64>,
 }
 
 impl AudioSampleEntry {
@@ -224,6 +233,9 @@ impl Atom for AudioSampleEntry {
                     entry.bits_per_coded_sample = Some(bits_per_sample);
                     entry.frames_per_packet = Some(1);
                     entry.channels = Some(pcm_channels(entry.num_channels)?);
+                    entry.interleaved_pcm_frame_bytes = u64::from(entry.num_channels)
+                        .checked_mul(u64::from(bits_per_sample / 8))
+                        .filter(|&width| width != 0);
                 }
             }
             1 => {
@@ -231,7 +243,7 @@ impl Atom for AudioSampleEntry {
 
                 // The number of frames (ISO/MP4 samples) per packet. For PCM codecs, this is
                 // always 1.
-                let _frames_per_packet = it.read_u32()?;
+                let frames_per_packet = it.read_u32()?;
 
                 // The number of bytes per PCM audio sample. This value supersedes sample_size. For
                 // non-PCM codecs, this value is not useful.
@@ -239,7 +251,7 @@ impl Atom for AudioSampleEntry {
 
                 // The number of bytes per PCM audio frame (ISO/MP4 sample). For non-PCM codecs,
                 // this value is not useful.
-                let _bytes_per_frame = it.read_u32()?;
+                let bytes_per_frame = it.read_u32()?;
 
                 // The next value, as defined, is seemingly non-sensical.
                 let _ = it.read_u32()?;
@@ -260,6 +272,11 @@ impl Atom for AudioSampleEntry {
                     entry.bits_per_coded_sample = Some(8 * codec_bytes_per_sample);
                     entry.frames_per_packet = Some(1);
                     entry.channels = Some(pcm_channels(entry.num_channels)?);
+                    let width = u64::from(entry.num_channels)
+                        .checked_mul(u64::from(codec_bytes_per_sample));
+                    entry.interleaved_pcm_frame_bytes = width.filter(|&width| {
+                        width != 0 && frames_per_packet != 0 && u64::from(bytes_per_frame) == width
+                    });
                 }
             }
             2 => {
@@ -278,7 +295,7 @@ impl Atom for AudioSampleEntry {
                 // The following fields are only useful for PCM codecs.
                 let bits_per_sample = it.read_u32()?;
                 let lpcm_flags = it.read_u32()?;
-                let _bytes_per_packet = it.read_u32()?;
+                let bytes_per_packet = it.read_u32()?;
                 let lpcm_frames_per_packet = it.read_u32()?;
 
                 // This is only valid if this is a PCM codec.
@@ -291,6 +308,15 @@ impl Atom for AudioSampleEntry {
                     entry.bits_per_coded_sample = Some(bits_per_sample);
                     entry.frames_per_packet = Some(u64::from(lpcm_frames_per_packet));
                     entry.channels = Some(lpcm_channels(entry.num_channels)?);
+                    let known_packed_flags = lpcm_flags & 0x8 != 0 && lpcm_flags & !0x0f == 0;
+                    let width = u64::from(entry.num_channels)
+                        .checked_mul(u64::from(bits_per_sample / 8));
+                    entry.interleaved_pcm_frame_bytes = width.filter(|&width| {
+                        known_packed_flags && bits_per_sample.is_multiple_of(8)
+                            && width != 0 && lpcm_frames_per_packet != 0
+                            && width.checked_mul(u64::from(lpcm_frames_per_packet))
+                                == Some(u64::from(bytes_per_packet))
+                    });
                 }
             }
             _ => {

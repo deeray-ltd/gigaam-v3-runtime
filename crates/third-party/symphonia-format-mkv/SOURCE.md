@@ -9,4 +9,6 @@ used by GigaAM v3 Runtime.
 - SHA-256 of that archive: `d015c5c0558864665894b3f4cbd95e10abb01b9c868e751c72670f326a56360e`
 
 The archive's normalized manifest and Rust sources are included. The local
-changes add a seekable sequential read path for batch audio.
+changes add a seekable sequential read path for batch audio. The batch path
+skips unselected payloads and can read an interleaved PCM track in bounded,
+sample-aligned packets.

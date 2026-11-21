@@ -164,8 +164,21 @@ impl CodecReader {
                 })),
             )
         } else {
+            let mut decoder_parameters = parameters.clone();
+            if matches!(
+                format.format_info().format,
+                symphonia::core::formats::well_known::FORMAT_ID_MKV
+                    | symphonia::core::formats::well_known::FORMAT_ID_ISOMP4
+            ) && crate::pcm_geometry::PcmFrameGeometry::from_params(parameters)?.is_some()
+            {
+                let bound = u64::try_from(crate::batch_probe::BATCH_PCM_MAX_FRAMES)
+                    .expect("PCM chunk bound fits u64");
+                decoder_parameters.max_frames_per_packet = decoder_parameters
+                    .max_frames_per_packet
+                    .map(|value| value.min(bound));
+            }
             let decoder = symphonia::default::get_codecs()
-                .make_audio_decoder(parameters, &AudioDecoderOptions::default())
+                .make_audio_decoder(&decoder_parameters, &AudioDecoderOptions::default())
                 .map_err(|error| format!("audio codec: {error}"))?;
             (None, PacketDecoder::Standard(decoder))
         };

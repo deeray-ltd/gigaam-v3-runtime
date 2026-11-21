@@ -19,6 +19,8 @@ use symphonia::default::formats::{
     AdtsReader, FlacReader, IsoMp4Reader, MkvReader, MpaReader, OggReader, WavReader,
 };
 
+pub(crate) const BATCH_PCM_MAX_FRAMES: usize = 8192;
+
 struct Sequential<R>(R);
 
 impl<R: FormatReader> FormatReader for Sequential<R> {
@@ -66,13 +68,28 @@ impl<'input> ProbeableFormat<'input> for Sequential<IsoMp4Reader<'_>> {
         opts: FormatOptions,
     ) -> Result<Box<dyn FormatReader + 'input>> {
         let mut reader = IsoMp4Reader::try_new_with_table_storage(mss, opts, true)?;
-        let track = reader
-            .first_track_known_codec(TrackType::Audio)
-            .ok_or(symphonia::core::errors::Error::Unsupported(
-                "no audio track",
-            ))?
-            .id;
-        reader.select_for_batch(track)?;
+        let track = reader.first_track_known_codec(TrackType::Audio).ok_or(
+            symphonia::core::errors::Error::Unsupported("no audio track"),
+        )?;
+        let id = track.id;
+        let geometry = track
+            .codec_params
+            .as_ref()
+            .and_then(|params| params.audio())
+            .map(crate::pcm_geometry::PcmFrameGeometry::from_params)
+            .transpose()
+            .map_err(|_| symphonia::core::errors::Error::DecodeError("invalid PCM geometry"))?
+            .flatten();
+        reader.select_for_batch(id)?;
+        if let Some(geometry) = geometry {
+            // A false result preserves the original packet path for unproven layouts.
+            let _enabled = reader.enable_batch_pcm(
+                id,
+                geometry.frame_bytes,
+                std::num::NonZeroUsize::new(BATCH_PCM_MAX_FRAMES)
+                    .expect("PCM chunk bound is nonzero"),
+            )?;
+        }
         Ok(Box::new(reader))
     }
     fn probe_data() -> &'static [ProbeFormatData] {
@@ -85,7 +102,28 @@ impl<'input> ProbeableFormat<'input> for Sequential<MkvReader<'_>> {
         mss: MediaSourceStream<'input>,
         opts: FormatOptions,
     ) -> Result<Box<dyn FormatReader + 'input>> {
-        Ok(Box::new(MkvReader::try_new_with_cues(mss, opts, false)?))
+        let mut reader = MkvReader::try_new_with_cues(mss, opts, false)?;
+        if let Some(track) = reader.first_track_known_codec(TrackType::Audio) {
+            let id = track.id;
+            let geometry = track
+                .codec_params
+                .as_ref()
+                .and_then(|params| params.audio())
+                .map(crate::pcm_geometry::PcmFrameGeometry::from_params)
+                .transpose()
+                .map_err(|_| symphonia::core::errors::Error::DecodeError("invalid PCM geometry"))?
+                .flatten();
+            reader.select_for_batch(id)?;
+            if let Some(geometry) = geometry {
+                reader.enable_batch_pcm(
+                    id,
+                    geometry.frame_bytes,
+                    std::num::NonZeroUsize::new(BATCH_PCM_MAX_FRAMES)
+                        .expect("PCM chunk bound is nonzero"),
+                )?;
+            }
+        }
+        Ok(Box::new(reader))
     }
     fn probe_data() -> &'static [ProbeFormatData] {
         MkvReader::probe_data()
