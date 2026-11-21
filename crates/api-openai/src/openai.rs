@@ -8,6 +8,7 @@ use axum::{
     http::{StatusCode, header},
     response::{IntoResponse, Response},
 };
+use gigaam_service_host::upload::BatchInput;
 use gigaam_service_host::wire::json::{JSON_CONTENT_TYPE, Json, obj};
 use std::path::Path;
 
@@ -17,15 +18,35 @@ pub(crate) enum Engine {
     Ctc,
     Rnnt,
 }
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(crate) struct Input {
-    pub(crate) audio: Vec<u8>,
+    pub(crate) audio: BatchInput,
     pub(crate) extension: Option<String>,
     pub(crate) engine: Engine,
     pub(crate) format: Format,
     pub(crate) word: bool,
     pub(crate) segment: bool,
     pub(crate) vad: Option<gigaam_transcription::VadPolicyConfig>,
+}
+
+pub(crate) enum MultipartField {
+    File {
+        filename: Option<String>,
+        audio: BatchInput,
+    },
+    Text {
+        name: String,
+        bytes: Vec<u8>,
+    },
+}
+
+impl MultipartField {
+    fn name(&self) -> &str {
+        match self {
+            Self::File { .. } => "file",
+            Self::Text { name, .. } => name,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -102,11 +123,14 @@ fn extension(filename: Option<&str>) -> Option<String> {
     .then_some(ext)
 }
 pub(crate) fn parse_fields_for_variant(
-    mut fields: Vec<(String, Option<String>, Vec<u8>)>,
+    mut fields: Vec<MultipartField>,
     variant: gigaam_model_package::VariantId,
 ) -> Result<Input, ApiError> {
     use gigaam_model_package::ModelFamily;
-    for (name, _, bytes) in &mut fields {
+    for field in &mut fields {
+        let MultipartField::Text { name, bytes } = field else {
+            continue;
+        };
         if name != "model" {
             continue;
         }
@@ -132,10 +156,7 @@ pub(crate) fn parse_fields_for_variant(
     parse_fields(fields, variant.family() == ModelFamily::Rnnt)
 }
 
-pub(crate) fn parse_fields(
-    mut fields: Vec<(String, Option<String>, Vec<u8>)>,
-    rnnt: bool,
-) -> Result<Input, ApiError> {
+pub(crate) fn parse_fields(fields: Vec<MultipartField>, rnnt: bool) -> Result<Input, ApiError> {
     let mut file = None;
     let mut model = None;
     let mut format = Format::Json;
@@ -145,11 +166,12 @@ pub(crate) fn parse_fields(
     let mut granularities = Vec::new();
     let mut seen = std::collections::HashSet::new();
     let mut vad_fields = Vec::new();
-    for (name, filename, bytes) in fields.drain(..) {
-        if name != "timestamp_granularities[]" && !seen.insert(name.clone()) {
+    for field in fields {
+        let name = field.name();
+        if name != "timestamp_granularities[]" && !seen.insert(name.to_owned()) {
             return Err(ApiError::bad(
                 format!("{name} must occur once"),
-                Some(match name.as_str() {
+                Some(match name {
                     "file" => "file",
                     "model" => "model",
                     "response_format" => "response_format",
@@ -161,16 +183,17 @@ pub(crate) fn parse_fields(
                 }),
             ));
         }
-        match name.as_str() {
-            "file" => {
-                if file.is_some() {
-                    return Err(ApiError::bad("file must occur once", Some("file")));
-                }
-                if bytes.is_empty() {
+        let (name, bytes) = match field {
+            MultipartField::File { filename, audio } => {
+                if audio.is_empty() {
                     return Err(ApiError::bad("file must not be empty", Some("file")));
                 }
-                file = Some((bytes, extension(filename.as_deref())));
+                file = Some((audio, extension(filename.as_deref())));
+                continue;
             }
+            MultipartField::Text { name, bytes } => (name, bytes),
+        };
+        match name.as_str() {
             "model" => {
                 if model.is_some() {
                     return Err(ApiError::bad("model must occur once", Some("model")));
@@ -298,15 +321,21 @@ pub(crate) fn parse_fields(
 
 #[cfg(test)]
 mod tests {
-    use super::{Format, parse_fields};
+    use super::{Format, MultipartField, parse_fields};
 
     #[test]
     fn selected_variant_resolves_only_matching_aliases() {
         use gigaam_model_package::VariantId;
         let fields = |model: &str| {
             vec![
-                ("model".to_string(), None, model.as_bytes().to_vec()),
-                ("file".to_string(), Some("a.wav".to_string()), vec![1]),
+                MultipartField::Text {
+                    name: "model".into(),
+                    bytes: model.as_bytes().to_vec(),
+                },
+                MultipartField::File {
+                    filename: Some("a.wav".into()),
+                    audio: vec![1].into(),
+                },
             ]
         };
         assert!(super::parse_fields_for_variant(fields("gigaam-v3"), VariantId::V3E2eCtc).is_ok());
@@ -323,17 +352,48 @@ mod tests {
         );
     }
 
-    fn fields(extra: &[(&str, &str)]) -> Vec<(String, Option<String>, Vec<u8>)> {
+    fn fields(extra: &[(&str, &str)]) -> Vec<MultipartField> {
         let mut values = vec![
-            ("model".into(), None, b"gigaam-v3".to_vec()),
-            ("file".into(), Some("speech.wav".into()), b"wave".to_vec()),
+            MultipartField::Text {
+                name: "model".into(),
+                bytes: b"gigaam-v3".to_vec(),
+            },
+            MultipartField::File {
+                filename: Some("speech.wav".into()),
+                audio: b"wave".to_vec().into(),
+            },
         ];
-        values.extend(
-            extra
-                .iter()
-                .map(|(key, value)| (String::from(*key), None, value.as_bytes().to_vec())),
-        );
+        values.extend(extra.iter().map(|(key, value)| MultipartField::Text {
+            name: String::from(*key),
+            bytes: value.as_bytes().to_vec(),
+        }));
         values
+    }
+
+    #[test]
+    fn fields_after_file_preserve_audio_and_model_error_precedence() {
+        use gigaam_model_package::VariantId;
+        let mut ordered = fields(&[("response_format", "text")]);
+        ordered.swap(0, 1);
+        let input = super::parse_fields_for_variant(ordered, VariantId::V3E2eCtc)
+            .expect("the model may follow the file");
+        assert_eq!(input.audio.len(), 4);
+        assert_eq!(input.extension.as_deref(), Some("wav"));
+        assert_eq!(input.format, Format::Text);
+
+        let invalid = vec![
+            MultipartField::File {
+                filename: None,
+                audio: Vec::new().into(),
+            },
+            MultipartField::Text {
+                name: "model".into(),
+                bytes: b"unavailable".to_vec(),
+            },
+        ];
+        let error = super::parse_fields_for_variant(invalid, VariantId::V3E2eCtc)
+            .expect_err("an unavailable model is refused");
+        assert_eq!(error.param, Some("model"));
     }
 
     #[test]

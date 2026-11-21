@@ -12,6 +12,7 @@
 mod admission;
 mod api;
 pub mod batch;
+pub mod batch_file;
 mod config;
 mod context;
 mod health;
@@ -34,7 +35,9 @@ mod response;
 mod router;
 #[cfg(test)]
 mod scored_response_test;
+mod scratch;
 mod telemetry;
+pub mod upload;
 pub mod wire;
 // Exercise adapter terminal and projection code against the controlled host fixtures.
 #[cfg(test)]
@@ -259,7 +262,7 @@ impl ServiceApplication {
                 request_timeout,
                 upload_timeout,
                 request_body_limit,
-            }),
+            })?,
             live: live::LiveService::new(
                 Arc::clone(&context),
                 Arc::clone(&admission),

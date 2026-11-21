@@ -10,35 +10,36 @@
 //! Native batch HTTP adaptation and response projection.
 
 use crate::response::{
-    Options, ResponseContract, ResponseInput, ResponseVersion, TranscribeErrorCode, json_err,
-    json_ok, transcribe_error_response, transcribe_response,
+    Options, ResponseContract, ResponseVersion, StoredResponseInput, TranscribeErrorCode, json_err,
+    transcribe_error_response, write_stored,
 };
 use axum::{
     Router,
-    body::Bytes,
-    extract::{DefaultBodyLimit, FromRequest, RawQuery, Request, State},
+    body::{Body, HttpBody},
+    extract::{RawQuery, Request, State},
     http::{HeaderMap, StatusCode},
-    response::Response,
+    response::{IntoResponse, Response},
     routing::post,
 };
 use gigaam_service_host::AdmissionRefusal;
 use gigaam_service_host::batch::{
-    AdmittedWorkResult, BatchModel, BatchOutput, BatchRequest, BatchService as HttpState,
-    TranscribeError, UploadError, UploadReservation,
+    AdmittedWorkResult, BatchModel, BatchRequest, BatchService as HttpState, TranscribeError,
+    UploadError, UploadReservation,
 };
+use gigaam_service_host::upload::BatchInput;
 use gigaam_service_host::wire::{
     QueryParameters, RequestId, bind_vad_policy, query_bool, query_finite_f32, with_request_id,
 };
 use gigaam_transcription::{BatchChannelPolicy, TurnGap, VadPolicyConfig};
+use std::future::poll_fn;
+use std::pin::Pin;
 use std::time::Instant;
 
-/// Builds the only byte-consuming route group and attaches its validated body limit.
+/// Registers the bounded native batch upload route.
 pub(crate) fn routes(state: HttpState) -> Router {
-    let limit = state.upload_limit_bytes();
     Router::new()
         .route("/v1/transcribe", post(upload_transcribe))
         .with_state(state)
-        .layer(DefaultBodyLimit::max(limit))
 }
 
 pub(super) async fn upload_transcribe(
@@ -63,11 +64,10 @@ pub(super) async fn upload_transcribe(
         }
     };
     let (parts, body) = request.into_parts();
-    let headers = parts.headers.clone();
+    let headers = parts.headers;
     let raw_query = parts.uri.query().map(str::to_owned);
-    let request = Request::from_parts(parts, body);
     let (body, reader) = match state
-        .read_upload(|| Bytes::from_request(request, &state))
+        .read_upload(|reader| read_native_body(&state, body, reader))
         .await
     {
         Ok(upload) => upload,
@@ -84,7 +84,7 @@ pub(super) async fn upload_transcribe(
                 &state,
                 &request_id,
                 started,
-                axum::response::IntoResponse::into_response(rejection),
+                rejection.into_response(),
             );
         }
         Err(UploadError::TimedOut) => {
@@ -108,16 +108,83 @@ pub(super) async fn upload_transcribe(
     .await
 }
 
+enum NativeUploadError {
+    Read(axum::Error),
+    TooLarge,
+    Storage,
+}
+
+impl IntoResponse for NativeUploadError {
+    fn into_response(self) -> Response {
+        match self {
+            Self::Read(error) => (
+                StatusCode::BAD_REQUEST,
+                format!("Failed to buffer the request body: {error}"),
+            )
+                .into_response(),
+            Self::TooLarge => (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "Failed to buffer the request body: length limit exceeded",
+            )
+                .into_response(),
+            Self::Storage => json_err(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "upload storage unavailable",
+            ),
+        }
+    }
+}
+
+async fn read_native_body(
+    state: &HttpState,
+    mut body: Body,
+    reader: UploadReservation,
+) -> Result<BatchInput, NativeUploadError> {
+    let limit = state.upload_limit_bytes();
+    let mut received = 0_usize;
+    let mut upload = None;
+    while let Some(frame) = poll_fn(|context| Pin::new(&mut body).poll_frame(context)).await {
+        let frame = frame.map_err(NativeUploadError::Read)?;
+        let Ok(chunk) = frame.into_data() else {
+            continue;
+        };
+        if chunk.is_empty() {
+            continue;
+        }
+        received = received
+            .checked_add(chunk.len())
+            .filter(|&size| size <= limit)
+            .ok_or(NativeUploadError::TooLarge)?;
+        let scratch = match upload.take() {
+            Some(scratch) => scratch,
+            None => state
+                .start_upload(&reader)
+                .map_err(|_| NativeUploadError::Storage)?,
+        };
+        upload = Some(
+            scratch
+                .append(chunk)
+                .await
+                .map_err(|_| NativeUploadError::Storage)?,
+        );
+    }
+    Ok(match upload {
+        Some(upload) => upload.into(),
+        None => Vec::new().into(),
+    })
+}
+
 /// Adapts a validated batch request while the admission owner retains capacity through completion.
 pub(super) async fn transcribe_inner(
     State(state): State<HttpState>,
     headers: HeaderMap,
     RawQuery(query_text): RawQuery,
-    body: Bytes,
+    body: impl Into<BatchInput>,
     mut reader: Option<UploadReservation>,
 ) -> Response {
     state.record_request();
     let started = Instant::now();
+    let body = body.into();
     let body_len = body.len();
     let request_id = match RequestId::from_headers(&headers) {
         Ok(request_id) => request_id,
@@ -156,7 +223,7 @@ pub(super) async fn transcribe_inner(
             return native_admission_refusal(refusal, &state, &request_id, response_version);
         }
     };
-    let request = match native_batch_request(&query, body.to_vec()) {
+    let request = match native_batch_request(&query, body) {
         Ok(request) => request,
         Err(error) => {
             state.record_error();
@@ -173,16 +240,51 @@ pub(super) async fn transcribe_inner(
     };
     let variant = state.variant();
     let response = match state
-        .execute(
+        .execute_file(
             admission,
             request_id.text().to_owned(),
             started,
             request,
-            move |output| Ok(project_native(&query, variant.as_str(), output)),
+            move |mut result, mut writer| {
+                let duration = result.duration;
+                let source_rate = result.source_rate;
+                let rtf = result.rtf;
+                let (selection, words) = result.replay();
+                write_stored(
+                    StoredResponseInput {
+                        contract: ResponseContract {
+                            version: query.response_version,
+                            vad: query.vad,
+                        },
+                        selection,
+                        options: query.options,
+                        duration_sec: duration,
+                        sample_rate_in: source_rate,
+                        model: query.model.as_str(),
+                        variant: variant.as_str(),
+                        rtf,
+                    },
+                    words,
+                    &mut writer,
+                )
+            },
         )
         .await
     {
-        AdmittedWorkResult::Completed(Ok(json)) => json_ok(json),
+        AdmittedWorkResult::Completed(Ok(file)) => {
+            let length = file.len();
+            Response::builder()
+                .header(
+                    axum::http::header::CONTENT_TYPE,
+                    gigaam_service_host::wire::json::JSON_CONTENT_TYPE,
+                )
+                .header(axum::http::header::CONTENT_LENGTH, length)
+                .body(file.into_body())
+                .expect("static response headers are valid")
+        }
+        AdmittedWorkResult::Refused(refusal) => {
+            native_admission_refusal(refusal, &state, &request_id, response_version)
+        }
         AdmittedWorkResult::Completed(Err(error)) => {
             state.record_error();
             let status = error.status();
@@ -224,49 +326,18 @@ pub(super) async fn transcribe_inner(
 
 pub(super) fn native_batch_request(
     query: &TranscribeQuery,
-    bytes: Vec<u8>,
+    bytes: impl Into<BatchInput>,
 ) -> Result<BatchRequest, TranscribeError> {
     Ok(BatchRequest {
         model: query.model,
         extension: query.extension.clone(),
-        audio: bytes,
+        audio: bytes.into(),
         channel_policy: http_batch_channel_policy(query.options),
         turn_gap: TurnGap::new(query.options.turn_gap).map_err(TranscribeError::BadRequest)?,
         vad: query.vad,
         scored: false,
         downmix: false,
     })
-}
-
-pub(super) fn project_native(
-    query: &TranscribeQuery,
-    work_variant: &str,
-    output: BatchOutput,
-) -> String {
-    let BatchOutput {
-        result,
-        duration,
-        source_rate,
-        rtf,
-    } = output;
-    let response = transcribe_response(ResponseInput {
-        contract: ResponseContract {
-            version: query.response_version,
-            vad: query.vad,
-        },
-        channels: result.channels(),
-        segments: result.segments(),
-        turns: result.turns(),
-        options: query.options,
-        duration_sec: duration,
-        sample_rate_in: source_rate,
-        source_channels: result.source_channels(),
-        duplicate: result.duplicate(),
-        model: query.model.as_str(),
-        variant: work_variant,
-        rtf,
-    });
-    response.to_string()
 }
 
 pub(super) fn native_admission_refusal(

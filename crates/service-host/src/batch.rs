@@ -12,12 +12,15 @@
 use crate::admission::{
     AdmissionRefusal, AdmissionState, HttpAdmission, RequestBodyLimit, RequestWorkOwner,
 };
+use crate::batch_file::BatchFile;
 use crate::context::ApplicationContext;
 use crate::log::{BatchProgress, BatchStage, BatchStageOutcome, TranscribeProgress};
 use crate::metrics::Metrics;
+use crate::scratch::{ScratchFile, ScratchSpace};
+use crate::upload::{BatchInput, BatchUpload};
 
 #[cfg(test)]
-use crate::response::{ResponseVersion, json_err, json_ok};
+use crate::response::{ResponseContract, ResponseVersion, json_err};
 use crate::telemetry::TelemetryProducer;
 #[cfg(test)]
 use crate::wire::{RequestId, with_request_id};
@@ -28,15 +31,26 @@ use axum::{
     body::Bytes,
     extract::{DefaultBodyLimit, RawQuery, Request, State},
     http::{HeaderMap, HeaderValue},
-    response::Response,
+    response::{IntoResponse, Response},
 };
 #[cfg(test)]
 pub(crate) use native_http::routes as native_test_routes;
 #[cfg(test)]
 use native_http::{
-    TranscribeQuery, http_batch_channel_policy, native_batch_request, project_native, routes,
-    upload_transcribe,
+    TranscribeQuery, http_batch_channel_policy, native_batch_request, routes, upload_transcribe,
 };
+#[cfg(test)]
+fn json_ok(body: String) -> Response {
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            crate::wire::json::JSON_CONTENT_TYPE,
+        )],
+        body,
+    )
+        .into_response()
+}
+
 #[cfg(test)]
 use openai_http::{openai_transcribe, parse_openai_multipart, routes as openai_routes};
 #[cfg(test)]
@@ -46,12 +60,14 @@ mod native_http;
 #[path = "../../api-openai/src/http.rs"]
 mod openai_http;
 
-use gigaam_audio::{ChannelAudio, ChannelAudioView, DecodedAudio, EncodedAudio, resample_audio};
+use gigaam_audio::{ChannelAudioView, FileDecoders, ReplayAudio, ReplayError};
+use gigaam_primitives::usize_to_f32;
 use gigaam_recognition::{ExecutionControl, ExecutionState, SpeechProbabilityDetector};
 use gigaam_transcription::{
-    BatchChannelPolicy, BatchSetup, MultiChannelBatchError, MultiChannelBatchOptions,
-    MultiChannelBatchResult, MultiChannelBatchSetup, MultiChannelBatchTranscriber, TurnGap,
-    VadPolicyConfig,
+    BatchChannelPolicy, BatchChannelSelection, BatchSetup, ChannelTranscript,
+    MultiChannelBatchError, MultiChannelBatchOptions, MultiChannelBatchResult,
+    MultiChannelBatchSetup, MultiChannelBatchTranscriber, ReplayObservations, StageTimings,
+    StoredWords, TurnGap, VadPolicyConfig, WordRecords,
 };
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -76,7 +92,8 @@ pub struct BatchService {
     request_timeout: Duration,
     upload_timeout: Duration,
     request_body_limit: RequestBodyLimit,
-    decoders: Option<gigaam_audio::FileDecoders>,
+    decoders: Option<FileDecoders>,
+    scratch: ScratchSpace,
 }
 
 /// Cohesive private inputs assembled by the facade for the HTTP adapter state.
@@ -94,7 +111,7 @@ pub(crate) struct HttpStateParameters {
 pub(crate) type HttpState = BatchService;
 
 impl BatchService {
-    pub(crate) fn new(parameters: HttpStateParameters) -> Self {
+    pub(crate) fn new(parameters: HttpStateParameters) -> Result<Self, String> {
         let HttpStateParameters {
             context,
             admission,
@@ -104,7 +121,7 @@ impl BatchService {
             upload_timeout,
             request_body_limit,
         } = parameters;
-        Self {
+        Ok(Self {
             context,
             admission,
             metrics,
@@ -113,7 +130,9 @@ impl BatchService {
             upload_timeout,
             request_body_limit,
             decoders: None,
-        }
+            scratch: crate::scratch::configured()
+                .map_err(|error| format!("batch scratch storage: {error}"))?,
+        })
     }
 
     pub(crate) fn with_file_decoders(mut self, decoders: gigaam_audio::FileDecoders) -> Self {
@@ -123,7 +142,8 @@ impl BatchService {
 }
 
 /// A body reader retained until work admission completes.
-pub struct UploadReservation(tokio::sync::OwnedSemaphorePermit);
+#[derive(Clone, Debug)]
+pub struct UploadReservation(pub(crate) Arc<tokio::sync::OwnedSemaphorePermit>);
 
 pub enum UploadError<E> {
     Refused(AdmissionRefusal),
@@ -140,7 +160,69 @@ pub struct BatchOutput {
     pub rtf: f32,
 }
 
+/// Final words and timing metadata owned by one complete batch result.
+pub struct StoredBatchOutput {
+    words: StoredWords<ScratchFile>,
+    selection: BatchChannelSelection,
+    timings: StageTimings,
+    pub duration: f32,
+    pub source_rate: u32,
+    pub rtf: f32,
+}
+
+impl StoredBatchOutput {
+    pub fn replay(
+        &mut self,
+    ) -> (
+        &BatchChannelSelection,
+        &mut StoredWords<impl std::io::Read + std::io::Seek>,
+    ) {
+        (&self.selection, &mut self.words)
+    }
+
+    fn collect(mut self, turn_gap: TurnGap) -> Result<BatchOutput, TranscribeError> {
+        let mut channels = Vec::with_capacity(self.selection.selection().channels().len());
+        for &channel in self.selection.selection().channels() {
+            let mut cursor = self
+                .words
+                .cursor(channel.index())
+                .map_err(TranscribeError::Unavailable)?;
+            let mut words = Vec::new();
+            while let Some(word) = self
+                .words
+                .next(&mut cursor)
+                .map_err(TranscribeError::Unavailable)?
+            {
+                words.push(word);
+            }
+            channels.push(
+                ChannelTranscript::new(channel.index(), words)
+                    .map_err(TranscribeError::Unavailable)?,
+            );
+        }
+        let result = MultiChannelBatchResult::from_channels(
+            &self.selection,
+            channels,
+            turn_gap,
+            self.timings,
+        )
+        .map_err(TranscribeError::Unavailable)?;
+        Ok(BatchOutput {
+            result,
+            duration: self.duration,
+            source_rate: self.source_rate,
+            rtf: self.rtf,
+        })
+    }
+}
+
 impl BatchService {
+    pub fn start_upload(&self, reader: &UploadReservation) -> std::io::Result<BatchUpload> {
+        self.scratch
+            .create()
+            .map(|file| BatchUpload::new(file, reader.clone()))
+    }
+
     pub fn upload_limit_bytes(&self) -> usize {
         self.request_body_limit.bytes()
     }
@@ -192,7 +274,7 @@ impl BatchService {
 
     pub async fn read_upload<T, E, F>(
         &self,
-        parse: impl FnOnce() -> F,
+        parse: impl FnOnce(UploadReservation) -> F,
     ) -> Result<(T, UploadReservation), UploadError<E>>
     where
         F: std::future::Future<Output = Result<T, E>>,
@@ -201,11 +283,12 @@ impl BatchService {
             .admission
             .admit_upload()
             .map_err(UploadError::Refused)?;
-        let value = tokio::time::timeout(self.upload_timeout, parse())
+        let reader = UploadReservation(Arc::new(permit));
+        let value = tokio::time::timeout(self.upload_timeout, parse(reader.clone()))
             .await
             .map_err(|_| UploadError::TimedOut)?
             .map_err(UploadError::Parse)?;
-        Ok((value, UploadReservation(permit)))
+        Ok((value, reader))
     }
 
     pub fn admit(
@@ -227,6 +310,44 @@ impl BatchService {
         request: BatchRequest,
         project: impl FnOnce(BatchOutput) -> Result<T, TranscribeError> + Send + 'static,
     ) -> AdmittedWorkResult<T> {
+        let turn_gap = request.turn_gap;
+        self.execute_projected(reservation, request_id, started, request, move |output| {
+            project(output.collect(turn_gap)?)
+        })
+        .await
+    }
+
+    pub async fn execute_file(
+        &self,
+        reservation: BatchReservation,
+        request_id: String,
+        started: Instant,
+        request: BatchRequest,
+        project: impl FnOnce(StoredBatchOutput, &mut dyn std::io::Write) -> Result<(), String>
+        + Send
+        + 'static,
+    ) -> AdmittedWorkResult<BatchFile> {
+        let scratch = self.scratch.clone();
+        let delivery = match self.admission.admit_response() {
+            Ok(delivery) => delivery,
+            Err(refusal) => return AdmittedWorkResult::Refused(refusal),
+        };
+        self.execute_projected(reservation, request_id, started, request, move |output| {
+            BatchFile::project(scratch.create().map_err(scratch_error)?, delivery, |file| {
+                project(output, file)
+            })
+        })
+        .await
+    }
+
+    async fn execute_projected<T: Send + 'static>(
+        &self,
+        reservation: BatchReservation,
+        request_id: String,
+        started: Instant,
+        request: BatchRequest,
+        project: impl FnOnce(StoredBatchOutput) -> Result<T, TranscribeError> + Send + 'static,
+    ) -> AdmittedWorkResult<T> {
         let progress = RequestProgress {
             telemetry: self.telemetry.clone(),
             request_id,
@@ -243,9 +364,11 @@ impl BatchService {
         let context = Arc::clone(&self.context);
         let metrics = Arc::clone(&self.metrics);
         let decoders = self.decoders.clone();
+        let scratch = self.scratch.clone();
         execute_admitted_work(execution, move |control| {
+            vad_checkpoint(control)?;
             let capabilities = &context.capabilities;
-            let (result, duration, source_rate, rtf) = run_batch(
+            let output = run_batch(
                 BatchExecution {
                     decoders: decoders.as_ref(),
                     context: &context,
@@ -253,16 +376,15 @@ impl BatchService {
                     request,
                     control,
                     progress: &progress,
+                    scratch: &scratch,
                 },
                 || capabilities.vad_provider.create(capabilities.vad_context()),
             )?;
+            vad_checkpoint(control)?;
             progress.stage(BatchStage::ResponseProjection, || {
-                project(BatchOutput {
-                    result,
-                    duration,
-                    source_rate,
-                    rtf,
-                })
+                let projected = project(output)?;
+                vad_checkpoint(control)?;
+                Ok(projected)
             })
         })
         .await
@@ -323,16 +445,20 @@ fn multi_channel_batch_error(error: MultiChannelBatchError) -> TranscribeError {
 }
 
 /// Publishes aggregate stage timings only after a complete multi-channel batch result exists.
+#[cfg(test)]
 fn complete_multi_channel_batch(
     metrics: &Metrics,
     operation: impl FnOnce() -> Result<MultiChannelBatchResult, MultiChannelBatchError>,
 ) -> Result<MultiChannelBatchResult, TranscribeError> {
     let result = operation().map_err(multi_channel_batch_error)?;
-    let timings = result.timings();
+    record_timings(metrics, result.timings());
+    Ok(result)
+}
+
+fn record_timings(metrics: &Metrics, timings: StageTimings) {
     metrics.observe_frontend(timings.frontend_seconds());
     metrics.observe_encoder(timings.encoder_seconds());
     metrics.observe_decode(timings.decode_seconds());
-    Ok(result)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -351,6 +477,7 @@ impl BatchModel {
 }
 
 pub enum AdmittedWorkResult<T> {
+    Refused(AdmissionRefusal),
     Completed(Result<T, TranscribeError>),
     WorkerFailure,
     TimedOut,
@@ -532,7 +659,9 @@ fn do_transcribe_with_vad_factory<D: SpeechProbabilityDetector>(
     let request = native_batch_request(query, work.bytes)?;
     let decoders = gigaam_audio::FileDecoders::new(vec![Arc::new(gigaam_format_wav::Wave)])
         .map_err(TranscribeError::BadRequest)?;
-    let (result, duration, source_rate, rtf) = run_batch(
+    let scratch = crate::scratch::configured().map_err(scratch_error)?;
+    let turn_gap = request.turn_gap;
+    let output = run_batch(
         BatchExecution {
             decoders: Some(&decoders),
             context: work.context,
@@ -540,6 +669,7 @@ fn do_transcribe_with_vad_factory<D: SpeechProbabilityDetector>(
             request,
             control: work.control,
             progress,
+            scratch: &scratch,
         },
         factory,
     )?;
@@ -547,21 +677,48 @@ fn do_transcribe_with_vad_factory<D: SpeechProbabilityDetector>(
         Ok(project_native(
             query,
             work_variant,
-            BatchOutput {
-                result,
-                duration,
-                source_rate,
-                rtf,
-            },
+            output.collect(turn_gap)?,
         ))
     })
+}
+
+#[cfg(test)]
+fn project_native(
+    query: &TranscribeQuery,
+    work_variant: &str,
+    output: gigaam_service_host::batch::BatchOutput,
+) -> String {
+    let gigaam_service_host::batch::BatchOutput {
+        result,
+        duration,
+        source_rate,
+        rtf,
+    } = output;
+    let response = crate::response::transcribe_response(crate::response::ResponseInput {
+        contract: ResponseContract {
+            version: query.response_version,
+            vad: query.vad,
+        },
+        channels: result.channels(),
+        segments: result.segments(),
+        turns: result.turns(),
+        options: query.options,
+        duration_sec: duration,
+        sample_rate_in: source_rate,
+        source_channels: result.source_channels(),
+        duplicate: result.duplicate(),
+        model: query.model.as_str(),
+        variant: work_variant,
+        rtf,
+    });
+    response.to_string()
 }
 
 // Transport-independent input to the shared decode and transcription path.
 pub struct BatchRequest {
     pub model: BatchModel,
     pub extension: Option<String>,
-    pub audio: Vec<u8>,
+    pub audio: BatchInput,
     pub channel_policy: BatchChannelPolicy,
     pub turn_gap: TurnGap,
     pub vad: Option<VadPolicyConfig>,
@@ -576,12 +733,13 @@ struct BatchExecution<'a> {
     request: BatchRequest,
     control: &'a ExecutionControl,
     progress: &'a RequestProgress,
+    scratch: &'a ScratchSpace,
 }
 
 fn run_batch<D: SpeechProbabilityDetector>(
     work: BatchExecution<'_>,
     factory: impl FnOnce() -> Result<D, String>,
-) -> Result<(MultiChannelBatchResult, f32, u32, f32), TranscribeError> {
+) -> Result<StoredBatchOutput, TranscribeError> {
     let BatchExecution {
         decoders,
         context,
@@ -599,6 +757,7 @@ fn run_batch<D: SpeechProbabilityDetector>(
             },
         control,
         progress,
+        scratch,
     } = work;
     let selected = match context.capabilities.pack.variant().family() {
         gigaam_model_package::ModelFamily::Ctc => BatchModel::Ctc,
@@ -630,32 +789,34 @@ fn run_batch<D: SpeechProbabilityDetector>(
             .map_err(TranscribeError::UnsupportedCapability)?;
     }
     let loaded = progress.stage(BatchStage::AudioDecode, || {
-        let encoded = EncodedAudio::new(audio, extension).map_err(TranscribeError::BadRequest)?;
-        let mut decoder = match decoders {
-            Some(decoders) => decoders.open_encoded(encoded),
-            None => Err("audio format is unavailable on this route".to_owned()),
-        }
-        .map_err(TranscribeError::BadRequest)?;
-        decoder
-            .collect_remaining()
+        let decoders = decoders.ok_or_else(|| {
+            TranscribeError::BadRequest("audio format is unavailable on this route".into())
+        })?;
+        audio
+            .open(decoders.clone(), extension.as_deref())
             .map_err(TranscribeError::BadRequest)
     })?;
-    let source_rate = loaded.sample_rate().hertz();
+    let source_rate = loaded.metadata().sample_rate().hertz();
     if !(4000..=192000).contains(&source_rate) {
         return Err(TranscribeError::BadRequest(format!(
             "invalid sample rate {source_rate} Hz (4000..192000)"
         )));
     }
-    if loaded.channels().is_empty() {
-        return Err(TranscribeError::BadRequest(
-            "input has no audio channels".into(),
-        ));
-    }
-    let audio = progress.stage(BatchStage::Resample, || {
-        resample_audio(loaded, context.capabilities.frontend.sample_rate())
-            .map_err(TranscribeError::BadRequest)
+    let mut audio = progress.stage(BatchStage::Resample, || {
+        let storage = scratch.create().map_err(scratch_error)?;
+        ReplayAudio::prepare(
+            loaded,
+            storage,
+            context.capabilities.frontend.sample_rate(),
+            downmix,
+            || vad_checkpoint(control).map_err(TranscribeError::message),
+        )
+        .map_err(|error| match error {
+            ReplayError::Audio(message) => TranscribeError::BadRequest(message),
+            ReplayError::Storage(error) => scratch_error(error),
+            ReplayError::Cancelled(message) => TranscribeError::Unavailable(message),
+        })
     })?;
-    let audio = if downmix { mono_downmix(audio)? } else { audio };
     let batch_options = MultiChannelBatchOptions::new(channel_policy, turn_gap);
     let transcriber = MultiChannelBatchTranscriber::new(MultiChannelBatchSetup::new(
         BatchSetup {
@@ -669,51 +830,55 @@ fn run_batch<D: SpeechProbabilityDetector>(
     ))
     .map_err(TranscribeError::Unavailable)?;
     let started = Instant::now();
-    let result = match (vad, scored) {
-        (policy, true) => {
-            let mut detector = request_vad(factory, control, progress)?;
-            let result = progress.stage(BatchStage::BatchTranscription, || {
-                complete_multi_channel_batch(metrics, || {
-                    transcriber.transcribe_scored(&audio, &mut detector, policy)
-                })
-            })?;
-            metrics.observe_vad(result.timings().vad_seconds());
-            result
-        }
-        (None, false) => progress.stage(BatchStage::BatchTranscription, || {
-            complete_multi_channel_batch(metrics, || transcriber.transcribe(&audio))
-        })?,
-        (Some(policy), false) => {
-            let mut detector = request_vad(factory, control, progress)?;
-            let result = progress.stage(BatchStage::BatchTranscription, || {
-                complete_multi_channel_batch(metrics, || {
-                    transcriber.transcribe_with_vad(&audio, &mut detector, policy)
-                })
-            })?;
-            metrics.observe_vad(result.timings().vad_seconds());
-            result
-        }
-    };
-    let duration = audio.duration_seconds();
+    let mut detector = (vad.is_some() || scored)
+        .then(|| request_vad(factory, control, progress))
+        .transpose()?;
+    let observations = detector.as_mut().map(|detector| ReplayObservations {
+        detector,
+        policy: vad,
+        scored,
+    });
+    let mut records = WordRecords::new(scratch.create().map_err(scratch_error)?, audio.channels())
+        .map_err(TranscribeError::Unavailable)?;
+    let (selection, timings, words) = progress.stage(BatchStage::BatchTranscription, || {
+        let (selection, timings) = transcriber
+            .transcribe_replay(
+                &mut audio,
+                observations,
+                || scratch.create(),
+                |channel, word| records.push(channel.index(), word),
+            )
+            .map_err(multi_channel_batch_error)?;
+        let words = records
+            .finish()
+            .map_err(TranscribeError::Unavailable)?
+            .with_control(control.clone());
+        record_timings(metrics, timings);
+        Ok((selection, timings, words))
+    })?;
+    if detector.is_some() {
+        metrics.observe_vad(timings.vad_seconds());
+    }
+    let duration = usize_to_f32(audio.frames())
+        / usize_to_f32(
+            audio
+                .sample_rate()
+                .as_usize()
+                .map_err(TranscribeError::Unavailable)?,
+        );
     let rtf = started.elapsed().as_secs_f32() / duration.max(1e-6);
-    Ok((result, duration, source_rate, rtf))
+    Ok(StoredBatchOutput {
+        words,
+        selection,
+        timings,
+        duration,
+        source_rate,
+        rtf,
+    })
 }
 
-fn mono_downmix(audio: DecodedAudio) -> Result<DecodedAudio, TranscribeError> {
-    if audio.channels().len() == 1 {
-        return Ok(audio);
-    }
-    let count = u16::try_from(audio.channels().len())
-        .map_err(|_| TranscribeError::BadRequest("too many source channels".into()))?;
-    let divisor = f32::from(count);
-    let mut samples = vec![0.0; audio.frames()];
-    for channel in audio.channels() {
-        for (mixed, sample) in samples.iter_mut().zip(channel.samples()) {
-            *mixed += *sample / divisor;
-        }
-    }
-    let mono = ChannelAudio::new(samples).map_err(TranscribeError::BadRequest)?;
-    DecodedAudio::new(audio.sample_rate(), vec![mono]).map_err(TranscribeError::BadRequest)
+fn scratch_error(error: std::io::Error) -> TranscribeError {
+    TranscribeError::Unavailable(format!("batch scratch storage: {error}"))
 }
 
 fn vad_checkpoint(control: &ExecutionControl) -> Result<(), TranscribeError> {
@@ -763,6 +928,23 @@ impl<D: SpeechProbabilityDetector> SpeechProbabilityDetector for ObservedVad<'_,
                     .map_err(TranscribeError::Unavailable)?;
                 vad_checkpoint(self.control)?;
                 Ok(probabilities)
+            })
+            .map_err(TranscribeError::message)
+    }
+
+    fn probabilities_bounded(
+        &mut self,
+        audio_length: usize,
+        read: &mut dyn FnMut(&mut [f32]) -> Result<(), String>,
+        emit: &mut dyn FnMut(&[f32]) -> Result<(), String>,
+    ) -> Result<(), String> {
+        vad_checkpoint(self.control).map_err(TranscribeError::message)?;
+        self.progress
+            .stage(BatchStage::VadDetection, || {
+                self.detector
+                    .probabilities_bounded(audio_length, read, emit)
+                    .map_err(TranscribeError::Unavailable)?;
+                vad_checkpoint(self.control)
             })
             .map_err(TranscribeError::message)
     }
@@ -832,6 +1014,29 @@ mod tests {
         fn probabilities(&mut self, samples: ChannelAudioView<'_>) -> Result<Vec<f32>, String> {
             Ok(vec![0.0; samples.samples().len().div_ceil(512)])
         }
+
+        fn probabilities_bounded(
+            &mut self,
+            audio_length: usize,
+            read: &mut dyn FnMut(&mut [f32]) -> Result<(), String>,
+            emit: &mut dyn FnMut(&[f32]) -> Result<(), String>,
+        ) -> Result<(), String> {
+            collect_vad_fixture(self, audio_length, read, emit)
+        }
+    }
+
+    fn collect_vad_fixture(
+        detector: &mut impl SpeechProbabilityDetector,
+        audio_length: usize,
+        read: &mut dyn FnMut(&mut [f32]) -> Result<(), String>,
+        emit: &mut dyn FnMut(&[f32]) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let mut samples = vec![0.0; audio_length];
+        if !samples.is_empty() {
+            read(&mut samples)?;
+            emit(&detector.probabilities(ChannelAudioView::new(&samples)?)?)?;
+        }
+        Ok(())
     }
 
     struct InjectedProvider;
@@ -1066,6 +1271,15 @@ mod tests {
                 release.recv().map_err(|_| "detection release closed")?;
             }
             Ok(vec![0.0; samples.samples().len().div_ceil(512)])
+        }
+
+        fn probabilities_bounded(
+            &mut self,
+            audio_length: usize,
+            read: &mut dyn FnMut(&mut [f32]) -> Result<(), String>,
+            emit: &mut dyn FnMut(&[f32]) -> Result<(), String>,
+        ) -> Result<(), String> {
+            collect_vad_fixture(self, audio_length, read, emit)
         }
     }
 
@@ -1399,7 +1613,7 @@ mod tests {
             request_timeout: Duration::from_secs(1),
             upload_timeout: Duration::from_secs(1),
             request_body_limit: RequestBodyLimit::new(8_192)?,
-        })
+        })?
         .with_file_decoders(gigaam_audio::FileDecoders::new(vec![Arc::new(
             gigaam_format_wav::Wave,
         )])?))
@@ -1429,6 +1643,64 @@ mod tests {
         assert!(line.contains("\"event\":\"transcribe_phase\""), "{line}");
         assert!(line.contains(&format!("\"phase\":\"{phase}\"")), "{line}");
         assert!(line.contains(&format!("\"state\":\"{state}\"")), "{line}");
+    }
+
+    #[tokio::test]
+    async fn native_upload_uses_selected_file_provider_after_spooling() -> Result<(), String> {
+        use gigaam_audio::{AudioFile, FileDecoder, FileDecoderProvider, FileFormatMatch};
+        struct Provider;
+        impl FileDecoderProvider for Provider {
+            fn name(&self) -> &'static str {
+                "selected"
+            }
+            fn identify(&self, prefix: &[u8], _: Option<&str>) -> FileFormatMatch {
+                if prefix == b"custom-audio" {
+                    FileFormatMatch::Exact
+                } else {
+                    FileFormatMatch::None
+                }
+            }
+            fn open(
+                &self,
+                mut source: Box<dyn AudioFile>,
+                _: Option<&str>,
+            ) -> Result<FileDecoder, String> {
+                let mut bytes = Vec::new();
+                std::io::Read::read_to_end(&mut source, &mut bytes)
+                    .map_err(|error| error.to_string())?;
+                if bytes == b"custom-audio" {
+                    Err("selected provider received exact upload".into())
+                } else {
+                    Err("wrong upload".into())
+                }
+            }
+        }
+        let fixture = crate::tests::assembly_fixture()?;
+        let telemetry = test_support::prepare(16, 1)?;
+        let admission = Arc::new(AdmissionState::new(&ServiceAdmission::new(
+            1,
+            1,
+            Duration::from_secs(5),
+        )?)?);
+        let state = state_with_telemetry(
+            &fixture,
+            admission,
+            telemetry.metrics_arc(),
+            telemetry.producer(),
+        )?
+        .with_file_decoders(FileDecoders::new(vec![Arc::new(Provider)])?);
+        let request = Request::builder()
+            .uri("/v1/transcribe")
+            .body(axum::body::Body::from("custom-audio"))
+            .map_err(|error| error.to_string())?;
+        let response = project(upload_transcribe(State(state), request).await).await;
+        assert_eq!(response.status, StatusCode::BAD_REQUEST);
+        assert!(
+            std::str::from_utf8(&response.body)
+                .map_err(|error| error.to_string())?
+                .contains("selected provider received exact upload")
+        );
+        Ok(())
     }
 
     #[tokio::test]
@@ -2164,7 +2436,7 @@ mod tests {
             Arc::clone(&metrics),
             telemetry.producer(),
         )?;
-        state.request_body_limit = RequestBodyLimit::new(64 * 1024)?;
+        state.request_body_limit = RequestBodyLimit::new(128 * 1024)?;
         fn request(parts: &[(&str, &str)]) -> Result<Request, String> {
             let mut body = Vec::new();
             for (name, value) in parts {
@@ -2181,8 +2453,16 @@ mod tests {
                 .body(axum::body::Body::from(body))
                 .map_err(|e| e.to_string())
         }
+        fn fixture_reader(state: &HttpState) -> Result<UploadReservation, String> {
+            state
+                .admission
+                .admit_upload()
+                .map(Arc::new)
+                .map(UploadReservation)
+                .map_err(|error| format!("{error:?}"))
+        }
         async fn error_body(state: &HttpState, request: Request) -> Result<String, String> {
-            let error = parse_openai_multipart(state, request)
+            let error = parse_openai_multipart(state, request, fixture_reader(state)?)
                 .await
                 .err()
                 .ok_or("expected refusal")?;
@@ -2210,7 +2490,7 @@ mod tests {
             ("vad_min_silence_ms", "100"),
             ("vad_speech_pad_ms", "30"),
         ];
-        let input = parse_openai_multipart(&state, request(&valid)?)
+        let input = parse_openai_multipart(&state, request(&valid)?, fixture_reader(&state)?)
             .await
             .map_err(|e| format!("{e:?}"))?;
         assert!(input.vad.is_some());
@@ -2235,7 +2515,8 @@ mod tests {
                 .contains("prompt is not supported")
         );
         let over = "x".repeat(16 * 1024 + 1);
-        let response = openai_transcribe(State(state), request(&[("prompt", &over)])?).await;
+        let response =
+            openai_transcribe(State(state.clone()), request(&[("prompt", &over)])?).await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let body = to_bytes(response.into_body(), 4096)
             .await
@@ -2250,6 +2531,320 @@ mod tests {
         Ok(())
     }
 
+    struct LargeResponseDecoder;
+
+    impl WindowDecoder for LargeResponseDecoder {
+        fn silence_capability(&self) -> gigaam_recognition::SilenceCapability {
+            gigaam_recognition::SilenceCapability::LegacyBlank
+        }
+        fn frame_rate(&self) -> FrameRate {
+            FrameRate::new(25.0).expect("fixture frame rate is valid")
+        }
+        fn decode(
+            &mut self,
+            features: gigaam_audio::FeatureMatrixView<'_>,
+        ) -> Result<Decoded, String> {
+            let word = gigaam_recognition::Word::new("x".repeat(8 * 1024 * 1024), 0.0, 0.01)?;
+            Decoded::new(
+                vec![word],
+                vec![false; features.frames()],
+                features.frames(),
+                0.0,
+            )
+        }
+    }
+
+    #[tokio::test]
+    async fn large_responses_release_delivery_after_socket_drop_and_refuse_projection_quota()
+    -> Result<(), String> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        async fn send(
+            address: std::net::SocketAddr,
+            path: &str,
+            content_type: &str,
+            body: &[u8],
+        ) -> Result<tokio::net::TcpStream, String> {
+            let mut client = tokio::net::TcpStream::connect(address)
+                .await
+                .map_err(|e| e.to_string())?;
+            let headers = format!(
+                "POST {path} HTTP/1.1\r\nHost: {address}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            client
+                .write_all(headers.as_bytes())
+                .await
+                .map_err(|e| e.to_string())?;
+            client.write_all(body).await.map_err(|e| e.to_string())?;
+            Ok(client)
+        }
+        let fixture = crate::tests::assembly_fixture()?;
+        let audio = crate::tests::pcm16_wav_silence(8000, 640)?;
+        let mut multipart = b"--b\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\ngigaam-v3\r\n--b\r\nContent-Disposition: form-data; name=\"file\"; filename=\"silence.wav\"\r\n\r\n".to_vec();
+        multipart.extend_from_slice(&audio);
+        multipart.extend_from_slice(b"\r\n--b--\r\n");
+        for (path, content_type, body) in [
+            (
+                "/v1/transcribe?ext=wav&response_version=2",
+                "audio/wav",
+                &audio,
+            ),
+            (
+                "/v1/audio/transcriptions",
+                "multipart/form-data; boundary=b",
+                &multipart,
+            ),
+        ] {
+            let telemetry = test_support::prepare(32, 1)?;
+            let admission = Arc::new(AdmissionState::new(&ServiceAdmission::new(
+                2,
+                2,
+                Duration::from_secs(20),
+            )?)?);
+            let mut state = state_with_telemetry(
+                &fixture,
+                Arc::clone(&admission),
+                telemetry.metrics_arc(),
+                telemetry.producer(),
+            )?;
+            Arc::get_mut(&mut state.context)
+                .ok_or("test context shared")?
+                .capabilities
+                .scheduler = Arc::new(ExecutionScheduler::spawn(LargeResponseDecoder));
+            state.request_timeout = Duration::from_secs(20);
+            let quota = std::num::NonZeroU64::new(64 * 1024 * 1024).ok_or("positive quota")?;
+            state.scratch = crate::scratch::ScratchSpace::new(std::env::temp_dir(), quota)
+                .map_err(|e| e.to_string())?;
+            let scratch = state.scratch.clone();
+            let router = routes(state.clone()).merge(openai_routes(state));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .map_err(|e| e.to_string())?;
+            let address = listener.local_addr().map_err(|e| e.to_string())?;
+            let server = tokio::spawn(async move { axum::serve(listener, router).await });
+            let mut slow = send(address, path, content_type, body).await?;
+            let mut first = [0_u8; 1024];
+            let count = tokio::time::timeout(Duration::from_secs(20), slow.read(&mut first))
+                .await
+                .map_err(|e| e.to_string())?
+                .map_err(|e| e.to_string())?;
+            assert!(
+                std::str::from_utf8(&first[..count])
+                    .map_err(|e| e.to_string())?
+                    .starts_with("HTTP/1.1 200")
+            );
+            assert_eq!(admission.available_http(), 2);
+            let spare = admission
+                .admit_response()
+                .map_err(|_| "one spare delivery slot")?;
+            assert!(
+                admission.admit_response().is_err(),
+                "slow response retains its delivery slot"
+            );
+            drop(spare);
+            let mut next = send(address, path, content_type, body).await?;
+            let mut received = Vec::new();
+            tokio::time::timeout(Duration::from_secs(30), next.read_to_end(&mut received))
+                .await
+                .map_err(|e| e.to_string())?
+                .map_err(|e| e.to_string())?;
+            assert!(received.starts_with(b"HTTP/1.1 200"));
+            assert!(received.len() > 8 * 1024 * 1024);
+            drop(slow);
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    if let (Ok(first), Ok(second)) =
+                        (admission.admit_response(), admission.admit_response())
+                    {
+                        drop((first, second));
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .map_err(|e| e.to_string())?;
+            let mut probe = scratch.create().map_err(|e| e.to_string())?;
+            std::io::Write::write_all(&mut probe, &vec![0; 64 * 1024 * 1024])
+                .map_err(|e| e.to_string())?;
+            drop(probe);
+            server.abort();
+
+            let telemetry = test_support::prepare(32, 1)?;
+            let admission = Arc::new(AdmissionState::new(&ServiceAdmission::new(
+                2,
+                2,
+                Duration::from_secs(20),
+            )?)?);
+            let mut state = state_with_telemetry(
+                &fixture,
+                Arc::clone(&admission),
+                telemetry.metrics_arc(),
+                telemetry.producer(),
+            )?;
+            Arc::get_mut(&mut state.context)
+                .ok_or("test context shared")?
+                .capabilities
+                .scheduler = Arc::new(ExecutionScheduler::spawn(LargeResponseDecoder));
+            state.request_timeout = Duration::from_secs(20);
+            let quota = std::num::NonZeroU64::new(12 * 1024 * 1024).ok_or("positive quota")?;
+            state.scratch = crate::scratch::ScratchSpace::new(std::env::temp_dir(), quota)
+                .map_err(|e| e.to_string())?;
+            let scratch = state.scratch.clone();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .map_err(|e| e.to_string())?;
+            let address = listener.local_addr().map_err(|e| e.to_string())?;
+            let server = tokio::spawn(async move {
+                axum::serve(listener, routes(state.clone()).merge(openai_routes(state))).await
+            });
+            let mut client = send(address, path, content_type, body).await?;
+            let mut response = Vec::new();
+            tokio::time::timeout(Duration::from_secs(30), client.read_to_end(&mut response))
+                .await
+                .map_err(|e| e.to_string())?
+                .map_err(|e| e.to_string())?;
+            let text = String::from_utf8(response).map_err(|e| e.to_string())?;
+            assert!(text.starts_with("HTTP/1.1 503"), "{text}");
+            let projection_error = if path.starts_with("/v1/transcribe") {
+                "native response I/O"
+            } else {
+                "OpenAI response I/O"
+            };
+            assert!(text.contains(projection_error), "{text}");
+            assert_eq!(admission.available_http(), 2);
+            let mut probe = scratch.create().map_err(|e| e.to_string())?;
+            std::io::Write::write_all(&mut probe, &vec![0; 12 * 1024 * 1024])
+                .map_err(|e| e.to_string())?;
+            server.abort();
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn completed_file_responses_cross_the_http_socket() -> Result<(), String> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let fixture = crate::tests::assembly_fixture()?;
+        let telemetry = test_support::prepare(32, 1)?;
+        let admission = Arc::new(AdmissionState::new(&ServiceAdmission::new(
+            2,
+            2,
+            Duration::from_secs(5),
+        )?)?);
+        let metrics = telemetry.metrics_arc();
+        let mut state = state_with_telemetry(
+            &fixture,
+            Arc::clone(&admission),
+            Arc::clone(&metrics),
+            telemetry.producer(),
+        )?;
+        let limit = std::num::NonZeroU64::new(65_536).ok_or("positive quota")?;
+        state.scratch = crate::scratch::ScratchSpace::new(std::env::temp_dir(), limit)
+            .map_err(|e| e.to_string())?;
+        let scratch = state.scratch.clone();
+        let router = routes(state.clone()).merge(openai_routes(state));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .map_err(|e| e.to_string())?;
+        let address = listener.local_addr().map_err(|e| e.to_string())?;
+        let server = tokio::spawn(async move { axum::serve(listener, router).await });
+        let audio = crate::tests::pcm16_wav_silence(8000, 640)?;
+        let mut multipart = b"--b\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\ngigaam-v3\r\n--b\r\nContent-Disposition: form-data; name=\"file\"; filename=\"silence.wav\"\r\n\r\n".to_vec();
+        multipart.extend_from_slice(&audio);
+        multipart.extend_from_slice(b"\r\n--b--\r\n");
+        for (path, content_type, body) in [
+            ("/v1/transcribe?ext=wav", "audio/wav", audio.clone()),
+            (
+                "/v1/audio/transcriptions",
+                "multipart/form-data; boundary=b",
+                multipart.clone(),
+            ),
+        ] {
+            let mut client = tokio::net::TcpStream::connect(address)
+                .await
+                .map_err(|e| e.to_string())?;
+            let headers = format!(
+                "POST {path} HTTP/1.1\r\nHost: {address}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            client
+                .write_all(headers.as_bytes())
+                .await
+                .map_err(|e| e.to_string())?;
+            client.write_all(&body).await.map_err(|e| e.to_string())?;
+            let mut response = Vec::new();
+            tokio::time::timeout(Duration::from_secs(5), client.read_to_end(&mut response))
+                .await
+                .map_err(|e| e.to_string())?
+                .map_err(|e| e.to_string())?;
+            let text = String::from_utf8(response).map_err(|e| e.to_string())?;
+            let (headers, body) = text.split_once("\r\n\r\n").ok_or("missing HTTP headers")?;
+            assert!(headers.starts_with("HTTP/1.1 200"), "{headers}");
+            assert!(
+                headers.contains("content-type: application/json"),
+                "{headers}"
+            );
+            assert!(
+                headers.contains(&format!("content-length: {}", body.len())),
+                "{headers}"
+            );
+            if path.starts_with("/v1/audio/") {
+                assert_eq!(body, "{\"text\":\"\"}");
+            } else {
+                assert!(body.contains("\"text\":\"\""), "{body}");
+            }
+        }
+        let _first = admission
+            .admit_response()
+            .map_err(|_| "first delivery slot")?;
+        let _second = admission
+            .admit_response()
+            .map_err(|_| "second delivery slot")?;
+        for (path, content_type, body) in [
+            (
+                "/v1/transcribe?ext=wav&response_version=2",
+                "audio/wav",
+                audio,
+            ),
+            (
+                "/v1/audio/transcriptions",
+                "multipart/form-data; boundary=b",
+                multipart,
+            ),
+        ] {
+            let mut client = tokio::net::TcpStream::connect(address)
+                .await
+                .map_err(|e| e.to_string())?;
+            let headers = format!(
+                "POST {path} HTTP/1.1\r\nHost: {address}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            client
+                .write_all(headers.as_bytes())
+                .await
+                .map_err(|e| e.to_string())?;
+            client.write_all(&body).await.map_err(|e| e.to_string())?;
+            let mut response = Vec::new();
+            tokio::time::timeout(Duration::from_secs(5), client.read_to_end(&mut response))
+                .await
+                .map_err(|e| e.to_string())?
+                .map_err(|e| e.to_string())?;
+            let text = String::from_utf8(response).map_err(|e| e.to_string())?;
+            assert!(text.starts_with("HTTP/1.1 503"), "{text}");
+            assert!(text.contains("service overloaded, retry later"), "{text}");
+            if path.starts_with("/v1/transcribe") {
+                assert!(text.contains("\"code\":\"overloaded\""), "{text}");
+            }
+            assert_eq!(admission.available_http(), 2);
+        }
+        assert_eq!(metric_counter(&metrics, "asr_overload_total"), 2);
+        assert_eq!(metric_counter(&metrics, "asr_transcribe_errors_total"), 0);
+        let mut probe = scratch.create().map_err(|e| e.to_string())?;
+        std::io::Write::write_all(&mut probe, &vec![0; 65_536]).map_err(|e| e.to_string())?;
+        server.abort();
+        Ok(())
+    }
+
     #[tokio::test]
     async fn multipart_counts_epilogue_and_preserves_file_bytes() -> Result<(), String> {
         let fixture = crate::tests::assembly_fixture()?;
@@ -2261,7 +2856,7 @@ mod tests {
         )?)?);
         let mut state = state_with_telemetry(
             &fixture,
-            admission,
+            Arc::clone(&admission),
             telemetry.metrics_arc(),
             telemetry.producer(),
         )?;
@@ -2274,6 +2869,13 @@ mod tests {
                 .header("content-type", "multipart/form-data; boundary=b")
                 .body(axum::body::Body::from(bytes))
                 .map_err(|e| e.to_string())
+        };
+        let reader = || {
+            admission
+                .admit_upload()
+                .map(Arc::new)
+                .map(UploadReservation)
+                .map_err(|error| format!("{error:?}"))
         };
         state.request_body_limit = RequestBodyLimit::new(100 * 1024)?;
         let mut preamble = vec![b'p'; 33 * 1024];
@@ -2294,23 +2896,23 @@ mod tests {
         padding.extend(audio);
         padding.extend(b"\r\n--b\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\ngigaam-v3\r\n--b--\r\n");
         for candidate in [preamble, long_header, padding] {
-            let input = parse_openai_multipart(&state, request(candidate)?)
+            let input = parse_openai_multipart(&state, request(candidate)?, reader()?)
                 .await
                 .map_err(|e| format!("{e:?}"))?;
-            assert_eq!(input.audio, audio);
+            assert_eq!(input.audio.len(), audio.len());
         }
         state.request_body_limit = RequestBodyLimit::new(body.len() + 1)?;
-        let below = parse_openai_multipart(&state, request(body.clone())?)
+        let below = parse_openai_multipart(&state, request(body.clone())?, reader()?)
             .await
             .map_err(|e| format!("{e:?}"))?;
-        assert_eq!(below.audio, audio);
+        assert_eq!(below.audio.len(), audio.len());
         state.request_body_limit = RequestBodyLimit::new(body.len())?;
-        let input = parse_openai_multipart(&state, request(body.clone())?)
+        let input = parse_openai_multipart(&state, request(body.clone())?, reader()?)
             .await
             .map_err(|e| format!("{e:?}"))?;
-        assert_eq!(input.audio, audio);
+        assert_eq!(input.audio.len(), audio.len());
         body.push(b'x');
-        let error = parse_openai_multipart(&state, request(body)?)
+        let error = parse_openai_multipart(&state, request(body)?, reader()?)
             .await
             .err()
             .ok_or("expected size refusal")?;
@@ -2546,6 +3148,210 @@ mod tests {
         .map_err(|e| e.to_string())?;
         server.abort();
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn chunked_multipart_counts_epilogue_after_file_before_model() -> Result<(), String> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let fixture = crate::tests::assembly_fixture()?;
+        let telemetry = test_support::prepare(32, 1)?;
+        let admission = Arc::new(AdmissionState::new(&ServiceAdmission::new(
+            1,
+            1,
+            Duration::from_secs(5),
+        )?)?);
+        let mut state = state_with_telemetry(
+            &fixture,
+            admission,
+            telemetry.metrics_arc(),
+            telemetry.producer(),
+        )?;
+        let audio = crate::tests::pcm16_wav_silence(8000, 640)?;
+        let mut body = b"--boundary\r\nContent-Disposition: form-data; name=\"file\"; filename=\"silence.wav\"\r\n\r\n".to_vec();
+        body.extend_from_slice(&audio);
+        body.extend_from_slice(b"\r\n--boundary\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\ngigaam-v3\r\n--boundary--\r\nepilogue");
+        state.request_body_limit = RequestBodyLimit::new(body.len())?;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .map_err(|e| e.to_string())?;
+        let address = listener.local_addr().map_err(|e| e.to_string())?;
+        let server = tokio::spawn(async move { axum::serve(listener, openai_routes(state)).await });
+        async fn send(address: std::net::SocketAddr, body: &[u8]) -> Result<String, String> {
+            let mut stream = tokio::net::TcpStream::connect(address)
+                .await
+                .map_err(|e| e.to_string())?;
+            stream.write_all(format!("POST /v1/audio/transcriptions HTTP/1.1\r\nHost: {address}\r\nContent-Type: Multipart/Form-Data; boundary=boundary\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n").as_bytes()).await.map_err(|e| e.to_string())?;
+            for chunk in body.chunks(7) {
+                stream
+                    .write_all(format!("{:x}\r\n", chunk.len()).as_bytes())
+                    .await
+                    .map_err(|e| e.to_string())?;
+                stream.write_all(chunk).await.map_err(|e| e.to_string())?;
+                stream.write_all(b"\r\n").await.map_err(|e| e.to_string())?;
+            }
+            stream
+                .write_all(b"0\r\n\r\n")
+                .await
+                .map_err(|e| e.to_string())?;
+            let mut response = Vec::new();
+            stream
+                .read_to_end(&mut response)
+                .await
+                .map_err(|e| e.to_string())?;
+            String::from_utf8(response).map_err(|e| e.to_string())
+        }
+        let accepted = send(address, &body).await?;
+        assert!(accepted.starts_with("HTTP/1.1 200"), "{accepted}");
+        body.push(b'x');
+        let rejected = send(address, &body).await?;
+        assert!(rejected.starts_with("HTTP/1.1 413"), "{rejected}");
+        server.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn incomplete_fields_wait_for_epilogue_body_limit() -> Result<(), String> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let fixture = crate::tests::assembly_fixture()?;
+        let telemetry = test_support::prepare(32, 1)?;
+        let admission = Arc::new(AdmissionState::new(&ServiceAdmission::new(
+            1,
+            1,
+            Duration::from_secs(5),
+        )?)?);
+        let mut state = state_with_telemetry(
+            &fixture,
+            admission,
+            telemetry.metrics_arc(),
+            telemetry.producer(),
+        )?;
+        state.request_body_limit = RequestBodyLimit::new(256)?;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .map_err(|e| e.to_string())?;
+        let address = listener.local_addr().map_err(|e| e.to_string())?;
+        let server = tokio::spawn(async move { axum::serve(listener, openai_routes(state)).await });
+        let body = b"--b\r\nContent-Disposition: form-data; name=\"file\"; filename=\"x.wav\"\r\n\r\nwave\r\n--b--\r\n";
+        for oversized in [false, true] {
+            let mut stream = tokio::net::TcpStream::connect(address)
+                .await
+                .map_err(|e| e.to_string())?;
+            stream.write_all(format!("POST /v1/audio/transcriptions HTTP/1.1\r\nHost: {address}\r\nContent-Type: multipart/form-data; boundary=b\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:x}\r\n", body.len()).as_bytes()).await.map_err(|e| e.to_string())?;
+            stream.write_all(body).await.map_err(|e| e.to_string())?;
+            stream.write_all(b"\r\n").await.map_err(|e| e.to_string())?;
+            let mut probe = [0_u8; 1];
+            assert!(
+                tokio::time::timeout(Duration::from_millis(250), stream.read(&mut probe))
+                    .await
+                    .is_err(),
+                "response arrived before epilogue and request end"
+            );
+            let epilogue = if oversized {
+                vec![b'x'; 256]
+            } else {
+                vec![b'x'; 8]
+            };
+            stream
+                .write_all(format!("{:x}\r\n", epilogue.len()).as_bytes())
+                .await
+                .map_err(|e| e.to_string())?;
+            stream
+                .write_all(&epilogue)
+                .await
+                .map_err(|e| e.to_string())?;
+            stream
+                .write_all(b"\r\n0\r\n\r\n")
+                .await
+                .map_err(|e| e.to_string())?;
+            let mut response = Vec::new();
+            tokio::time::timeout(Duration::from_secs(3), stream.read_to_end(&mut response))
+                .await
+                .map_err(|e| e.to_string())?
+                .map_err(|e| e.to_string())?;
+            let text = String::from_utf8(response).map_err(|e| e.to_string())?;
+            let status = if oversized {
+                "HTTP/1.1 413"
+            } else {
+                "HTTP/1.1 400"
+            };
+            assert!(text.starts_with(status), "{text}");
+        }
+        server.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn multipart_file_spool_preserves_exact_nonuniform_bytes() -> Result<(), String> {
+        use gigaam_audio::{
+            AudioFile, FileDecoder, FileDecoderProvider, FileDecoders, FileFormatMatch,
+        };
+        struct Inspect(Vec<u8>);
+        impl FileDecoderProvider for Inspect {
+            fn name(&self) -> &'static str {
+                "inspect-bytes"
+            }
+            fn identify(&self, _: &[u8], _: Option<&str>) -> FileFormatMatch {
+                FileFormatMatch::Exact
+            }
+            fn open(
+                &self,
+                mut source: Box<dyn AudioFile>,
+                _: Option<&str>,
+            ) -> Result<FileDecoder, String> {
+                let mut actual = Vec::new();
+                std::io::Read::read_to_end(&mut source, &mut actual).map_err(|e| e.to_string())?;
+                if actual != self.0 {
+                    return Err("uploaded bytes differ".into());
+                }
+                Err("uploaded bytes match".into())
+            }
+        }
+        let fixture = crate::tests::assembly_fixture()?;
+        let telemetry = test_support::prepare(32, 1)?;
+        let admission = Arc::new(AdmissionState::new(&ServiceAdmission::new(
+            1,
+            1,
+            Duration::from_secs(5),
+        )?)?);
+        let state = state_with_telemetry(
+            &fixture,
+            admission,
+            telemetry.metrics_arc(),
+            telemetry.producer(),
+        )?;
+        let expected: Vec<u8> = (0..4097_usize)
+            .map(|index| u8::try_from(index % 251).expect("modulo 251 fits u8"))
+            .collect();
+        let mut body = b"--boundary\r\nContent-Disposition: form-data; name=\"file\"; filename=\"sound.bin\"\r\n\r\n".to_vec();
+        body.extend_from_slice(&expected);
+        body.extend_from_slice(b"\r\n--boundary\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\ngigaam-v3\r\n--boundary--\r\n");
+        let chunks: Vec<Result<axum::body::Bytes, std::convert::Infallible>> = body
+            .chunks(7)
+            .map(|chunk| Ok(axum::body::Bytes::copy_from_slice(chunk)))
+            .collect();
+        let request = Request::builder()
+            .header("content-type", "multipart/form-data; boundary=boundary")
+            .body(axum::body::Body::from_stream(futures_util::stream::iter(
+                chunks,
+            )))
+            .map_err(|e| e.to_string())?;
+        let reader = state
+            .admission
+            .admit_upload()
+            .map(Arc::new)
+            .map(UploadReservation)
+            .map_err(|e| format!("{e:?}"))?;
+        let input = parse_openai_multipart(&state, request, reader)
+            .await
+            .map_err(|e| format!("{e:?}"))?;
+        assert_eq!(input.audio.len(), expected.len());
+        let decoders = FileDecoders::new(vec![Arc::new(Inspect(expected))])?;
+        let result = input.audio.open(decoders, input.extension.as_deref());
+        match result {
+            Err(error) if error == "uploaded bytes match" => Ok(()),
+            Err(error) => Err(error),
+            Ok(_) => Err("inspection unexpectedly produced a decoder".into()),
+        }
     }
 
     #[tokio::test]

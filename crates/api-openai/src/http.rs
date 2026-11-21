@@ -9,7 +9,7 @@
 
 //! OpenAI batch HTTP routes and multipart adaptation.
 
-use crate::openai::ApiError;
+use crate::openai::{ApiError, Input, MultipartField};
 use axum::{
     Router,
     extract::{Request, State},
@@ -21,6 +21,7 @@ use gigaam_service_host::{
     AdmissionRefusal,
     batch::{
         AdmittedWorkResult, BatchModel, BatchRequest, BatchService, TranscribeError, UploadError,
+        UploadReservation,
     },
     wire::{RequestId, json_ok, with_request_id},
 };
@@ -75,7 +76,8 @@ async fn openai_models(State(state): State<BatchService>) -> Response {
 pub(super) async fn parse_openai_multipart(
     state: &BatchService,
     request: Request,
-) -> Result<crate::openai::Input, crate::openai::ApiError> {
+    reader: UploadReservation,
+) -> Result<Input, ApiError> {
     let boundary = request
         .headers()
         .get(CONTENT_TYPE)
@@ -118,15 +120,34 @@ pub(super) async fn parse_openai_multipart(
             .name()
             .ok_or_else(|| crate::openai::ApiError::bad("field name is required", None))?
             .to_owned();
-        let filename = field.file_name().map(str::to_owned);
-        let mut bytes = Vec::new();
-        while let Some(chunk) = field.chunk().await.map_err(openai_multipart_error)? {
-            if name != "file" && chunk.len() > 16 * 1024 - bytes.len() {
-                return Err(ApiError::bad("multipart text field exceeds 16 KiB", None));
+        if name == "file" {
+            let filename = field.file_name().map(str::to_owned);
+            let mut upload = None;
+            while let Some(chunk) = field.chunk().await.map_err(openai_multipart_error)? {
+                if chunk.is_empty() {
+                    continue;
+                }
+                let scratch = match upload.take() {
+                    Some(scratch) => scratch,
+                    None => state.start_upload(&reader).map_err(openai_upload_error)?,
+                };
+                upload = Some(scratch.append(chunk).await.map_err(openai_upload_error)?);
             }
-            bytes.extend_from_slice(&chunk);
+            let audio = match upload {
+                Some(upload) => upload.into(),
+                None => Vec::new().into(),
+            };
+            fields.push(MultipartField::File { filename, audio });
+        } else {
+            let mut bytes = Vec::new();
+            while let Some(chunk) = field.chunk().await.map_err(openai_multipart_error)? {
+                if chunk.len() > 16 * 1024 - bytes.len() {
+                    return Err(ApiError::bad("multipart text field exceeds 16 KiB", None));
+                }
+                bytes.extend_from_slice(&chunk);
+            }
+            fields.push(MultipartField::Text { name, bytes });
         }
-        fields.push((name, filename, bytes));
     }
     crate::openai::parse_fields_for_variant(fields, state.variant())
 }
@@ -142,6 +163,14 @@ fn openai_multipart_error(error: multra::Error) -> ApiError {
     ApiError::new(status, error.to_string(), None)
 }
 
+fn openai_upload_error(_: std::io::Error) -> ApiError {
+    ApiError::new(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "upload storage unavailable",
+        None,
+    )
+}
+
 pub(super) async fn openai_transcribe(
     State(state): State<BatchService>,
     request: Request,
@@ -155,8 +184,8 @@ pub(super) async fn openai_transcribe(
             return crate::openai::ApiError::bad(error, None).response();
         }
     };
-    let (mut input, reader) = match state
-        .read_upload(|| parse_openai_multipart(&state, request))
+    let (input, reader) = match state
+        .read_upload(|reader| parse_openai_multipart(&state, request, reader))
         .await
     {
         Ok(input) => input,
@@ -194,7 +223,6 @@ pub(super) async fn openai_transcribe(
             return complete_early_response(&state, &request_id, started, openai_refusal(refusal));
         }
     };
-    let audio = std::mem::take(&mut input.audio);
     let gap = TurnGap::new(1.0).expect("one second is a valid OpenAI segment grouping gap");
     let request = BatchRequest {
         model: match input.engine {
@@ -202,34 +230,50 @@ pub(super) async fn openai_transcribe(
             crate::openai::Engine::Rnnt => BatchModel::Rnnt,
         },
         extension: input.extension.clone(),
-        audio,
+        audio: input.audio,
         channel_policy: BatchChannelPolicy::single_output(),
         turn_gap: gap,
         vad: input.vad,
         scored: input.segment,
         downmix: true,
     };
+    let format = input.format;
     let result = state
-        .execute(
+        .execute_file(
             admission,
             request_id.text().to_owned(),
             started,
             request,
-            move |output| {
-                crate::openai_response::project(crate::openai_response::ProjectionInput {
-                    result: &output.result,
-                    duration: output.duration,
-                    format: input.format,
-                    word: input.word,
-                    segment: input.segment,
-                    gap,
-                })
-                .map_err(TranscribeError::Unavailable)
+            move |mut result, mut writer| {
+                let duration = result.duration;
+                let (_, words) = result.replay();
+                crate::openai_response::write_stored(
+                    words,
+                    crate::openai_response::StoredProjectionInput {
+                        duration,
+                        format,
+                        word: input.word,
+                        segment: input.segment,
+                        gap,
+                    },
+                    &mut writer,
+                )
             },
         )
         .await;
     let response = match result {
-        AdmittedWorkResult::Completed(Ok(response)) => response,
+        AdmittedWorkResult::Completed(Ok(file)) => {
+            let length = file.len();
+            Response::builder()
+                .header(axum::http::header::CONTENT_TYPE, format.content_type())
+                .header(axum::http::header::CONTENT_LENGTH, length)
+                .body(file.into_body())
+                .expect("static response headers are valid")
+        }
+        AdmittedWorkResult::Refused(refusal) => {
+            state.record_refusal(refusal);
+            openai_refusal(refusal)
+        }
         AdmittedWorkResult::Completed(Err(error)) => {
             state.record_error();
             let (status, message) = match error {

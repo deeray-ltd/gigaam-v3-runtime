@@ -151,6 +151,7 @@ pub(crate) struct AdmissionState {
     phase_tx: watch::Sender<AdmissionPhase>,
     http: Arc<Semaphore>,
     uploads: Arc<Semaphore>,
+    responses: Arc<Semaphore>,
     ws: Arc<Semaphore>,
     max_http: usize,
     max_ws: usize,
@@ -167,6 +168,7 @@ impl AdmissionState {
             phase_tx,
             http,
             uploads: Arc::new(Semaphore::new(settings.max_uploads.get())),
+            responses: Arc::new(Semaphore::new(max_http)),
             ws,
             max_http,
             max_ws,
@@ -215,6 +217,14 @@ impl AdmissionState {
     /// Commits HTTP admission only after the second lifecycle read while the permit is owned.
     pub(crate) fn admit_http(&self) -> Result<HttpAdmission, AdmissionRefusal> {
         self.reserve_http()?.commit(self)
+    }
+
+    /// Acquired by already admitted batch work. Completed responses keep their own capacity
+    /// while the recognition worker is free to accept another request.
+    pub(crate) fn admit_response(&self) -> Result<OwnedSemaphorePermit, AdmissionRefusal> {
+        Arc::clone(&self.responses)
+            .try_acquire_owned()
+            .map_err(|_| AdmissionRefusal::Overloaded)
     }
 
     fn reserve_http(&self) -> Result<PendingHttpAdmission, AdmissionRefusal> {
