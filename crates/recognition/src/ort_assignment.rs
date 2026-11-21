@@ -348,6 +348,10 @@ mod tests {
         let cpu = record("CPUExecutionProvider", "encoder/cast", "ai.onnx", "Cast");
         let records = vec![cuda.clone(), cpu.clone(), cuda.clone()];
         let evidence = evidence_from_records(records.clone())?;
+        assert_eq!(
+            evidence.fingerprint().to_hex(),
+            "75b02c6adc9e16da23f41e420b3389c2998e7cdf992006722f4149018d362a4a"
+        );
         assert_eq!(evidence.cpu_assignments(), 1);
         assert_eq!(evidence.cuda_assignments(), 2);
         assert_eq!(evidence.cpu_operator_types(), &[("Cast".to_owned(), 1)]);
