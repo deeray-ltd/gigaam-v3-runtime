@@ -15,8 +15,8 @@ locked Cargo metadata and checksum-verified local registry crate archives.
   is a procedural macro are excluded because their code is executed during compilation,
   not statically linked into `asr-serve`.
 - Registry packages: 111; the three selected closures are identical.
-- Cargo.lock SHA-256: `621712c72e2cb223b5d738151ede4747c3a55f92b736f9a257e4e45bf922052b`.
-- Closure SHA-256: `58308d0dde4371edaded6ed1c6aa6a7a84767bedc1b8f756e85b4fb4695a06e2`.
+- Cargo.lock SHA-256: `1f422f5d4faab0036721633604a48c1f2bc40f512594ef32831fadd5247d676e`.
+- Closure SHA-256: `edf3f6a5c2c88510af9adc68b391dd3b92dfa80283f19e1be3474acd0bdef83e`.
 - Project workspace code is covered by the parent `COPYING` and `COPYING.LESSER` files.
 
 ## Package records
@@ -258,10 +258,10 @@ locked Cargo metadata and checksum-verified local registry crate archives.
 - Packaged license, permission, and copyright notices:
   - `LICENSE.txt`: `texts/25a0874d15e7c834a47c3adc80901edb2219759254992023ef1010c3065413d5.txt` (SHA-256 `25a0874d15e7c834a47c3adc80901edb2219759254992023ef1010c3065413d5`).
 
-### `flate2` 1.1.9
+### `flate2` 1.1.11
 - License expression: `MIT OR Apache-2.0`.
-- Locked crate archive SHA-256: `843fba2746e448b37e26a819579957415c8cef339bf08564fe8b7ddbd959573c`.
-- Source archive: `https://static.crates.io/crates/flate2/flate2-1.1.9.crate`.
+- Locked crate archive SHA-256: `626d4928326b646e70f65ed36fc7cf9f206bdb68a0019ee7c6b4709da4e084c4`.
+- Source archive: `https://static.crates.io/crates/flate2/flate2-1.1.11.crate`.
 - Repository declared by package metadata: `https://github.com/rust-lang/flate2-rs`.
 - Authors declared by package metadata: `Alex Crichton <alex@alexcrichton.com>`; `Josh Triplett <josh@joshtriplett.org>`.
 - Packaged license, permission, and copyright notices:
@@ -516,10 +516,10 @@ locked Cargo metadata and checksum-verified local registry crate archives.
   - `LICENSE-APACHE`: `texts/a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2.txt` (SHA-256 `a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2`).
   - `LICENSE-MIT`: `texts/df9cfd06d8a44d9a671eadd39ffd97f166481da015a30f45dfd27886209c5922.txt` (SHA-256 `df9cfd06d8a44d9a671eadd39ffd97f166481da015a30f45dfd27886209c5922`).
 
-### `miniz_oxide` 0.8.9
+### `miniz_oxide` 0.9.1
 - License expression: `MIT OR Zlib OR Apache-2.0`.
-- Locked crate archive SHA-256: `1fa76a2c86f704bdb222d66965fb3d63269ce38518b83cb0575fca855ebb6316`.
-- Source archive: `https://static.crates.io/crates/miniz_oxide/miniz_oxide-0.8.9.crate`.
+- Locked crate archive SHA-256: `b63fbc4a50860e98e7b2aa7804ded1db5cbc3aff9193adaff57a6931bf7c4b4c`.
+- Source archive: `https://static.crates.io/crates/miniz_oxide/miniz_oxide-0.9.1.crate`.
 - Repository declared by package metadata: `https://github.com/Frommi/miniz_oxide/tree/master/miniz_oxide`.
 - Authors declared by package metadata: `Frommi <daniil.liferenko@gmail.com>`; `oyvindln <oyvindln@users.noreply.github.com>`; `Rich Geldreich richgel99@gmail.com`.
 - Packaged license, permission, and copyright notices:

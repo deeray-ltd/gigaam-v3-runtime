@@ -204,24 +204,18 @@ mod tests {
 
     #[test]
     fn compression_roundtrips_and_uses_utf8_byte_lengths() -> Result<(), String> {
-        for text in [
-            "",
-            "hello",
-            "Привет, мир!",
-            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        for (text, expected) in [
+            ("", 0.0),
+            ("hello", 5.0 / 13.0),
+            ("Привет, мир!", 21.0 / 31.0),
+            ("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", 40.0 / 12.0),
         ] {
             let encoded = compressed(text)?;
             let mut decoded = String::new();
             ZlibDecoder::new(encoded.as_slice())
                 .read_to_string(&mut decoded)
-                .map_err(|e| e.to_string())?;
+                .map_err(|error| error.to_string())?;
             assert_eq!(decoded, text);
-            let expected = if text.is_empty() {
-                0.0
-            } else {
-                f64::from(u32::try_from(text.len()).map_err(|e| e.to_string())?)
-                    / f64::from(u32::try_from(encoded.len()).map_err(|e| e.to_string())?)
-            };
             assert_eq!(compression_ratio(text)?, expected);
         }
         assert_eq!(compressed("")?, vec![120, 156, 3, 0, 0, 0, 0, 1]);
