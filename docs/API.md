@@ -363,10 +363,11 @@ Native FLAC batch inputs retain the STREAMINFO and encoded audio frames. The bat
 decoder skips other declared metadata blocks. For Ogg-FLAC, it preserves decoder
 setup and skips optional embedded pictures and comment packets.
 
-Batch readers split supported interleaved PCM ranges in Matroska and ISO-BMFF
-into complete source frames before decoding. The reported sample clock follows
-the same physical samples. The normal packet path remains available for
-ISO-BMFF sample descriptions whose layout and packet width cannot be verified.
+Batch readers split PCM ranges in Matroska and ISO-BMFF at the selected PCM
+decoder's frame boundaries. The reported sample clock follows the same decoded
+samples and channel order. ISO-BMFF sample descriptions with advisory or
+unspecified packet fields use the same bounded reads and existing PCM
+interpretation.
 
 ## Offline CLI
 

@@ -157,11 +157,13 @@ struct BatchPcm {
     track_id: u32,
     frame_bytes: u64,
     max_frames: u64,
+    require_complete_frames: bool,
 }
 
 struct PendingPcm {
     track_id: u32,
     pos: u64,
+    packet_len: u64,
     total_frames: u64,
     consumed_frames: u64,
     pts: Timestamp,
@@ -655,32 +657,34 @@ impl<'s> IsoMp4Reader<'s> {
         Ok(())
     }
 
-    /// Enables bounded reads only when the selected track establishes packed interleaved PCM.
-    /// The caller verifies the PCM codec and supplies its complete frame width.
-    /// A false result leaves the reader's existing packet behavior unchanged.
+    /// Caps batch reads at the frame width consumed by the selected PCM decoder.
+    /// The caller verifies the codec and supplies the decoder's complete frame width.
     pub fn enable_batch_pcm(
         &mut self,
         track_id: u32,
         frame_bytes: std::num::NonZeroUsize,
         max_frames: std::num::NonZeroUsize,
-    ) -> Result<bool> {
+    ) -> Result<()> {
         if !self.deferred_tables || self.selected_track != Some(track_id) {
             return unsupported_error("isomp4: PCM batch track is not selected");
         }
         if self.pending_pcm.is_some() || self.track_states.iter().any(|track| track.track_id == track_id && track.next_sample != 0) {
             return decode_error("isomp4: PCM batch mode must be enabled before reading");
         }
-        let state = self.track_states.iter().find(|track| track.track_id == track_id)
-            .ok_or(Error::DecodeError("isomp4: selected PCM track is missing"))?;
-        let declared = self.moov.traks[state.track_num].mdia.minf.stbl.stsd.interleaved_pcm_frame_bytes();
         let width = u64::try_from(frame_bytes.get()).map_err(|_| Error::DecodeError("isomp4: PCM frame width exceeds u64"))?;
-        if declared != Some(width) { return Ok(false); }
-        if frame_bytes.get().checked_mul(max_frames.get()).is_none() {
+        if frame_bytes.get().checked_mul(max_frames.get())
+            .and_then(|bytes| bytes.checked_add(frame_bytes.get() - 1)).is_none() {
             return decode_error("isomp4: invalid PCM frame geometry");
         }
         let max_frames = u64::try_from(max_frames.get()).map_err(|_| Error::DecodeError("isomp4: PCM frame limit exceeds u64"))?;
-        self.batch_pcm = Some(BatchPcm { track_id, frame_bytes: width, max_frames });
-        Ok(true)
+        let state = self.track_states.iter().find(|track| track.track_id == track_id)
+            .ok_or(Error::DecodeError("isomp4: selected PCM track is missing"))?;
+        let declared = self.moov.traks[state.track_num].mdia.minf.stbl.stsd.interleaved_pcm_frame_bytes();
+        // Keep the previous alignment policy for verified layouts. Other layouts
+        // still use the decoder's frame width to bound reads.
+        let require_complete_frames = declared == Some(width);
+        self.batch_pcm = Some(BatchPcm { track_id, frame_bytes: width, max_frames, require_complete_frames });
+        Ok(())
     }
 
     fn next_pcm_packet(&mut self) -> Result<Packet> {
@@ -688,15 +692,21 @@ impl<'s> IsoMp4Reader<'s> {
         let pending = self.pending_pcm.as_mut().ok_or(Error::DecodeError("isomp4: PCM range missing"))?;
         let end_frame = pending.consumed_frames.checked_add(layout.max_frames)
             .unwrap_or(u64::MAX).min(pending.total_frames);
-        let frames = end_frame - pending.consumed_frames;
         let offset = pending.consumed_frames.checked_mul(layout.frame_bytes)
             .ok_or(Error::DecodeError("isomp4: PCM offset overflow"))?;
         let pos = pending.pos.checked_add(offset).ok_or(Error::DecodeError("isomp4: PCM position overflow"))?;
-        let len = frames.checked_mul(layout.frame_bytes).ok_or(Error::DecodeError("isomp4: PCM length overflow"))?;
-        let len = usize::try_from(len).map_err(|_| Error::DecodeError("isomp4: PCM chunk too large"))?;
-        // Both factors are u64, so their product fits u128. Pending ranges are
-        // nonempty and frame-aligned, making total_frames nonzero. The two
-        // ordered frame indices produce monotonic floor-rounded tick edges.
+        // Include the original packet remainder only in the last read. The decoder
+        // consumes complete frames and already discards any terminal remainder.
+        let end = if end_frame == pending.total_frames {
+            pending.packet_len
+        } else {
+            end_frame.checked_mul(layout.frame_bytes)
+                .ok_or(Error::DecodeError("isomp4: PCM offset overflow"))?
+        };
+        let len = usize::try_from(end - offset).map_err(|_| Error::DecodeError("isomp4: PCM chunk too large"))?;
+        // Both factors are u64, so their product fits u128. Split packets
+        // contain more than the configured nonzero number of frames. Ordered
+        // frame indices produce monotonic floor-rounded tick edges.
         let edge = |index: u64| -> Result<u64> {
             let ticks = u128::from(pending.duration.get()) * u128::from(index) / u128::from(pending.total_frames);
             u64::try_from(ticks).map_err(|_| Error::DecodeError("isomp4: PCM time overflow"))
@@ -809,7 +819,10 @@ impl<'s> IsoMp4Reader<'s> {
         let sample_data_desc =
             seg.sample_data(track.track_num, track.next_sample, false, &mut lookup)?;
         if let Some(layout) = &self.batch_pcm {
-            if info.track_id == layout.track_id && u64::from(sample_data_desc.size) % layout.frame_bytes != 0 {
+            if layout.require_complete_frames
+                && info.track_id == layout.track_id
+                && u64::from(sample_data_desc.size) % layout.frame_bytes != 0
+            {
                 return decode_error("isomp4: PCM sample has incomplete interleaved frames");
             }
         }
@@ -825,12 +838,15 @@ impl<'s> IsoMp4Reader<'s> {
             track.next_sample_pos
         };
 
+        let next_sample_pos = pos.checked_add(u64::from(sample_data_desc.size))
+            .ok_or(Error::DecodeError("isomp4: sample extent overflows"))?;
+
         // Advance the track's current segment to the next sample's segment.
         track.cur_seg = info.seg_idx;
 
         // Advance the track's next sample number and position.
         track.next_sample += 1;
-        track.next_sample_pos = pos + u64::from(sample_data_desc.size);
+        track.next_sample_pos = next_sample_pos;
 
         Ok(Some(SampleDataInfo { pos, len: sample_data_desc.size }))
     }
@@ -1070,11 +1086,15 @@ impl FormatReader for IsoMp4Reader<'_> {
         };
 
         if let Some(layout) = &self.batch_pcm {
-            if next_sample_info.track_id == layout.track_id && sample_info.len != 0 {
+            let packet_len = u64::from(sample_info.len);
+            let total_frames = packet_len / layout.frame_bytes;
+            if next_sample_info.track_id == layout.track_id && total_frames > layout.max_frames {
+                self.iter.validate_packet_extent(sample_info.pos, packet_len)?;
                 self.pending_pcm = Some(PendingPcm {
                     track_id: next_sample_info.track_id,
                     pos: sample_info.pos,
-                    total_frames: u64::from(sample_info.len) / layout.frame_bytes,
+                    packet_len,
+                    total_frames,
                     consumed_frames: 0,
                     pts: next_sample_info.ts,
                     duration: next_sample_info.dur,

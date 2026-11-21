@@ -936,13 +936,18 @@ impl<R: ReadAtom> AtomIterator<R> {
         }
     }
 
-    pub(crate) fn read_packet_at(&mut self, pos: u64, len: usize) -> Result<Box<[u8]>>
-    where R: MediaSource {
-        let end = pos.checked_add(u64::try_from(len).map_err(|_| AtomError::UnexpectedEndOfAtom)?)
-            .ok_or(AtomError::UnexpectedEndOfAtom)?;
+    pub(crate) fn validate_packet_extent(&self, pos: u64, len: u64) -> Result<()> {
+        let end = pos.checked_add(len).ok_or(AtomError::UnexpectedEndOfAtom)?;
         if self.len.is_none_or(|length| end > length) {
             return Err(AtomError::UnexpectedEndOfAtom);
         }
+        Ok(())
+    }
+
+    pub(crate) fn read_packet_at(&mut self, pos: u64, len: usize) -> Result<Box<[u8]>>
+    where R: MediaSource {
+        let size = u64::try_from(len).map_err(|_| AtomError::UnexpectedEndOfAtom)?;
+        self.validate_packet_extent(pos, size)?;
         let resume = *self.raw_resume.get_or_insert_with(|| self.reader.pos());
         let result = self.seek_reader(pos).and_then(|()| {
             self.reader.read_boxed_slice_exact(len).map_err(Into::into)
