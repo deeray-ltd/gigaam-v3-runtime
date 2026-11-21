@@ -40,7 +40,12 @@ impl Atom for FtypAtom {
         let minor = it.read_quad_bytes()?;
 
         // The remainder of the Ftyp atom contains the FourCCs of compatible brands.
-        let n_brands = (data_len - 8) / 4;
+        let brand_bytes = data_len - 8;
+        if it.defer_fixed_table(brand_bytes)?.is_some() {
+            // The batch reader needs the file type atom, but does not use its compatible brands.
+            return Ok(FtypAtom { major, minor, compatible: Vec::new() });
+        }
+        let n_brands = brand_bytes / 4;
 
         // Limit the maximum initial capacity to prevent malicious files from using all the
         // available memory.

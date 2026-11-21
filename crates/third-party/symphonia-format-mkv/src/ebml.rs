@@ -292,15 +292,15 @@ pub(crate) struct EbmlIterator<R: ReadEbml, S: EbmlSchema> {
     current: Option<EbmlElementHeader<S>>,
     /// The length of the container, if known.
     len: Option<u64>,
-    /// Whether opt-in binary reads may retain a range in the seekable source.
-    defer_binary: bool,
+    /// Whether opt-in element reads may skip or retain ranges in the seekable source.
+    defer_data: bool,
 }
 
 impl<R: ReadEbml, S: EbmlSchema> EbmlIterator<R, S> {
-    pub(crate) fn new(reader: R, schema: S, len: Option<u64>, defer_binary: bool) -> Self {
+    pub(crate) fn new(reader: R, schema: S, len: Option<u64>, defer_data: bool) -> Self {
         // Pre-allocate the iteration stack.
         let stack = Vec::with_capacity(S::MAX_DEPTH);
-        Self { reader, schema, stack, current: None, len, defer_binary }
+        Self { reader, schema, stack, current: None, len, defer_data }
     }
 
     /// Get a reference to the schema being used by the EBML reader.
@@ -841,6 +841,18 @@ impl<R: ReadEbml, S: EbmlSchema> EbmlIterator<R, S> {
         Ok(self.read_string()?.unwrap_or_default())
     }
 
+    /// Consume metadata text without loading its payload in the seekable batch reader.
+    /// Returning an empty string lets the caller retain the element's presence.
+    pub(crate) fn read_metadata_string(&mut self) -> Result<String> {
+        if self.defer_data {
+            self.take_data_range(EbmlDataType::String)?;
+            Ok(String::new())
+        }
+        else {
+            self.read_string_no_default()
+        }
+    }
+
     fn seek_exact(&mut self, pos: u64) -> Result<()> {
         if self.reader.seek_buffered(pos) != pos && self.reader.seek(SeekFrom::Start(pos))? != pos {
             return Err(EbmlError::SeekOutOfRange);
@@ -869,12 +881,17 @@ impl<R: ReadEbml, S: EbmlSchema> EbmlIterator<R, S> {
 
     /// Retain the current binary element as a source range when deferred reads are enabled.
     pub(crate) fn read_binary_or_range(&mut self) -> Result<BinaryData> {
-        if !self.defer_binary {
-            return self.read_binary().map(BinaryData::Inline);
+        if self.defer_data {
+            self.take_data_range(EbmlDataType::Binary).map(BinaryData::Source)
         }
+        else {
+            self.read_binary().map(BinaryData::Inline)
+        }
+    }
 
+    fn take_data_range(&mut self, data_type: EbmlDataType) -> Result<Range<u64>> {
         let header = self.current_or_err()?;
-        if header.element_info.ok_or(EbmlError::UnknownElement)?.data_type() != EbmlDataType::Binary {
+        if header.element_info.ok_or(EbmlError::UnknownElement)?.data_type() != data_type {
             return Err(EbmlError::UnexpectedElementDataType);
         }
         let start = self.reader.pos();
@@ -893,7 +910,7 @@ impl<R: ReadEbml, S: EbmlSchema> EbmlIterator<R, S> {
         }
         self.seek_exact(end)?;
         self.discard_current();
-        Ok(BinaryData::Source(start..end))
+        Ok(start..end)
     }
 
     /// Read a boxed slice of the binary data carried by a binary element.

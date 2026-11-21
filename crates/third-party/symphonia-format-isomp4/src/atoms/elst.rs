@@ -36,6 +36,13 @@ impl Atom for ElstAtom {
         }
 
         let entry_count = it.read_u32()?;
+        let entry_size = if version == 0 { 12 } else { 20 };
+
+        // Batch traversal does not apply edit lists to the decoded packet clock.
+        // Validate the complete table without retaining its records in this mode.
+        if it.defer_fixed_table(u64::from(entry_count) * entry_size)?.is_some() {
+            return Ok(ElstAtom { entries: Vec::new() });
+        }
 
         // Limit the maximum initial capacity to prevent malicious files from using all the
         // available memory.

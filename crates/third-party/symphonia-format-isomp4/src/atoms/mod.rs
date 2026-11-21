@@ -7,7 +7,7 @@
 
 use std::{io::SeekFrom, num::NonZeroU64};
 
-use symphonia_core::io::{MediaSource, ReadBytes, SeekBuffered};
+use symphonia_core::io::{MediaSource, ReadBytes, ScopedStream, SeekBuffered};
 
 /// Atom parsing limits.
 pub mod limits {
@@ -646,6 +646,25 @@ impl<R: ReadAtom> AtomIterator<R> {
         // consumes it in bounded chunks, without allocating the declared count.
         self.ignore_bytes(bytes)?;
         Ok(Some(pos))
+    }
+
+    pub(crate) fn read_scoped_batch_atom_data<T>(
+        &mut self,
+        bytes: u64,
+        read: impl FnOnce(&mut ScopedStream<&mut R>) -> Result<T>,
+    ) -> Result<Option<T>> {
+        if !self.defer_sample_sizes {
+            return Ok(None);
+        }
+        self.ensure_parent_atom_data(bytes)?;
+        let start = self.reader.pos();
+        let result = read(&mut ScopedStream::new(&mut self.reader, bytes));
+        // Validate the unread portion even when the parser stopped or failed early.
+        // Use the source position because a failed read may partially consume bytes.
+        let consumed = self.reader.pos().checked_sub(start).ok_or(AtomError::UnexpectedPosition)?;
+        let remaining = bytes.checked_sub(consumed).ok_or(AtomError::Overrun)?;
+        self.ignore_bytes(remaining)?;
+        result.map(Some)
     }
 
     /// Consume the iterator and return the inner reader.
