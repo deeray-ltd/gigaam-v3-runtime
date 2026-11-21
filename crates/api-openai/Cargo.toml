@@ -14,7 +14,7 @@ gigaam-service-host = { path = "../service-host", default-features = false }
 gigaam-model-package = { path = "../model-package" }
 gigaam-transcription = { path = "../transcription" }
 axum = { version = "0.8.9", features = ["multipart"] }
-flate2 = { version = "=1.1.9", default-features = false, features = ["miniz_oxide"] }
+flate2 = { version = "=1.1.11", default-features = false, features = ["miniz_oxide"] }
 
 [dev-dependencies]
 tokio = { version = "1.53.1", features = ["macros", "rt"] }
