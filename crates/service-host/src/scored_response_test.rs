@@ -43,8 +43,8 @@ async fn scored_batch_projects_actual_segment_metadata() -> Result<(), String> {
             }
             Decoded::new_with_tokens(DecodedTokensInput {
                 words: vec![
-                    Word::new("hello".into(), 0.25, 0.5)?,
-                    Word::new("world".into(), 0.5, 0.75)?,
+                    Word::new("Привет,".into(), 0.25, 0.5)?,
+                    Word::new("мир!".into(), 0.5, 0.75)?,
                 ],
                 silence: vec![false],
                 output_frames: 1,
@@ -96,8 +96,8 @@ async fn scored_batch_projects_actual_segment_metadata() -> Result<(), String> {
     assert_eq!(
         text,
         format!(
-            "{{\"task\":\"transcribe\",\"language\":\"russian\",\"duration\":1,\"text\":\"hello world\",\"words\":[{{\"word\":\"hello\",\"start\":0.25,\"end\":0.5}},{{\"word\":\"world\",\"start\":0.5,\"end\":0.75}}],\"segments\":[{{\"id\":0,\"seek\":0,\"start\":0.25,\"end\":0.75,\"text\":\"hello world\",\"tokens\":[7,8,9],\"temperature\":0,\"avg_logprob\":-0.5,\"compression_ratio\":{},\"no_speech_prob\":0.5}}]}}",
-            11.0_f64 / 19.0
+            "{{\"task\":\"transcribe\",\"language\":\"russian\",\"duration\":1,\"text\":\"Привет, мир!\",\"words\":[{{\"word\":\"Привет,\",\"start\":0.25,\"end\":0.5}},{{\"word\":\"мир!\",\"start\":0.5,\"end\":0.75}}],\"segments\":[{{\"id\":0,\"seek\":0,\"start\":0.25,\"end\":0.75,\"text\":\"Привет, мир!\",\"tokens\":[7,8,9],\"temperature\":0,\"avg_logprob\":-0.5,\"compression_ratio\":{},\"no_speech_prob\":0.5}}]}}",
+            21.0_f64 / 31.0
         )
     );
     Ok(())
