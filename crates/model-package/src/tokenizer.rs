@@ -2,7 +2,8 @@
 // Copyright (C) 2026 Yuriy Krasilnikov
 // Copyright (C) 2026 Deeray Ltd.
 
-use sentencepiece_model::SentencePieceModel;
+use crate::sentencepiece_model::ModelProto;
+use prost::Message;
 
 /// Decoder-relevant SentencePiece piece kind.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -54,13 +55,13 @@ pub(crate) fn read_sentencepiece(
     bytes: &[u8],
     vocabulary: Vec<String>,
 ) -> Result<TokenizerMetadata, String> {
-    let model = SentencePieceModel::from_slice(bytes).map_err(|e| format!("invalid model: {e}"))?;
-    if model.pieces().len() != vocabulary.len() {
+    let model = ModelProto::decode(bytes).map_err(|e| format!("invalid model: {e}"))?;
+    if model.pieces.len() != vocabulary.len() {
         return Err("piece count differs from vocabulary".into());
     }
     let mut pieces = Vec::with_capacity(vocabulary.len());
     let mut unknown = None;
-    for (index, (piece, word)) in model.pieces().iter().zip(vocabulary).enumerate() {
+    for (index, (piece, word)) in model.pieces.iter().zip(vocabulary).enumerate() {
         if piece.piece() != word || word.is_empty() {
             return Err(format!("piece {index} differs from vocabulary"));
         }
@@ -78,7 +79,7 @@ pub(crate) fn read_sentencepiece(
         }
         pieces.push(TokenizerPiece { text: word, kind });
     }
-    let trainer = model.trainer();
+    let trainer = model.trainer_spec.as_ref();
     let unknown_id = trainer.map_or(0, |t| t.unk_id());
     let unknown_id = usize::try_from(unknown_id).map_err(|_| "invalid unknown id".to_string())?;
     if unknown != Some(unknown_id) {
@@ -93,11 +94,12 @@ pub(crate) fn read_sentencepiece(
         return Err("unknown piece declaration differs from indexed piece".into());
     }
     let unknown_surface = trainer.map_or(" ⁇ ", |t| t.unk_surface()).to_string();
-    let normalizer = model.normalizer();
+    let normalizer = model.normalizer_spec.as_ref();
     let add_dummy_prefix = normalizer.is_none_or(|n| n.add_dummy_prefix());
     let remove_extra_whitespaces = normalizer.is_none_or(|n| n.remove_extra_whitespaces());
     let active_denormalizer = model
-        .denormalizer()
+        .denormalizer_spec
+        .as_ref()
         .is_some_and(|n| !n.precompiled_charsmap().is_empty());
     Ok(TokenizerMetadata::SentencePiece {
         pieces,
@@ -111,8 +113,10 @@ pub(crate) fn read_sentencepiece(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sentencepiece_model::{
+        ModelProto, NormalizerSpec, TrainerSpec, model_proto::SentencePiece,
+    };
     use prost::Message;
-    use sentencepiece_model::{ModelProto, NormalizerSpec, SentencePiece, TrainerSpec};
 
     fn fixture() -> ModelProto {
         ModelProto {
@@ -136,6 +140,10 @@ mod tests {
     #[test]
     fn reads_model_and_refuses_inconsistent_vocabulary_and_unknown_types() {
         let model = fixture();
+        assert_eq!(
+            model.encode_to_vec(),
+            include_bytes!("../tests/fixtures/sentencepiece.bin")
+        );
         let vocab = vec!["<unk>".into(), "▁а".into()];
         let result =
             read_sentencepiece(&model.encode_to_vec(), vocab.clone()).expect("valid model");

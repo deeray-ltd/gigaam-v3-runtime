@@ -198,7 +198,13 @@ mod tests {
 mod sentencepiece_tests {
     use super::*;
     use prost::Message;
-    use sentencepiece_model::{ModelProto, SentencePiece};
+    mod sentencepiece_model {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../model-package/src/generated/sentencepiece.rs"
+        ));
+    }
+    use sentencepiece_model::{ModelProto, model_proto::SentencePiece};
 
     fn projector() -> TokenTextProjector {
         let entries = [("<unk>", 2), ("▁", 1), ("а", 1), ("б", 1), ("<s>", 3)];
@@ -221,6 +227,36 @@ mod sentencepiece_tests {
         let metadata = TokenizerMetadata::from_sentencepiece(&model.encode_to_vec(), vocabulary)
             .expect("valid model");
         TokenTextProjector::new(metadata).expect("supported model")
+    }
+    #[test]
+    fn generated_model_matches_protoc_witness() {
+        use sentencepiece_model::{NormalizerSpec, TrainerSpec};
+        let model = ModelProto {
+            pieces: vec![
+                SentencePiece {
+                    piece: Some("<unk>".into()),
+                    r#type: Some(2),
+                    ..Default::default()
+                },
+                SentencePiece {
+                    piece: Some("▁а".into()),
+                    r#type: Some(1),
+                    ..Default::default()
+                },
+            ],
+            trainer_spec: Some(TrainerSpec::default()),
+            normalizer_spec: Some(NormalizerSpec::default()),
+            ..Default::default()
+        };
+        let bytes = model.encode_to_vec();
+        assert_eq!(
+            bytes,
+            include_bytes!("../../model-package/tests/fixtures/sentencepiece.bin")
+        );
+        let metadata =
+            TokenizerMetadata::from_sentencepiece(&bytes, vec!["<unk>".into(), "▁а".into()])
+                .unwrap();
+        assert!(TokenTextProjector::new(metadata).is_ok());
     }
     #[test]
     fn exact_unknown_and_boundary_surfaces_keep_occurrence_ranges() {

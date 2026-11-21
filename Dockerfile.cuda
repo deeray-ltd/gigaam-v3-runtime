@@ -72,6 +72,7 @@ COPY --from=ort /opt/ort/LICENSE /usr/share/licenses/gigaam-v3-runtime/onnxrunti
 COPY --from=ort /opt/ort/ThirdPartyNotices.txt /usr/share/licenses/gigaam-v3-runtime/onnxruntime/ThirdPartyNotices.txt
 COPY COPYING COPYING.LESSER THIRD_PARTY.md /usr/share/licenses/gigaam-v3-runtime/
 COPY crates/service/licenses/rust/ /usr/share/licenses/gigaam-v3-runtime/rust/
+COPY crates/model-package/licenses/sentencepiece/ /usr/share/licenses/gigaam-v3-runtime/sentencepiece/
 
 ENV ASR_ENCODER_EP=cuda \
     LD_LIBRARY_PATH=/app/ort/lib:/usr/local/cuda/lib64:/usr/local/nvidia/lib:/usr/local/nvidia/lib64 \

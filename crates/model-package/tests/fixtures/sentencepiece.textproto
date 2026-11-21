@@ -1,0 +1,4 @@
+pieces { piece: "<unk>" type: UNKNOWN }
+pieces { piece: "▁а" type: NORMAL }
+trainer_spec {}
+normalizer_spec {}

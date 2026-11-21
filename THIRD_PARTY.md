@@ -25,53 +25,36 @@ This file is itself copied into every final image. A local image built from an e
 revision is evidence only for the inputs it actually used; it is not a release candidate
 and does not establish a published image tag.
 
+## SentencePiece model schema
+
+The Model Package reader uses Rust types generated from Google's SentencePiece
+v0.2.3 protobuf schema. The schema and the generated types are covered by the
+[Apache License 2.0](crates/model-package/licenses/sentencepiece/LICENSE).
+The license and copyright notice ship in the SentencePiece directory of all
+service images.
+
 ## Rust dependency inventory
 
-The locked Cargo metadata currently resolves seven workspace packages and 120 registry
-packages when all features are considered. Direct registry dependencies are:
+Selected direct registry dependencies are listed below. The generated service notices carry
+the locked package versions, license expressions and redistributed texts.
 
 | Crate | Workspace owner | Role | License expression in metadata |
 | --- | --- | --- | --- |
 | ort | gigaam-recognition | Dynamic ONNX Runtime binding with the API-24 graph-assignment surface; its transitive ort-sys binding follows the same expression. | MIT OR Apache-2.0 |
 | sha2 | gigaam-recognition | Canonical CUDA graph-assignment SHA-256 binding. | MIT OR Apache-2.0 |
+| prost | gigaam-model-package | Decodes the existing SentencePiece model protobuf format. | Apache-2.0 |
 | opus-decoder | gigaam-audio | Optional Opus decoding. | MIT OR Apache-2.0 |
 | symphonia | gigaam-audio | Optional MP3, FLAC, Vorbis, AAC, ISO-BMFF, Ogg, WAV, PCM, and Matroska decoding. | MPL-2.0 |
 | axum | gigaam-service | HTTP and WebSocket routing. | MIT |
 | tokio | gigaam-service | Async runtime, networking, signals, synchronization, and timers. | MIT |
 | tungstenite | gigaam-service | WebSocket close-frame and capacity-error types shared with axum's WebSocket support. | MIT OR Apache-2.0 |
 
-The metadata license expressions for the 120 registry packages are:
-
-| License expression | Packages |
-| --- | ---: |
-| MIT OR Apache-2.0 | 61 |
-| MIT | 21 |
-| MPL-2.0 | 13 |
-| Apache-2.0 OR MIT | 6 |
-| MIT/Apache-2.0 | 5 |
-| Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT | 3 |
-| BSD-2-Clause OR Apache-2.0 OR MIT | 2 |
-| (Apache-2.0 OR MIT) AND BSD-3-Clause | 1 |
-| (MIT OR Apache-2.0) AND Unicode-3.0 | 1 |
-| Apache-2.0 | 1 |
-| Apache-2.0 OR BSL-1.0 | 1 |
-| ISC | 1 |
-| MIT AND BSD-3-Clause | 1 |
-| MIT OR Apache-2.0 OR LGPL-2.1-or-later | 1 |
-| Unlicense OR MIT | 1 |
-| Zlib OR Apache-2.0 OR MIT | 1 |
-
-License expressions are package metadata, not a claim that all alternatives have the same
-redistribution conditions. In particular, the 13 Symphonia packages are MPL-2.0, and the
-r-efi package offers an LGPL-2.1-or-later alternative alongside MIT and Apache-2.0.
-
 ## Static Rust dependency payload
 
 Every final CPU, CUDA, and TensorRT image copies the generated payload at
-`/usr/share/licenses/gigaam-v3-runtime/rust`. It describes the exact non-dev Rust registry
-closure statically linked into `gigaam-service` for `x86_64-unknown-linux-gnu`. The CPU,
-CUDA, and TensorRT service configurations currently resolve to the same 101-package static
-closure; packages whose only library target is a procedural macro are excluded because they
+`/usr/share/licenses/gigaam-v3-runtime/rust`. It lists the non-dev Rust registry dependencies discovered from the locked Cargo
+metadata for `gigaam-service` on `x86_64-unknown-linux-gnu`. The generator checks that the
+CPU, CUDA and TensorRT inventories agree; packages whose only library target is a procedural macro are excluded because they
 run during compilation and are not linked into `asr-serve`. Project workspace code remains
 covered by the parent `COPYING` and `COPYING.LESSER` files.
 
@@ -90,8 +73,8 @@ file in their locked crate archives. Their generated records retain the metadata
 the exact checksum-bound crates.io source archive. Every MPL-2.0 record also links the canonical
 [Mozilla Public License 2.0 terms](https://www.mozilla.org/MPL/2.0/) and identifies the archive
 as its source-acquisition location.
-CI compares the checked-in payload with those inputs and verifies that each final image carries
-the payload; image construction remains the release-artifact witness.
+CI compares the checked-in payload with those inputs. The Dockerfiles copy the payload to each
+final image. Inspect the built images to verify the shipped files.
 
 ## Attribution
 

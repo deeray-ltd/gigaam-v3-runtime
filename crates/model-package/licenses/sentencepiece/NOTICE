@@ -1,0 +1,4 @@
+Copyright 2016 Google Inc.
+
+The Rust SentencePiece model types were generated from the upstream
+SentencePiece v0.2.3 protobuf schema. They are licensed under Apache-2.0.
