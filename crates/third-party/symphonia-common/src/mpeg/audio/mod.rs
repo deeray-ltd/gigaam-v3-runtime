@@ -8,8 +8,8 @@
 use symphonia_core::audio::{Channels, layouts};
 use symphonia_core::codecs::CodecProfile;
 use symphonia_core::codecs::audio::well_known::profiles::*;
-use symphonia_core::errors::{Result, decode_error, unsupported_error};
-use symphonia_core::io::{BitReaderLtr, FiniteBitStream, ReadBitsLtr};
+use symphonia_core::errors::{Error, Result, decode_error, unsupported_error};
+use symphonia_core::io::{BitReaderLtr, FiniteBitStream, ReadBitsLtr, ReadBytes, ScopedStream};
 
 /// MPEG4 audio object types.
 #[non_exhaustive]
@@ -224,6 +224,34 @@ pub struct AudioSpecificConfig {
     pub sbr_ps_info: Option<(u32, Option<Channels>)>,
     pub sbr_present: bool,
     pub ps_present: bool,
+}
+
+/// Retain a prefix sufficient for [`AudioSpecificConfig::read`] and advance over all `len` bytes.
+/// The caller supplies the declared length and a reader bounded to the enclosing field.
+pub fn read_audio_specific_config_prefix<B: ReadBytes>(
+    reader: &mut B,
+    len: u64,
+) -> Result<Box<[u8]>> {
+    // Each object type uses at most 5+6 bits, each frequency at most 4+24 bits,
+    // and each channel configuration 4 bits. Include explicit SBR/PS signaling.
+    const INITIAL_BITS: u64 = (11 + 28 + 4) + (28 + 11 + 4);
+    // GA flags and core delay, scalable layer, ER BSAC fields, resilience flags,
+    // and extension_flag3. Also allow the two-bit error protection field.
+    const GA_BITS: u64 = (3 + 14) + 3 + 16 + 3 + 1 + 2;
+    // Sync marker, object type, SBR flag, extended rate, and possible PS sync and flag.
+    const SYNC_EXTENSION_BITS: u64 = 11 + 11 + (1 + 28 + 11 + 1);
+    // Cover the bit reader's full reservoir and leave enough unread bits for the
+    // optional sync checks whenever the input extends past this prefix.
+    const LOOKAHEAD_BITS: u64 = 64;
+    const PREFIX_BYTES: u64 =
+        (INITIAL_BITS + GA_BITS + SYNC_EXTENSION_BITS + LOOKAHEAD_BITS).div_ceil(8);
+
+    let prefix_len = usize::try_from(len.min(PREFIX_BYTES))
+        .map_err(|_| Error::LimitError("common (mp4a): configuration prefix size exceeds usize"))?;
+    let mut scoped = ScopedStream::new(reader, len);
+    let prefix = scoped.read_boxed_slice_exact(prefix_len)?;
+    scoped.ignore()?;
+    Ok(prefix)
 }
 
 impl AudioSpecificConfig {
@@ -481,5 +509,65 @@ pub fn get_audio_codec_profile(asc: &AudioSpecificConfig) -> Option<CodecProfile
             }
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use symphonia_core::io::BufReader;
+
+    #[test]
+    fn bounded_configuration_preserves_conditional_aac_fields() -> Result<()> {
+        let fields = [
+            (5_u32, 5), // Explicit SBR object type.
+            (15, 4),
+            (48_000, 24),
+            (2, 4), // Explicit rate and stereo.
+            (15, 4),
+            (24_000, 24),
+            (2, 5), // Explicit extension rate and AAC-LC object type.
+            (0, 1),
+            (1, 1),
+            (0, 14),
+            (1, 1),
+            (0, 1), // GA flags with core delay.
+            (0x2b7, 11),
+            (5, 5),
+            (0, 1), // Optional sync extension turns SBR off.
+        ];
+        let mut bytes = Vec::new();
+        let mut bit = 0;
+        for (value, width) in fields {
+            for shift in (0..width).rev() {
+                if bit % 8 == 0 {
+                    bytes.push(0);
+                }
+                if value & (1 << shift) != 0 {
+                    bytes[bit / 8] |= 1 << (7 - bit % 8);
+                }
+                bit += 1;
+            }
+        }
+
+        let expected = AudioSpecificConfig::read(&bytes)?;
+        assert_eq!(expected.object_type, AudioObjectType::Lc);
+        assert_eq!(expected.sample_rate, 48_000);
+        assert_eq!(expected.samples, 1024);
+        assert_eq!(expected.sbr_ps_info, Some((24_000, None)));
+        assert!(!expected.sbr_present);
+
+        let mut padded = bytes.clone();
+        padded.resize(bytes.len() + 8192, 0xa5);
+        for input in [&bytes[..], &padded[..]] {
+            let mut reader = BufReader::new(input);
+            let len = u64::try_from(input.len()).expect("fixture length fits u64");
+            let prefix = read_audio_specific_config_prefix(&mut reader, len)?;
+            assert_eq!(prefix.len(), input.len().min(32));
+            assert_eq!(reader.pos(), len);
+            assert_eq!(AudioSpecificConfig::read(&prefix)?, expected);
+            assert_eq!(AudioSpecificConfig::read(input)?, expected);
+        }
+        Ok(())
     }
 }

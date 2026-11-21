@@ -9,3 +9,7 @@ used by GigaAM v3 Runtime.
 
 The normalized Cargo manifest uses the published 0.6.1 packaging layout.
 The library source comes from the pinned upstream revision.
+
+The local change enables bounded AAC configuration reads in the existing
+MPEG descriptor parser. Its scope is suitable for a separate proposal to
+Symphonia.

@@ -6,10 +6,13 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 use symphonia_core::codecs::CodecId;
+use symphonia_core::codecs::audio::well_known::CODEC_ID_AAC;
 use symphonia_core::errors::{Result, decode_error, unsupported_error};
 use symphonia_core::io::{FiniteStream, ReadBytes, ScopedStream};
 
 use log::debug;
+
+use super::audio::read_audio_specific_config_prefix;
 
 /// The minimum size of an object descriptor (minimum header size).
 pub const MIN_OBJECT_DESCRIPTOR_SIZE: u64 = 2;
@@ -165,6 +168,19 @@ pub struct ESDescriptor {
 
 impl ObjectDescriptor for ESDescriptor {
     fn read<B: ReadBytes>(reader: &mut B, len: u64) -> Result<Self> {
+        Self::read_inner(reader, len, false)
+    }
+}
+
+impl ESDescriptor {
+    /// Parse an ES descriptor for use with the AAC AudioSpecificConfig parser.
+    /// The AAC configuration contains the prefix used by that parser. Other codecs
+    /// retain their full decoder-specific data.
+    pub fn read_with_bounded_aac_config<B: ReadBytes>(reader: &mut B, len: u64) -> Result<Self> {
+        Self::read_inner(reader, len, true)
+    }
+
+    fn read_inner<B: ReadBytes>(reader: &mut B, len: u64, bound_aac_config: bool) -> Result<Self> {
         // ES Descriptor is an expandable object descriptor. All reads must be scoped to the length
         // defined in the header.
         let mut scoped = ScopedStream::new(reader, len);
@@ -197,7 +213,11 @@ impl ObjectDescriptor for ESDescriptor {
 
             match tag {
                 ClassTag::DecoderConfigDescriptor => {
-                    dec_config = Some(DecoderConfigDescriptor::read(&mut scoped, desc_len)?);
+                    dec_config = Some(DecoderConfigDescriptor::read_inner(
+                        &mut scoped,
+                        desc_len,
+                        bound_aac_config,
+                    )?);
                 }
                 ClassTag::SlConfigDescriptor => {
                     sl_config = Some(SLConfigDescriptor::read(&mut scoped, desc_len)?);
@@ -251,11 +271,20 @@ pub struct DecoderConfigDescriptor {
 
 impl ObjectDescriptor for DecoderConfigDescriptor {
     fn read<B: ReadBytes>(reader: &mut B, len: u64) -> Result<Self> {
+        Self::read_inner(reader, len, false)
+    }
+}
+
+impl DecoderConfigDescriptor {
+    fn read_inner<B: ReadBytes>(reader: &mut B, len: u64, bound_aac_config: bool) -> Result<Self> {
         // Decoder Config Descriptor is an expandable object descriptor. All reads must be scoped to
         // the length defined in the header.
         let mut scoped = ScopedStream::new(reader, len);
 
         let object_type_indication = scoped.read_u8()?;
+        let bound_config = bound_aac_config
+            && codec_id_from_object_type_indication(object_type_indication)
+                == Some(CodecId::Audio(CODEC_ID_AAC));
 
         let (_stream_type, _upstream) = {
             let val = scoped.read_u8()?;
@@ -278,6 +307,10 @@ impl ObjectDescriptor for DecoderConfigDescriptor {
             let (tag, desc_len) = read_object_descriptor_header(&mut scoped)?;
 
             match tag {
+                ClassTag::DecoderSpecificInfo if bound_config => {
+                    let extra_data = read_audio_specific_config_prefix(&mut scoped, desc_len)?;
+                    dec_specific_config = Some(DecoderSpecificInfo { extra_data });
+                }
                 ClassTag::DecoderSpecificInfo => {
                     dec_specific_config = Some(DecoderSpecificInfo::read(&mut scoped, desc_len)?);
                 }
@@ -371,5 +404,60 @@ impl ObjectDescriptor for SLConfigDescriptor {
         scoped.ignore()?;
 
         Ok(SLConfigDescriptor {})
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use symphonia_core::io::BufReader;
+
+    fn es_descriptor(object_type: u8, declared: u8, config: &[u8]) -> Vec<u8> {
+        let mut decoder = vec![object_type, 0x15];
+        decoder.extend([0; 11]); // Buffer size and bit rates.
+        decoder.extend([0x05, declared]);
+        decoder.extend(config);
+        let mut es = vec![0, 1, 0, 0x04, u8::try_from(decoder.len()).expect("small fixture")];
+        es.extend(decoder);
+        es.extend([0x06, 1, 2]); // MP4 SL configuration.
+        es
+    }
+
+    #[test]
+    fn opt_in_only_bounds_aac_and_advances_to_the_end_of_its_descriptor() -> Result<()> {
+        let mut aac = vec![0x11, 0x88]; // AAC-LC, 48 kHz, mono.
+        aac.resize(64, 0xa5);
+        for (object_type, config, expected) in [
+            (0x40, &aac[..], &aac[..32]),
+            (0x40, &aac[..2], &aac[..2]),
+            (0x40, &aac[..1], &aac[..1]),
+            (0x21, &aac[..], &aac[..]), // AVC decoder-specific bytes are preserved.
+        ] {
+            let mut bytes = es_descriptor(
+                object_type,
+                u8::try_from(config.len()).expect("small fixture"),
+                config,
+            );
+            let len = u64::try_from(bytes.len()).expect("fixture length fits u64");
+            bytes.push(0xf1); // Following box data.
+            let mut input = BufReader::new(&bytes);
+            let desc = ESDescriptor::read_with_bounded_aac_config(&mut input, len)?;
+            let retained = desc.dec_config.dec_specific_info.expect("config is present");
+            assert_eq!(retained.extra_data.as_ref(), expected);
+            assert_eq!(input.pos(), len);
+            assert_eq!(input.read_byte()?, 0xf1);
+
+            let desc = ESDescriptor::read(&mut BufReader::new(&bytes), len)?;
+            let retained = desc.dec_config.dec_specific_info.expect("config is present");
+            assert_eq!(retained.extra_data.as_ref(), config);
+        }
+
+        // The prefix itself fits, but the declared AAC config extends past DecoderConfig.
+        let malformed = es_descriptor(0x40, 65, &aac);
+        let len = u64::try_from(malformed.len()).expect("fixture length fits u64");
+        let mut input = BufReader::new(&malformed);
+        assert!(ESDescriptor::read_with_bounded_aac_config(&mut input, len).is_err());
+        assert!(input.pos() < len - 3); // SL configuration was not consumed as AAC data.
+        Ok(())
     }
 }

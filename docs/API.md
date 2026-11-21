@@ -389,6 +389,8 @@ The seekable ISO-BMFF batch reader skips edit-list records and compatible
 brands after checking their declared ranges. It parses elementary stream
 descriptors from the file and skips unused descriptors. Fragment tables stay
 file-backed when the movie metadata follows the audio fragments.
+The batch descriptor reader checks the full AAC configuration range and
+retains the prefix needed by the linked configuration parser.
 
 ## Offline CLI
 
