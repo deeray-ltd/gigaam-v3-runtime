@@ -151,9 +151,18 @@ is unchanged.
 | Status | Meaning |
 | --- | --- |
 | 400 | Invalid header/query/audio input, unavailable requested RNN-T, or another request-domain refusal. |
-| 413 | Request body exceeds the route body limit. This is an Axum layer response; its body is not an application JSON contract. |
+| 413 | Request body exceeds the route body limit; the response body is not an application JSON contract. |
 | 503 | Admission overload or draining, worker failure, a worker queue wait exceeding 60 seconds, or an operational transcription failure. |
 | 504 | The processing deadline expired. |
+
+HTTP batch uploads, decoded audio, intermediate results, and completed response bodies use
+private temporary files. `ASR_BATCH_SCRATCH_DIR` selects an existing trusted writable directory;
+the system temporary directory is the default. `ASR_BATCH_SCRATCH_MAX_BYTES` limits the
+logical bytes held by one service instance, defaults to 8 GiB, and must be positive. Storage
+exhaustion or I/O failure is an operational refusal. Files are unlinked after creation and
+released when their owners close. Completed responses hold separate delivery capacity until
+sent or dropped; if it is exhausted, new batch delivery is refused. Container parsers may
+retain format-specific indexes, so this does not establish a duration-independent memory bound.
 
 A recognition call waits at most 60 seconds to start once its decoder worker queue accepts
 it; that queue-wait expiry returns 503. The separate whole-request processing deadline,

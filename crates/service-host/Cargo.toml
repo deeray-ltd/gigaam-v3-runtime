@@ -18,6 +18,7 @@ gigaam-audio = { path = "../audio" }
 gigaam-recognition = { path = "../recognition", default-features = false }
 gigaam-transcription = { path = "../transcription" }
 axum = { version = "0.8.9", default-features = false, features = ["http1", "matched-path", "original-uri", "tokio", "tower-log", "tracing"] }
+futures-util = { version = "=0.3.34", default-features = false, features = ["std"] }
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "net", "io-util", "signal", "sync", "time"] }
 
 [dev-dependencies]

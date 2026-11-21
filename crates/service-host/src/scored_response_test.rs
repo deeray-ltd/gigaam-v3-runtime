@@ -2,8 +2,32 @@
 // Copyright (C) 2026 Yuriy Krasilnikov
 // Copyright (C) 2026 Deeray Ltd.
 
-use crate::openai_response::{Format, ProjectionInput, project};
-use gigaam_transcription::TurnGap;
+use crate::openai_response::{Format, StoredProjectionInput, write_stored};
+use gigaam_transcription::{TurnGap, WordRecords};
+use std::io::Cursor;
+
+struct ProjectionInput<'a> {
+    pub result: &'a gigaam_transcription::MultiChannelBatchResult,
+    pub duration: f32,
+    pub format: Format,
+    pub word: bool,
+    pub segment: bool,
+    pub gap: TurnGap,
+}
+
+fn project(input: ProjectionInput<'_>) -> Result<axum::response::Response, String> {
+    let [channel] = input.result.channels() else {
+        return Err("OpenAI output requires exactly one selected channel".into());
+    };
+    crate::openai_response::project_channel(
+        channel,
+        input.duration,
+        input.format,
+        input.word,
+        input.segment,
+        input.gap,
+    )
+}
 
 #[tokio::test]
 async fn scored_batch_projects_actual_segment_metadata() -> Result<(), String> {
@@ -100,5 +124,46 @@ async fn scored_batch_projects_actual_segment_metadata() -> Result<(), String> {
             21.0_f64 / 31.0
         )
     );
+
+    let [channel] = result.channels() else {
+        return Err("fixture must produce one channel".into());
+    };
+    let mut records = WordRecords::new(Cursor::new(Vec::new()), 1)?;
+    for item in channel.words() {
+        records.push(0, item.clone())?;
+    }
+    let mut stored = records.finish()?;
+    for format in [Format::Json, Format::Text, Format::Verbose] {
+        for (word, segment) in [(false, false), (true, false), (false, true), (true, true)] {
+            let retained = project(ProjectionInput {
+                result: &result,
+                duration: 1.0,
+                format,
+                word,
+                segment,
+                gap,
+            })?;
+            let retained_body = axum::body::to_bytes(retained.into_body(), usize::MAX)
+                .await
+                .map_err(|error| error.to_string())?;
+            let mut bounded_body = Vec::new();
+            write_stored(
+                &mut stored,
+                StoredProjectionInput {
+                    duration: 1.0,
+                    format,
+                    word,
+                    segment,
+                    gap,
+                },
+                &mut bounded_body,
+            )?;
+            assert_eq!(
+                bounded_body, retained_body,
+                "{format:?}, words={word}, segments={segment}"
+            );
+        }
+    }
+
     Ok(())
 }
