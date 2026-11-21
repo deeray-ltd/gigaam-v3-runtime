@@ -101,7 +101,7 @@ impl<'input> ProbeableFormat<'input> for Sequential<MkvReader<'_>> {
         mss: MediaSourceStream<'input>,
         opts: FormatOptions,
     ) -> Result<Box<dyn FormatReader + 'input>> {
-        let mut reader = MkvReader::try_new_with_cues(mss, opts, false)?;
+        let mut reader = MkvReader::try_new_batch_audio(mss, opts)?;
         if let Some(track) = reader.first_track_known_codec(TrackType::Audio) {
             let id = track.id;
             let geometry = track
