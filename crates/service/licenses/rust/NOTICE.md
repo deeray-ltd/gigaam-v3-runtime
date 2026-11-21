@@ -15,8 +15,8 @@ locked Cargo metadata and checksum-verified local registry crate archives.
   is a procedural macro are excluded because their code is executed during compilation,
   not statically linked into `asr-serve`.
 - Registry packages: 110; the three selected closures are identical.
-- Cargo.lock SHA-256: `265eb0b3e5381c01e4ed5350e8ef852bbc02559b96f7a0a7b5b34980efe771d1`.
-- Closure SHA-256: `b71747aa7a18b47c56caa4c24761b02737c08076f10f7a38e5ec7dfc5606bdbd`.
+- Cargo.lock SHA-256: `cb1924da493b59f7f679ea62ed7887a1a9ce5f8f145ff3062b2aa9b66a769719`.
+- Closure SHA-256: `ec3b76d81224ba00be50c66af50986eec2183b735a39c90b02bb0fdd8545b27b`.
 - Project workspace code is covered by the parent `COPYING` and `COPYING.LESSER` files.
 
 ## Package records
@@ -977,10 +977,10 @@ locked Cargo metadata and checksum-verified local registry crate archives.
   - `LICENSE-APACHE`: `texts/62c7a1e35f56406896d7aa7ca52d0cc0d272ac022b5d2796e7d6905db8a3636a.txt` (SHA-256 `62c7a1e35f56406896d7aa7ca52d0cc0d272ac022b5d2796e7d6905db8a3636a`).
   - `LICENSE-MIT`: `texts/23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3.txt` (SHA-256 `23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3`).
 
-### `tokio` 1.53.1
+### `tokio` 1.54.1
 - License expression: `MIT`.
-- Locked crate archive SHA-256: `202caea871b69668250d242070849eb495be178ed697a3e98aebce5bc81a0bed`.
-- Source archive: `https://static.crates.io/crates/tokio/tokio-1.53.1.crate`.
+- Locked crate archive SHA-256: `b52fd3255258d26fac7264ab5a76b53c13367136dc011d3d6ad4f8ed070396a3`.
+- Source archive: `https://static.crates.io/crates/tokio/tokio-1.54.1.crate`.
 - Repository declared by package metadata: `https://github.com/tokio-rs/tokio`.
 - Authors declared by package metadata: `Tokio Contributors <team@tokio.rs>`.
 - Packaged license, permission, and copyright notices:
