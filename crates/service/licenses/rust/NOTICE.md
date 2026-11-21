@@ -14,9 +14,9 @@ locked Cargo metadata and checksum-verified local registry crate archives.
 - Selection: normal non-dev dependency edges only. Packages whose only library target
   is a procedural macro are excluded because their code is executed during compilation,
   not statically linked into `asr-serve`.
-- Registry packages: 110; the three selected closures are identical.
-- Cargo.lock SHA-256: `cb1924da493b59f7f679ea62ed7887a1a9ce5f8f145ff3062b2aa9b66a769719`.
-- Closure SHA-256: `ec3b76d81224ba00be50c66af50986eec2183b735a39c90b02bb0fdd8545b27b`.
+- Registry packages: 103; the three selected closures are identical.
+- Cargo.lock SHA-256: `216522bdb8d7b28965e90fd11cbd0180b6062c71908a98082d3ee7e819f7b3e3`.
+- Closure SHA-256: `97e74497caf296bec83ac40415f7562b585650f8332e2e0033a96369ed3774ac`.
 - Project workspace code is covered by the parent `COPYING` and `COPYING.LESSER` files.
 
 ## Package records
@@ -267,16 +267,6 @@ locked Cargo metadata and checksum-verified local registry crate archives.
 - Packaged license, permission, and copyright notices:
   - `LICENSE-APACHE`: `texts/a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2.txt` (SHA-256 `a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2`).
   - `LICENSE-MIT`: `texts/025436edff4cfcdde17a5811fdea78892d8482efd1abdec5a17872d07a4f2112.txt` (SHA-256 `025436edff4cfcdde17a5811fdea78892d8482efd1abdec5a17872d07a4f2112`).
-
-### `form_urlencoded` 1.2.2
-- License expression: `MIT OR Apache-2.0`.
-- Locked crate archive SHA-256: `cb4cb245038516f5f85277875cdaa4f7d2c9a0fa0468de06ed190163b1581fcf`.
-- Source archive: `https://static.crates.io/crates/form_urlencoded/form_urlencoded-1.2.2.crate`.
-- Repository declared by package metadata: `https://github.com/servo/rust-url`.
-- Authors declared by package metadata: `The rust-url developers`.
-- Packaged license, permission, and copyright notices:
-  - `LICENSE-APACHE`: `texts/a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2.txt` (SHA-256 `a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2`).
-  - `LICENSE-MIT`: `texts/20c7855c364d57ea4c97889a5e8d98470a9952dade37bd9248b9a54431670e5e.txt` (SHA-256 `20c7855c364d57ea4c97889a5e8d98470a9952dade37bd9248b9a54431670e5e`).
 
 ### `futures-channel` 0.3.34
 - License expression: `MIT OR Apache-2.0`.
@@ -704,26 +694,6 @@ locked Cargo metadata and checksum-verified local registry crate archives.
   - `LICENSE-APACHE`: `texts/a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2.txt` (SHA-256 `a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2`).
   - `LICENSE-MIT`: `texts/7576269ea71f767b99297934c0b2367532690f8c4badc695edf8e04ab6a1e545.txt` (SHA-256 `7576269ea71f767b99297934c0b2367532690f8c4badc695edf8e04ab6a1e545`).
 
-### `ryu` 1.0.23
-- License expression: `Apache-2.0 OR BSL-1.0`.
-- Locked crate archive SHA-256: `9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f`.
-- Source archive: `https://static.crates.io/crates/ryu/ryu-1.0.23.crate`.
-- Repository declared by package metadata: `https://github.com/dtolnay/ryu`.
-- Authors declared by package metadata: `David Tolnay <dtolnay@gmail.com>`.
-- Packaged license, permission, and copyright notices:
-  - `LICENSE-APACHE`: `texts/62c7a1e35f56406896d7aa7ca52d0cc0d272ac022b5d2796e7d6905db8a3636a.txt` (SHA-256 `62c7a1e35f56406896d7aa7ca52d0cc0d272ac022b5d2796e7d6905db8a3636a`).
-  - `LICENSE-BOOST`: `texts/c9bff75738922193e67fa726fa225535870d2aa1059f91452c411736284ad566.txt` (SHA-256 `c9bff75738922193e67fa726fa225535870d2aa1059f91452c411736284ad566`).
-
-### `serde` 1.0.229
-- License expression: `MIT OR Apache-2.0`.
-- Locked crate archive SHA-256: `4148590afebada386688f18773da617792bf2ef03ffc1e4cbd2b1d45b023e0ba`.
-- Source archive: `https://static.crates.io/crates/serde/serde-1.0.229.crate`.
-- Repository declared by package metadata: `https://github.com/serde-rs/serde`.
-- Authors declared by package metadata: `Erick Tryzelaar <erick.tryzelaar@gmail.com>`; `David Tolnay <dtolnay@gmail.com>`.
-- Packaged license, permission, and copyright notices:
-  - `LICENSE-APACHE`: `texts/62c7a1e35f56406896d7aa7ca52d0cc0d272ac022b5d2796e7d6905db8a3636a.txt` (SHA-256 `62c7a1e35f56406896d7aa7ca52d0cc0d272ac022b5d2796e7d6905db8a3636a`).
-  - `LICENSE-MIT`: `texts/23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3.txt` (SHA-256 `23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3`).
-
 ### `serde_core` 1.0.229
 - License expression: `MIT OR Apache-2.0`.
 - Locked crate archive SHA-256: `67dca2c9c51e58a4791a4b1ed58308b39c64224d349a935ab5039aa360942a48`.
@@ -733,36 +703,6 @@ locked Cargo metadata and checksum-verified local registry crate archives.
 - Packaged license, permission, and copyright notices:
   - `LICENSE-APACHE`: `texts/62c7a1e35f56406896d7aa7ca52d0cc0d272ac022b5d2796e7d6905db8a3636a.txt` (SHA-256 `62c7a1e35f56406896d7aa7ca52d0cc0d272ac022b5d2796e7d6905db8a3636a`).
   - `LICENSE-MIT`: `texts/23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3.txt` (SHA-256 `23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3`).
-
-### `serde_json` 1.0.151
-- License expression: `MIT OR Apache-2.0`.
-- Locked crate archive SHA-256: `c841b55ecdae098c80dcae9cf767f6f8a0c2cdb3416bbef72181df4d0fe73f14`.
-- Source archive: `https://static.crates.io/crates/serde_json/serde_json-1.0.151.crate`.
-- Repository declared by package metadata: `https://github.com/serde-rs/json`.
-- Authors declared by package metadata: `Erick Tryzelaar <erick.tryzelaar@gmail.com>`; `David Tolnay <dtolnay@gmail.com>`.
-- Packaged license, permission, and copyright notices:
-  - `LICENSE-APACHE`: `texts/62c7a1e35f56406896d7aa7ca52d0cc0d272ac022b5d2796e7d6905db8a3636a.txt` (SHA-256 `62c7a1e35f56406896d7aa7ca52d0cc0d272ac022b5d2796e7d6905db8a3636a`).
-  - `LICENSE-MIT`: `texts/23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3.txt` (SHA-256 `23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3`).
-
-### `serde_path_to_error` 0.1.20
-- License expression: `MIT OR Apache-2.0`.
-- Locked crate archive SHA-256: `10a9ff822e371bb5403e391ecd83e182e0e77ba7f6fe0160b795797109d1b457`.
-- Source archive: `https://static.crates.io/crates/serde_path_to_error/serde_path_to_error-0.1.20.crate`.
-- Repository declared by package metadata: `https://github.com/dtolnay/path-to-error`.
-- Authors declared by package metadata: `David Tolnay <dtolnay@gmail.com>`.
-- Packaged license, permission, and copyright notices:
-  - `LICENSE-APACHE`: `texts/62c7a1e35f56406896d7aa7ca52d0cc0d272ac022b5d2796e7d6905db8a3636a.txt` (SHA-256 `62c7a1e35f56406896d7aa7ca52d0cc0d272ac022b5d2796e7d6905db8a3636a`).
-  - `LICENSE-MIT`: `texts/23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3.txt` (SHA-256 `23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3`).
-
-### `serde_urlencoded` 0.7.1
-- License expression: `MIT/Apache-2.0`.
-- Locked crate archive SHA-256: `d3491c14715ca2294c4d6a88f15e84739788c1d030eed8c110436aafdaa2f3fd`.
-- Source archive: `https://static.crates.io/crates/serde_urlencoded/serde_urlencoded-0.7.1.crate`.
-- Repository declared by package metadata: `https://github.com/nox/serde_urlencoded`.
-- Authors declared by package metadata: `Anthony Ramine <n.oxyde@gmail.com>`.
-- Packaged license, permission, and copyright notices:
-  - `LICENSE-APACHE`: `texts/62c7a1e35f56406896d7aa7ca52d0cc0d272ac022b5d2796e7d6905db8a3636a.txt` (SHA-256 `62c7a1e35f56406896d7aa7ca52d0cc0d272ac022b5d2796e7d6905db8a3636a`).
-  - `LICENSE-MIT`: `texts/b9eb266294324f672cbe945fe8f2e32f85024f0d61a1a7d14382cdde0ac44769.txt` (SHA-256 `b9eb266294324f672cbe945fe8f2e32f85024f0d61a1a7d14382cdde0ac44769`).
 
 ### `sha1` 0.10.7
 - License expression: `MIT OR Apache-2.0`.
@@ -1070,12 +1010,3 @@ locked Cargo metadata and checksum-verified local registry crate archives.
   - `LICENSE-APACHE`: `texts/9d185ac6703c4b0453974c0d85e9eee43e6941009296bb1f5eb0b54e2329e9f3.txt` (SHA-256 `9d185ac6703c4b0453974c0d85e9eee43e6941009296bb1f5eb0b54e2329e9f3`).
   - `LICENSE-BSD`: `texts/83c1763356e822adde0a2cae748d938a73fdc263849ccff6b27776dff213bd32.txt` (SHA-256 `83c1763356e822adde0a2cae748d938a73fdc263849ccff6b27776dff213bd32`).
   - `LICENSE-MIT`: `texts/1a2f5c12ddc934d58956aa5dbdd3255fe55fd957633ab7d0d39e4f0daa73f7df.txt` (SHA-256 `1a2f5c12ddc934d58956aa5dbdd3255fe55fd957633ab7d0d39e4f0daa73f7df`).
-
-### `zmij` 1.0.23
-- License expression: `MIT`.
-- Locked crate archive SHA-256: `29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b`.
-- Source archive: `https://static.crates.io/crates/zmij/zmij-1.0.23.crate`.
-- Repository declared by package metadata: `https://github.com/dtolnay/zmij`.
-- Authors declared by package metadata: `David Tolnay <dtolnay@gmail.com>`.
-- Packaged license, permission, and copyright notices:
-  - `LICENSE-MIT`: `texts/23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3.txt` (SHA-256 `23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3`).

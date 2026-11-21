@@ -24,13 +24,13 @@ gigaam-service-host = { path = "../service-host", default-features = false }
 gigaam-api-native = { path = "../api-native" }
 gigaam-api-openai = { path = "../api-openai" }
 gigaam-recognition = { path = "../recognition", default-features = false }
-axum = { version = "0.8.9" }
+axum = { version = "0.8.9", default-features = false, features = ["http1", "matched-path", "original-uri", "tokio", "tower-log", "tracing"] }
 
 [dev-dependencies]
 gigaam-audio = { path = "../audio", features = ["decoders"] }
 gigaam-model-package = { path = "../model-package" }
 gigaam-transcription = { path = "../transcription" }
-axum = { version = "0.8.9", features = ["ws"] }
+axum = { version = "0.8.9", default-features = false, features = ["http1", "matched-path", "original-uri", "tokio", "tower-log", "tracing", "ws"] }
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "net", "io-util", "signal", "sync", "time"] }
 
 [features]
