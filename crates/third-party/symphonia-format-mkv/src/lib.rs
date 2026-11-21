@@ -21,6 +21,7 @@ mod lacing;
 mod schema;
 mod segment;
 mod tags;
+mod vorbis;
 
 pub use crate::demuxer::MkvReader;
 

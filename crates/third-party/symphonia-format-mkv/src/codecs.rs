@@ -5,6 +5,8 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
+use std::ops::Range;
+
 use extra_data::{
     VIDEO_EXTRA_DATA_ID_AV1_DECODER_CONFIG, VIDEO_EXTRA_DATA_ID_AVC_DECODER_CONFIG,
     VIDEO_EXTRA_DATA_ID_HEVC_DECODER_CONFIG, VIDEO_EXTRA_DATA_ID_VP9_DECODER_CONFIG,
@@ -28,18 +30,51 @@ use symphonia_core::codecs::{CodecId, CodecParameters, CodecProfile};
 use symphonia_core::errors::{Error, Result, decode_error};
 use symphonia_core::io::{BufReader, ReadBytes};
 
+use crate::ebml::{BinaryData, EbmlIterator, ReadEbml};
 use crate::lacing::read_xiph_sizes;
+use crate::schema::MkvSchema;
 use crate::segment::TrackElement;
 
-pub(crate) fn make_track_codec_params(track: TrackElement) -> Result<Option<CodecParameters>> {
+pub(crate) fn make_track_codec_params<R: ReadEbml>(
+    mut track: TrackElement,
+    it: &mut EbmlIterator<R, MkvSchema>,
+) -> Result<Option<CodecParameters>> {
     // Get the codec ID for the track.
     let codec_id = get_codec_id(&track);
-    let (profile, level) = get_codec_profile_and_level(&track);
+    let extra_data = match (codec_id, track.codec_private.take()) {
+        (_, None) => None,
+        (Some(CodecId::Audio(_)), Some(_)) if track.audio.is_none() => None,
+        (Some(CodecId::Audio(CODEC_ID_VORBIS)), Some(BinaryData::Source(range))) => {
+            Some(vorbis_extra_data_from_source(it, range)?)
+        }
+        (id, Some(private)) => {
+            let bytes = match private {
+                BinaryData::Inline(bytes) => bytes,
+                BinaryData::Source(range) => {
+                    let len = range.end - range.start;
+                    let size = usize::try_from(len).map_err(|_| {
+                        Error::LimitError("mkv: codec private data does not fit in memory")
+                    })?;
+                    it.with_binary_range(range.start, len, |mut reader| {
+                        Ok(reader.read_boxed_slice_exact(size)?)
+                    })?
+                }
+            };
+            Some(match id {
+                Some(CodecId::Audio(CODEC_ID_VORBIS)) => {
+                    vorbis_extra_data_from_codec_private(&bytes)?
+                }
+                Some(CodecId::Audio(CODEC_ID_FLAC)) => flac_extra_data_from_codec_private(&bytes)?,
+                _ => bytes,
+            })
+        }
+    };
+    let (profile, level) = get_codec_profile_and_level(&track, extra_data.as_deref());
 
     match codec_id {
-        Some(CodecId::Audio(id)) => make_audio_codec_params(id, profile, track),
-        Some(CodecId::Video(id)) => make_video_codec_params(id, profile, level, track),
-        Some(CodecId::Subtitle(id)) => make_subtitle_codec_params(id, track),
+        Some(CodecId::Audio(id)) => make_audio_codec_params(id, profile, track, extra_data),
+        Some(CodecId::Video(id)) => make_video_codec_params(id, profile, level, track, extra_data),
+        Some(CodecId::Subtitle(id)) => make_subtitle_codec_params(id, extra_data),
         _ => Ok(None),
     }
 }
@@ -48,6 +83,7 @@ fn make_audio_codec_params(
     id: AudioCodecId,
     profile: Option<CodecProfile>,
     track: TrackElement,
+    extra_data: Option<Box<[u8]>>,
 ) -> Result<Option<CodecParameters>> {
     // A nested audio track element in expected in the track element.
     let audio = match track.audio {
@@ -85,13 +121,7 @@ fn make_audio_codec_params(
         codec_params.with_bits_per_sample(bits.get() as u32);
     }
 
-    if let Some(codec_private) = track.codec_private {
-        let extra_data = match id {
-            CODEC_ID_VORBIS => vorbis_extra_data_from_codec_private(&codec_private)?,
-            CODEC_ID_FLAC => flac_extra_data_from_codec_private(&codec_private)?,
-            _ => codec_private,
-        };
-
+    if let Some(extra_data) = extra_data {
         codec_params.with_extra_data(extra_data);
     }
 
@@ -103,6 +133,7 @@ fn make_video_codec_params(
     profile: Option<CodecProfile>,
     level: Option<u32>,
     track: TrackElement,
+    extra_data: Option<Box<[u8]>>,
 ) -> Result<Option<CodecParameters>> {
     // A nested video track element in expected in the track element.
     let video = match track.video {
@@ -134,7 +165,7 @@ fn make_video_codec_params(
         codec_params.with_level(level);
     }
 
-    if let Some(codec_private) = track.codec_private {
+    if let Some(data) = extra_data {
         let extra_data_id = match id {
             CODEC_ID_H264 => VIDEO_EXTRA_DATA_ID_AVC_DECODER_CONFIG,
             CODEC_ID_HEVC => VIDEO_EXTRA_DATA_ID_HEVC_DECODER_CONFIG,
@@ -142,7 +173,7 @@ fn make_video_codec_params(
             CODEC_ID_AV1 => VIDEO_EXTRA_DATA_ID_AV1_DECODER_CONFIG,
             _ => VIDEO_EXTRA_DATA_ID_NULL,
         };
-        codec_params.add_extra_data(VideoExtraData { id: extra_data_id, data: codec_private });
+        codec_params.add_extra_data(VideoExtraData { id: extra_data_id, data });
     }
 
     for block in track.block_addition_mappings {
@@ -156,24 +187,24 @@ fn make_video_codec_params(
 
 fn make_subtitle_codec_params(
     id: SubtitleCodecId,
-    track: TrackElement,
+    extra_data: Option<Box<[u8]>>,
 ) -> Result<Option<CodecParameters>> {
     let mut codec_params = SubtitleCodecParameters::new();
 
     codec_params.for_codec(id);
 
-    if let Some(codec_private) = track.codec_private {
-        codec_params.with_extra_data(codec_private);
+    if let Some(extra_data) = extra_data {
+        codec_params.with_extra_data(extra_data);
     }
 
     Ok(Some(CodecParameters::Subtitle(codec_params)))
 }
 
+const VORBIS_PACKET_TYPE_IDENTIFICATION: u8 = 1;
+const VORBIS_PACKET_TYPE_SETUP: u8 = 5;
+
 // Extra data parsing
 fn vorbis_extra_data_from_codec_private(extra: &[u8]) -> Result<Box<[u8]>> {
-    const VORBIS_PACKET_TYPE_IDENTIFICATION: u8 = 1;
-    const VORBIS_PACKET_TYPE_SETUP: u8 = 5;
-
     // Private Data for this codec has the following layout:
     // - 1 byte that represents number of packets minus one;
     // - Xiph coded lengths of packets, length of the last packet must be deduced (as in Xiph lacing)
@@ -218,6 +249,57 @@ fn vorbis_extra_data_from_codec_private(extra: &[u8]) -> Result<Box<[u8]>> {
     ]
     .concat()
     .into_boxed_slice())
+}
+
+fn vorbis_extra_data_from_source<R: ReadEbml>(
+    it: &mut EbmlIterator<R, MkvSchema>,
+    range: Range<u64>,
+) -> Result<Box<[u8]>> {
+    let (mut start, mut packet_lengths) =
+        it.with_binary_range(range.start, range.end - range.start, |mut reader| {
+            let count = usize::from(reader.read_byte()?);
+            let lengths = read_xiph_sizes(&mut reader, count)?;
+            Ok((reader.pos(), lengths))
+        })?;
+    let remaining = range.end.checked_sub(start)
+        .ok_or(Error::DecodeError("mkv: vorbis packet lengths exceed codec private data"))?;
+    let last_length = packet_lengths.iter()
+        .try_fold(remaining, |left, &len| left.checked_sub(len))
+        .ok_or(Error::DecodeError("mkv: vorbis packet sizes exceed codec private data"))?;
+    packet_lengths.push(last_length);
+
+    // Identify the last packet of each required type by reading its first byte.
+    // The comment and any other unneeded packets can remain in the source.
+    let mut ident = None;
+    let mut setup = None;
+    for len in packet_lengths {
+        if len != 0 {
+            let kind = it.with_binary_range(start, 1, |mut reader| Ok(reader.read_byte()?))?;
+            match kind {
+                VORBIS_PACKET_TYPE_IDENTIFICATION => ident = Some((start, len)),
+                VORBIS_PACKET_TYPE_SETUP => setup = Some((start, len)),
+                _ => (),
+            }
+        }
+        start += len;
+    }
+
+    let (ident_start, ident_len) =
+        ident.ok_or(Error::DecodeError("mkv: missing vorbis identification packet"))?;
+    let (setup_start, setup_len) =
+        setup.ok_or(Error::DecodeError("mkv: missing vorbis setup packet"))?;
+    let size = usize::try_from(ident_len + setup_len)
+        .map_err(|_| Error::LimitError("mkv: vorbis headers do not fit in memory"))?;
+    let mut extra = Vec::new();
+    extra.try_reserve_exact(size)
+        .map_err(|_| Error::LimitError("mkv: could not allocate vorbis headers"))?;
+    extra.resize(size, 0);
+    let ident_size = usize::try_from(ident_len)
+        .map_err(|_| Error::LimitError("mkv: vorbis identification packet does not fit in memory"))?;
+    let (ident_buf, setup_buf) = extra.split_at_mut(ident_size);
+    it.with_binary_range(ident_start, ident_len, |mut reader| Ok(reader.read_buf_exact(ident_buf)?))?;
+    it.with_binary_range(setup_start, setup_len, |mut reader| Ok(reader.read_buf_exact(setup_buf)?))?;
+    Ok(extra.into_boxed_slice())
 }
 
 fn flac_extra_data_from_codec_private(codec_private: &[u8]) -> Result<Box<[u8]>> {
@@ -347,7 +429,10 @@ fn get_codec_id(track: &TrackElement) -> Option<CodecId> {
     Some(codec_id)
 }
 
-fn get_codec_profile_and_level(track: &TrackElement) -> (Option<CodecProfile>, Option<u32>) {
+fn get_codec_profile_and_level(
+    track: &TrackElement,
+    extra_data: Option<&[u8]>,
+) -> (Option<CodecProfile>, Option<u32>) {
     use symphonia_core::codecs::audio::well_known::profiles::{
         CODEC_PROFILE_AAC_HE, CODEC_PROFILE_AAC_LC, CODEC_PROFILE_AAC_LTP, CODEC_PROFILE_AAC_MAIN,
         CODEC_PROFILE_AAC_SSR,
@@ -369,18 +454,14 @@ fn get_codec_profile_and_level(track: &TrackElement) -> (Option<CodecProfile>, O
         "V_MPEG4/ISO/ASP" => (Some(CODEC_PROFILE_MPEG4_ADVANCED_SIMPLE), None),
         "V_MPEG4/ISO/AVC" | "V_MPEG4/ISO/AP" => {
             // Parse AVCDecoderConfigurationRecord extra data to acquire the profile and level.
-            track
-                .codec_private
-                .as_ref()
+            extra_data
                 .and_then(|buf| AVCDecoderConfigurationRecord::read(buf).ok())
                 .map(|cfg| (Some(cfg.profile), Some(cfg.level)))
                 .unwrap_or_else(|| (None, None))
         }
         "V_MPEGH/ISO/HEVC" => {
             // Parse HevcDecoderConfigurationRecord extra data to acquire the profile and level.
-            track
-                .codec_private
-                .as_ref()
+            extra_data
                 .and_then(|buf| HEVCDecoderConfigurationRecord::read(buf).ok())
                 .map(|cfg| (Some(cfg.profile), Some(cfg.level)))
                 .unwrap_or_else(|| (None, None))

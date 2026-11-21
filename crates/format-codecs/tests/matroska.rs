@@ -50,6 +50,236 @@ fn element(id: &[u8], payload: Vec<u8>) -> Result<Vec<u8>, String> {
     out.extend_from_slice(&payload);
     Ok(out)
 }
+
+mod vorbis {
+    use super::*;
+    use std::error::Error;
+
+    // A generated 48 kHz mono sine encoded with FFmpeg/libvorbis, with optional
+    // indexing and metadata removed so the two payloads can be varied independently.
+    const CONTROL: &[u8] = include_bytes!("fixtures/vorbis-sine.mkv");
+    const SEGMENT: &[u8] = b"\x18\x53\x80\x67";
+    const TRACKS: &[u8] = b"\x16\x54\xAE\x6B";
+    const TRACK_ENTRY: &[u8] = b"\xAE";
+    const CODEC_PRIVATE: &[u8] = b"\x63\xA2";
+    const CLUSTER: &[u8] = b"\x1F\x43\xB6\x75";
+    const SIMPLE_BLOCK: &[u8] = b"\xA3";
+    const SMALL_PADDING: usize = 256 * 1024;
+    const LARGE_PADDING: usize = 2 * 1024 * 1024;
+
+    type Element<'a> = (&'a [u8], &'a [u8]);
+
+    fn children(mut input: &[u8]) -> Result<Vec<Element<'_>>, Box<dyn Error>> {
+        let mut children = Vec::new();
+        while let Some(&first) = input.first() {
+            if first == 0 {
+                return Err("invalid test element ID".into());
+            }
+            let id_width = usize::try_from(first.leading_zeros() + 1)?;
+            let (id, rest) = input
+                .split_at_checked(id_width)
+                .ok_or("truncated test ID")?;
+            let first_size = *rest
+                .first()
+                .filter(|&&byte| byte != 0)
+                .ok_or("invalid test size")?;
+            let size_width = first_size.leading_zeros() + 1;
+            let (size, rest) = rest
+                .split_at_checked(usize::try_from(size_width)?)
+                .ok_or("truncated test size")?;
+            let marked = size
+                .iter()
+                .fold(0_u64, |value, &byte| value << 8 | u64::from(byte));
+            let marker = 1_u64 << (size_width * 7);
+            let length = marked - marker;
+            if length == marker - 1 {
+                return Err("unknown-size test element".into());
+            }
+            let (body, tail) = rest
+                .split_at_checked(usize::try_from(length)?)
+                .ok_or("truncated test element")?;
+            children.push((id, body));
+            input = tail;
+        }
+        Ok(children)
+    }
+
+    fn read_xiph_length(input: &mut &[u8]) -> Result<usize, Box<dyn Error>> {
+        let mut length = 0;
+        loop {
+            let (&byte, rest) = input.split_first().ok_or("truncated test packet lengths")?;
+            *input = rest;
+            length += usize::from(byte);
+            if byte != 255 {
+                return Ok(length);
+            }
+        }
+    }
+
+    fn write_xiph_length(output: &mut Vec<u8>, length: usize) -> Result<(), Box<dyn Error>> {
+        output.resize(output.len() + length / 255, 255);
+        output.push(u8::try_from(length % 255)?);
+        Ok(())
+    }
+
+    fn with_comment(tracks: &[u8], description_bytes: usize) -> Result<Vec<u8>, Box<dyn Error>> {
+        let entries = children(tracks)?;
+        let [(TRACK_ENTRY, track)] = entries.as_slice() else {
+            return Err("expected one test track".into());
+        };
+        let fields = children(track)?;
+        let mut private = fields
+            .iter()
+            .find(|(id, _)| *id == CODEC_PRIVATE)
+            .map(|(_, body)| *body)
+            .ok_or("missing test CodecPrivate")?;
+        let Some((&2, rest)) = private.split_first() else {
+            return Err("expected three test Vorbis headers".into());
+        };
+        private = rest;
+        let ident_size = read_xiph_length(&mut private)?;
+        let comment_size = read_xiph_length(&mut private)?;
+        let (ident, rest) = private
+            .split_at_checked(ident_size)
+            .ok_or("truncated test identification header")?;
+        let (_, setup) = rest
+            .split_at_checked(comment_size)
+            .ok_or("truncated test comment")?;
+        assert!(ident.starts_with(b"\x01vorbis"));
+        assert!(setup.starts_with(b"\x05vorbis"));
+
+        let mut comment = b"\x03vorbis".to_vec();
+        comment.extend(0_u32.to_le_bytes()); // Empty vendor string.
+        comment.extend(1_u32.to_le_bytes()); // One comment field.
+        comment.extend(u32::try_from(b"DESCRIPTION=".len() + description_bytes)?.to_le_bytes());
+        comment.extend(b"DESCRIPTION=");
+        comment.resize(comment.len() + description_bytes, b'x');
+        comment.push(1); // Vorbis framing flag.
+
+        let mut private = vec![2];
+        write_xiph_length(&mut private, ident.len())?;
+        write_xiph_length(&mut private, comment.len())?;
+        private.extend(ident);
+        private.extend(comment);
+        private.extend(setup);
+
+        // Put CodecPrivate before CodecID to exercise field-order independence.
+        let mut updated = element(CODEC_PRIVATE, private)?;
+        for (id, body) in fields {
+            if id != CODEC_PRIVATE {
+                updated.extend(element(id, body.to_vec())?);
+            }
+        }
+        Ok(element(TRACK_ENTRY, updated)?)
+    }
+
+    fn fixture(comment: Option<usize>, packet_padding: usize) -> Result<Vec<u8>, Box<dyn Error>> {
+        let mut result = Vec::new();
+        let mut packet = 0;
+        for (id, body) in children(CONTROL)? {
+            if id != SEGMENT {
+                result.extend(element(id, body.to_vec())?);
+                continue;
+            }
+            let mut segment = Vec::new();
+            for (id, body) in children(body)? {
+                let updated = match (id, comment) {
+                    (TRACKS, Some(count)) => with_comment(body, count)?,
+                    (CLUSTER, _) if packet_padding != 0 => {
+                        let mut cluster = Vec::new();
+                        for (id, body) in children(body)? {
+                            let mut payload = body.to_vec();
+                            if id == SIMPLE_BLOCK {
+                                packet += 1;
+                                if packet == 2 {
+                                    // Track 1, a 16-bit relative timestamp, and an unlaced block.
+                                    assert_eq!(payload[0], 0x81);
+                                    assert_eq!(payload[3] & 6, 0);
+                                    payload.resize(payload.len() + packet_padding, 0);
+                                }
+                            }
+                            cluster.extend(element(id, payload)?);
+                        }
+                        cluster
+                    }
+                    _ => body.to_vec(),
+                };
+                segment.extend(element(id, updated)?);
+            }
+            result.extend(element(id, segment)?);
+        }
+        assert!(packet_padding == 0 || packet >= 2);
+        Ok(result)
+    }
+
+    struct Decoded {
+        pcm: Vec<u32>,
+        open_bytes: usize,
+        total_bytes: usize,
+    }
+
+    fn decode(input: Vec<u8>) -> Result<Decoded, Box<dyn Error>> {
+        let bytes_read = Arc::new(AtomicUsize::new(0));
+        let source = CountedSource {
+            cursor: Cursor::new(input),
+            bytes_read: Arc::clone(&bytes_read),
+        };
+        let providers: Vec<Arc<dyn FileDecoderProvider>> =
+            vec![Arc::new(gigaam_format_codecs::Containers)];
+        let mut decoder = FileDecoders::new(providers)?.open(Box::new(source), Some("mkv"))?;
+        let open_bytes = bytes_read.load(Ordering::Relaxed);
+        assert_eq!(decoder.metadata().sample_rate().hertz(), 48_000);
+        assert_eq!(decoder.metadata().channel_count().get(), 1);
+        let mut pcm = Vec::new();
+        let chunk_size = NonZeroUsize::new(2048).ok_or("invalid chunk maximum")?;
+        while let Some(chunk) = decoder.next_chunk(chunk_size)? {
+            assert_eq!(chunk.first_frame(), u64::try_from(pcm.len())?);
+            pcm.extend(
+                chunk.audio().channels()[0]
+                    .samples()
+                    .iter()
+                    .map(|sample| sample.to_bits()),
+            );
+            assert_eq!(chunk.end_frame(), u64::try_from(pcm.len())?);
+        }
+        assert!(decoder.next_chunk(chunk_size)?.is_none());
+        assert_eq!(pcm.len(), 14_912);
+        assert!(pcm.iter().any(|&bits| bits != 0));
+        Ok(Decoded {
+            pcm,
+            open_bytes,
+            total_bytes: bytes_read.load(Ordering::Relaxed),
+        })
+    }
+
+    #[test]
+    fn batch_ignores_vorbis_comment_body_before_codec_id() -> Result<(), Box<dyn Error>> {
+        let baseline = decode(CONTROL.to_vec())?;
+        let small = decode(fixture(Some(SMALL_PADDING), 0)?)?;
+        let large = decode(fixture(Some(LARGE_PADDING), 0)?)?;
+        assert_eq!(baseline.pcm, small.pcm);
+        assert_eq!(baseline.pcm, large.pcm);
+        // A longer comment requires more lacing bytes, plus buffered reads at
+        // the ends. Its body must be skipped without a proportional read.
+        let expected_growth = (LARGE_PADDING - SMALL_PADDING).div_ceil(255) + 64 * 1024;
+        assert!(large.open_bytes <= small.open_bytes + expected_growth);
+        assert!(large.total_bytes < SMALL_PADDING);
+        Ok(())
+    }
+
+    #[test]
+    fn batch_ignores_vorbis_audio_packet_suffix() -> Result<(), Box<dyn Error>> {
+        let baseline = decode(CONTROL.to_vec())?;
+        let small = decode(fixture(None, SMALL_PADDING)?)?;
+        let large = decode(fixture(None, LARGE_PADDING)?)?;
+        assert_eq!(baseline.pcm, small.pcm);
+        assert_eq!(baseline.pcm, large.pcm);
+        assert!(large.open_bytes <= small.open_bytes + 64 * 1024);
+        assert!(large.total_bytes < SMALL_PADDING);
+        Ok(())
+    }
+}
+
 fn uint(id: &[u8], value: u64) -> Result<Vec<u8>, String> {
     let bytes = value.to_be_bytes();
     let first = bytes.iter().position(|byte| *byte != 0).unwrap_or(7);

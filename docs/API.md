@@ -363,6 +363,13 @@ Native FLAC batch inputs retain the STREAMINFO and encoded audio frames. The bat
 decoder skips other declared metadata blocks. For Ogg-FLAC, it preserves decoder
 setup and skips optional embedded pictures and comment packets.
 
+For the selected Vorbis audio track in a seekable Matroska input, the batch
+decoder retains the identification and setup packets and skips comment bodies.
+It validates each audio packet's full declared range, then reads only the prefix
+bounded by the channel count and maximum block size in the Vorbis header. Packet
+timestamps and durations are preserved. Decoder initialization loads the setup
+packet and its decoded tables into memory.
+
 Batch readers split PCM ranges in Matroska and ISO-BMFF at the selected PCM
 decoder's frame boundaries. The reported sample clock follows the same decoded
 samples and channel order. ISO-BMFF sample descriptions with advisory or

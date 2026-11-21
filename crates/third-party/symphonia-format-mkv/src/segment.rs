@@ -23,7 +23,7 @@ use symphonia_core::meta::{
 };
 use symphonia_core::units::{Duration, Time, TimeBase, Timestamp};
 
-use crate::ebml::{EbmlElement, EbmlElementHeader, EbmlError, EbmlIterator, ReadEbml, Result};
+use crate::ebml::{BinaryData, EbmlElement, EbmlElementHeader, EbmlError, EbmlIterator, ReadEbml, Result};
 use crate::schema::{MkvElement, MkvSchema};
 use crate::sub_fields::*;
 use crate::tags::{TagContext, Target, make_raw_tags, map_std_tag};
@@ -358,7 +358,7 @@ pub(crate) struct TrackElement {
     pub(crate) lang: String,
     pub(crate) lang_bcp47: Option<String>,
     pub(crate) codec_id: String,
-    pub(crate) codec_private: Option<Box<[u8]>>,
+    pub(crate) codec_private: Option<BinaryData>,
     pub(crate) codec_delay: MatroskaTicks,
     pub(crate) block_addition_mappings: Vec<BlockAdditionMappingElement>,
     pub(crate) audio: Option<AudioElement>,
@@ -420,7 +420,7 @@ impl EbmlElement<MkvSchema> for TrackElement {
                 }
                 MkvElement::CodecPrivate => {
                     // Non-mandatory element.
-                    codec_private = Some(it.read_binary()?);
+                    codec_private = Some(it.read_binary_or_range()?);
                 }
                 MkvElement::CodecDelay => {
                     // Mandatory element. Schema-defined default is 0.
