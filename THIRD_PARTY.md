@@ -87,6 +87,11 @@ Each service image includes the license and source record for each demuxer under
 `/usr/share/licenses/gigaam-v3-runtime`. The modified source is available under
 `crates/third-party` in the repository revision used to build the image.
 
+## Pinned Symphonia source
+
+The [symphonia-codec-vorbis source record](crates/third-party/symphonia-codec-vorbis/SOURCE.md)
+identifies the MPL-2.0 source used by the build.
+
 ## Attribution
 
 The GPLv3 and LGPLv3 texts in [COPYING](COPYING) and
