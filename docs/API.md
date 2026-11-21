@@ -370,6 +370,10 @@ and skips optional embedded pictures and comment packets.
 
 For seekable Matroska, the batch reader validates and skips the segment title
 and application strings. It checks that required elements are present.
+It retains codec initialization data for the first known audio track.
+For the remaining tracks it checks the declared ranges and the Vorbis or
+FLAC header structure where applicable. Track identifiers and timing remain
+available for validating interleaved blocks.
 
 For the selected Vorbis track in seekable Matroska batch input, the reader
 skips comments and reads setup data through the framing bit when the

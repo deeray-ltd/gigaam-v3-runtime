@@ -21,7 +21,7 @@ use symphonia_core::units::TimeBase;
 
 use log::{info, warn};
 
-use crate::codecs::make_track_codec_params;
+use crate::codecs::{CodecPrivateMode, is_known_audio_track, make_track_codec_params};
 use crate::ebml::{EbmlElementInfo, EbmlError, EbmlIterator, EbmlSchema, ReadEbml};
 use crate::lacing::{Frame, FrameRange, extract_frames, extract_frame_ranges};
 use crate::schema::{MkvElement, MkvSchema};
@@ -101,6 +101,22 @@ impl<'s> MkvReader<'s> {
         opts: FormatOptions,
         retain_cues: bool,
     ) -> Result<Self> {
+        Self::try_new_impl(mss, opts, retain_cues, false)
+    }
+
+    /// Open seekable audio batch input with codec data for the first known audio track.
+    ///
+    /// Other tracks keep their timing and identifiers so interleaved blocks can be validated.
+    pub fn try_new_batch_audio(mss: MediaSourceStream<'s>, opts: FormatOptions) -> Result<Self> {
+        Self::try_new_impl(mss, opts, false, true)
+    }
+
+    fn try_new_impl(
+        mss: MediaSourceStream<'s>,
+        opts: FormatOptions,
+        retain_cues: bool,
+        batch_audio: bool,
+    ) -> Result<Self> {
         // Get the total length of the stream, if possible.
         let (is_seekable, total_len) = (mss.is_seekable(), mss.byte_len());
 
@@ -110,6 +126,9 @@ impl<'s> MkvReader<'s> {
         }
 
         let defer_blocks = is_seekable && !retain_cues && total_len.is_some();
+        if batch_audio && !defer_blocks {
+            return unsupported_error("mkv: batch audio requires a seekable source with known length");
+        }
         let mut it = EbmlIterator::new(mss, MkvSchema, total_len, defer_blocks);
 
         // Read the EBML header.
@@ -353,10 +372,16 @@ impl<'s> MkvReader<'s> {
 
             tr.with_flags(track.flags);
 
-            if let Some(codec_params) =
-                make_track_codec_params(track, &mut it, defer_blocks && !selected_audio)?
-            {
-                // Apply setup validation to the same track as first_track_known_codec.
+            let private_mode = if batch_audio && (selected_audio || !is_known_audio_track(&track)) {
+                CodecPrivateMode::Omit
+            }
+            else if defer_blocks && !selected_audio {
+                CodecPrivateMode::CompactVorbisSetup
+            }
+            else {
+                CodecPrivateMode::Full
+            };
+            if let Some(codec_params) = make_track_codec_params(track, &mut it, private_mode)? {
                 selected_audio |= codec_params.audio().is_some_and(|p| p.codec != CODEC_ID_NULL_AUDIO);
                 tr.with_codec_params(codec_params);
             }

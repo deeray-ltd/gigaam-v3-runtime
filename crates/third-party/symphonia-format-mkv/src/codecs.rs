@@ -21,7 +21,7 @@ use symphonia_core::audio::Channels;
 use symphonia_core::audio::sample::SampleFormat;
 use symphonia_core::codecs::audio::AudioCodecParameters;
 use symphonia_core::codecs::audio::well_known::{CODEC_ID_FLAC, CODEC_ID_VORBIS};
-use symphonia_core::codecs::audio::{AudioCodecId, well_known::*};
+use symphonia_core::codecs::audio::{AudioCodecId, CODEC_ID_NULL_AUDIO, well_known::*};
 use symphonia_core::codecs::subtitle::{SubtitleCodecId, SubtitleCodecParameters, well_known::*};
 use symphonia_core::codecs::video::{
     VIDEO_EXTRA_DATA_ID_NULL, VideoCodecId, VideoCodecParameters, VideoExtraData, well_known::*,
@@ -36,10 +36,22 @@ use crate::schema::MkvSchema;
 use crate::segment::TrackElement;
 use crate::vorbis::IDENTIFICATION_BYTES;
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(crate) enum CodecPrivateMode {
+    Full,
+    CompactVorbisSetup,
+    Omit,
+}
+
+pub(crate) fn is_known_audio_track(track: &TrackElement) -> bool {
+    track.audio.is_some()
+        && matches!(get_codec_id(track), Some(CodecId::Audio(id)) if id != CODEC_ID_NULL_AUDIO)
+}
+
 pub(crate) fn make_track_codec_params<R: ReadEbml>(
     mut track: TrackElement,
     it: &mut EbmlIterator<R, MkvSchema>,
-    compact_vorbis_setup: bool,
+    private_mode: CodecPrivateMode,
 ) -> Result<Option<CodecParameters>> {
     // Get the codec ID for the track.
     let codec_id = get_codec_id(&track);
@@ -47,13 +59,25 @@ pub(crate) fn make_track_codec_params<R: ReadEbml>(
         (_, None) => None,
         (Some(CodecId::Audio(_)), Some(_)) if track.audio.is_none() => None,
         (Some(CodecId::Audio(CODEC_ID_VORBIS)), Some(BinaryData::Source(range))) => {
-            Some(vorbis_extra_data_from_source(it, range, compact_vorbis_setup)?)
+            let headers = vorbis_header_ranges(it, range)?;
+            if private_mode == CodecPrivateMode::Omit {
+                None
+            }
+            else {
+                Some(vorbis_extra_data_from_source(
+                    it,
+                    headers,
+                    private_mode == CodecPrivateMode::CompactVorbisSetup,
+                )?)
+            }
         }
         (Some(CodecId::Audio(CODEC_ID_FLAC)), Some(BinaryData::Source(range))) => {
-            Some(it.with_binary_range(range.start, range.end - range.start, |mut reader| {
+            let stream_info = it.with_binary_range(range.start, range.end - range.start, |mut reader| {
                 flac_extra_data(&mut reader)
-            })?)
+            })?;
+            (private_mode != CodecPrivateMode::Omit).then_some(stream_info)
         }
+        (_, Some(_)) if private_mode == CodecPrivateMode::Omit => None,
         (id, Some(private)) => {
             let bytes = match private {
                 BinaryData::Inline(bytes) => bytes,
@@ -258,11 +282,10 @@ fn vorbis_extra_data_from_codec_private(extra: &[u8]) -> Result<Box<[u8]>> {
     .into_boxed_slice())
 }
 
-fn vorbis_extra_data_from_source<R: ReadEbml>(
+fn vorbis_header_ranges<R: ReadEbml>(
     it: &mut EbmlIterator<R, MkvSchema>,
     range: Range<u64>,
-    compact_setup: bool,
-) -> Result<Box<[u8]>> {
+) -> Result<[(u64, u64); 2]> {
     let (mut start, mut packet_lengths) =
         it.with_binary_range(range.start, range.end - range.start, |mut reader| {
             let count = usize::from(reader.read_byte()?);
@@ -292,10 +315,17 @@ fn vorbis_extra_data_from_source<R: ReadEbml>(
         start += len;
     }
 
-    let (ident_start, ident_len) =
-        ident.ok_or(Error::DecodeError("mkv: missing vorbis identification packet"))?;
-    let (setup_start, setup_len) =
-        setup.ok_or(Error::DecodeError("mkv: missing vorbis setup packet"))?;
+    Ok([
+        ident.ok_or(Error::DecodeError("mkv: missing vorbis identification packet"))?,
+        setup.ok_or(Error::DecodeError("mkv: missing vorbis setup packet"))?,
+    ])
+}
+
+fn vorbis_extra_data_from_source<R: ReadEbml>(
+    it: &mut EbmlIterator<R, MkvSchema>,
+    [(ident_start, ident_len), (setup_start, setup_len)]: [(u64, u64); 2],
+    compact_setup: bool,
+) -> Result<Box<[u8]>> {
     let setup_prefix_len =
         if compact_setup && usize::try_from(ident_len).ok() == Some(IDENTIFICATION_BYTES) {
             let mut header = [0; IDENTIFICATION_BYTES];

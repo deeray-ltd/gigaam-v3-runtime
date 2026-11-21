@@ -65,6 +65,7 @@ mod vorbis {
     const WRITING_APP: &[u8] = b"\x57\x41";
     const TRACKS: &[u8] = b"\x16\x54\xAE\x6B";
     const TRACK_ENTRY: &[u8] = b"\xAE";
+    const CODEC_ID: &[u8] = b"\x86";
     const CODEC_PRIVATE: &[u8] = b"\x63\xA2";
     const CLUSTER: &[u8] = b"\x1F\x43\xB6\x75";
     const SIMPLE_BLOCK: &[u8] = b"\xA3";
@@ -328,12 +329,14 @@ mod vorbis {
         Ok(())
     }
 
-    #[test]
-    fn batch_initializes_only_the_selected_vorbis_setup() -> Result<(), Box<dyn Error>> {
+    fn fixture_with_second_track(
+        codec_id: &[u8],
+        put_first: bool,
+        private: impl Fn(&[u8]) -> Result<Vec<u8>, Box<dyn Error>>,
+    ) -> Result<Vec<u8>, Box<dyn Error>> {
         const TRACK_NUMBER: &[u8] = b"\xD7";
         const TRACK_UID: &[u8] = b"\x73\xC5";
-        let baseline = decode(CONTROL.to_vec())?;
-        let input = fixture_with_segment_element(TRACKS, |body| {
+        fixture_with_segment_element(TRACKS, |body| {
             let entries = children(body)?;
             let [(TRACK_ENTRY, track)] = entries.as_slice() else {
                 return Err("expected one original test track".into());
@@ -342,24 +345,126 @@ mod vorbis {
             for (id, value) in children(track)? {
                 match id {
                     TRACK_NUMBER | TRACK_UID => second.extend(element(id, vec![2])?),
-                    CODEC_PRIVATE => {
-                        let mut packets = value.get(1..).ok_or("missing test Vorbis headers")?;
-                        let ident_len = read_xiph_length(&mut packets)?;
-                        let comment_len = read_xiph_length(&mut packets)?;
-                        let setup_start = value.len() - packets.len() + ident_len + comment_len;
-                        assert!(value[setup_start..].starts_with(b"\x05vorbis"));
-                        // The secondary track has never been decoded. Its abbreviated
-                        // setup must not prevent transcription of the first track.
-                        second.extend(element(id, value[..setup_start + 7].to_vec())?);
-                    }
+                    CODEC_ID => second.extend(element(id, codec_id.to_vec())?),
+                    CODEC_PRIVATE => second.extend(element(id, private(value)?)?),
                     _ => second.extend(element(id, value.to_vec())?),
                 }
             }
-            let mut tracks = body.to_vec();
-            tracks.extend(element(TRACK_ENTRY, second)?);
+            let second = element(TRACK_ENTRY, second)?;
+            let mut tracks = Vec::with_capacity(body.len() + second.len());
+            if put_first {
+                tracks.extend(second);
+                tracks.extend(body);
+            } else {
+                tracks.extend(body);
+                tracks.extend(second);
+            }
             Ok(tracks)
+        })
+    }
+
+    #[test]
+    fn batch_initializes_only_the_selected_vorbis_setup() -> Result<(), Box<dyn Error>> {
+        let baseline = decode(CONTROL.to_vec())?;
+        let input = fixture_with_second_track(b"A_VORBIS", false, |value| {
+            let mut packets = value.get(1..).ok_or("missing test Vorbis headers")?;
+            let ident_len = read_xiph_length(&mut packets)?;
+            let comment_len = read_xiph_length(&mut packets)?;
+            let setup_start = value.len() - packets.len() + ident_len + comment_len;
+            assert!(value[setup_start..].starts_with(b"\x05vorbis"));
+            // The secondary track has never been decoded. Its abbreviated
+            // setup must not prevent transcription of the first track.
+            Ok(value[..setup_start + 7].to_vec())
         })?;
         assert_eq!(decode(input)?.pcm, baseline.pcm);
+        Ok(())
+    }
+
+    #[test]
+    fn batch_skips_large_secondary_codec_private_and_preserves_pcm() -> Result<(), Box<dyn Error>> {
+        let baseline = decode(CONTROL.to_vec())?;
+        for padding in [0, SMALL_PADDING, LARGE_PADDING] {
+            let input = fixture_with_second_track(b"A_VORBIS", false, |value| {
+                let mut private = value.to_vec();
+                private.resize(private.len() + padding, 0);
+                Ok(private)
+            })?;
+            if padding == SMALL_PADDING {
+                let source = MediaSourceStream::new(
+                    Box::new(Cursor::new(input.clone())),
+                    Default::default(),
+                );
+                let ordinary = MkvReader::try_new(source, FormatOptions::default())?;
+                let extra_data = ordinary
+                    .tracks()
+                    .iter()
+                    .find(|track| track.id == 2)
+                    .and_then(|track| track.codec_params.as_ref()?.audio()?.extra_data.as_deref())
+                    .ok_or("ordinary reader preserves second track codec data")?;
+                assert!(extra_data.len() > padding);
+            }
+            let result = decode(input)?;
+            assert_eq!(result.pcm, baseline.pcm);
+            assert!(result.total_bytes < SMALL_PADDING);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn batch_keeps_unselected_codec_private_validation() -> Result<(), Box<dyn Error>> {
+        let input = fixture_with_second_track(b"A_VORBIS", false, |_| {
+            // Two explicitly laced packets claim more bytes than CodecPrivate contains.
+            Ok(vec![2, 30, 254, 1, 3, 5])
+        })?;
+        let error = decode(input)
+            .err()
+            .ok_or("expected invalid Vorbis lacing")?;
+        assert!(
+            error
+                .to_string()
+                .contains("vorbis packet sizes exceed codec private data")
+        );
+
+        let input = fixture_with_second_track(b"A_FLAC", false, |_| {
+            Ok(b"fLaC\x80\x00\x00\x01\x00".to_vec())
+        })?;
+        let error = decode(input)
+            .err()
+            .ok_or("expected invalid FLAC STREAMINFO")?;
+        assert!(
+            error
+                .to_string()
+                .contains("invalid stream info block length")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn batch_keeps_first_audio_track_when_its_codec_is_unavailable() -> Result<(), Box<dyn Error>> {
+        let input = fixture_with_second_track(b"A_ALAC", true, |_| Ok(vec![0]))?;
+        let error = decode(input).err().ok_or("expected missing ALAC decoder")?;
+        assert!(error.to_string().starts_with("audio codec:"));
+        Ok(())
+    }
+
+    #[test]
+    fn batch_refuses_a_block_without_a_track_declaration() -> Result<(), Box<dyn Error>> {
+        let input = fixture_with_segment_element(CLUSTER, |body| {
+            let mut cluster = Vec::new();
+            for (id, packet) in children(body)? {
+                let mut payload = packet.to_vec();
+                if id == SIMPLE_BLOCK {
+                    assert_eq!(payload[0], 0x81);
+                    payload[0] = 0x82;
+                }
+                cluster.extend(element(id, payload)?);
+            }
+            Ok(cluster)
+        })?;
+        let error = decode(input)
+            .err()
+            .ok_or("expected an undeclared track error")?;
+        assert!(error.to_string().contains("track number for block"));
         Ok(())
     }
 
