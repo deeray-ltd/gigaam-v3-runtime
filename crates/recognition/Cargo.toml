@@ -28,8 +28,7 @@ name = "ctc_golden"
 required-features = ["golden-tests"]
 
 [dev-dependencies]
-prost = "=0.13.5"
-sentencepiece-model = "=0.1.4"
+prost = "=0.14.6"
 
 [[test]]
 name = "tokenizer_golden"

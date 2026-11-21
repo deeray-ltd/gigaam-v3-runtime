@@ -96,6 +96,7 @@ COPY --from=ort /opt/ort/ThirdPartyNotices.txt /usr/share/licenses/gigaam-v3-run
 COPY --from=tensorrt /opt/tensorrt-notices/ /usr/share/licenses/gigaam-v3-runtime/tensorrt/
 COPY COPYING COPYING.LESSER THIRD_PARTY.md /usr/share/licenses/gigaam-v3-runtime/
 COPY crates/service/licenses/rust/ /usr/share/licenses/gigaam-v3-runtime/rust/
+COPY crates/model-package/licenses/sentencepiece/ /usr/share/licenses/gigaam-v3-runtime/sentencepiece/
 
 ENV ASR_ENCODER_EP=tensorrt \
     ASR_TRT_CACHE=/app/trt-cache \

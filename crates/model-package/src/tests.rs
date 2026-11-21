@@ -596,8 +596,8 @@ fn v3_selected_asset_cannot_escape_through_symlink() {
 #[test]
 fn v3_selected_tokenizer_reads_model_and_checks_indexed_vocabulary() {
     use super::{PieceKind, TokenizerMetadata, VariantPackage};
+    use crate::sentencepiece_model::{ModelProto, model_proto::SentencePiece};
     use prost::Message;
-    use sentencepiece_model::{ModelProto, SentencePiece};
 
     let pack = TempPack::new(&valid_v3("v3_e2e_ctc", true, false));
     let package = VariantPackage::open(pack.path()).expect("valid variant metadata");

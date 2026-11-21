@@ -19,6 +19,8 @@ mod compatibility;
 mod definition;
 mod error;
 mod schema;
+#[path = "generated/sentencepiece.rs"]
+mod sentencepiece_model;
 mod tokenizer;
 mod variant;
 

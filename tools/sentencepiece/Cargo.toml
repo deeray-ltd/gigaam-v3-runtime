@@ -1,0 +1,10 @@
+[package]
+name = "generate-sentencepiece"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+prost-build = "=0.14.6"
