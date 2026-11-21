@@ -608,13 +608,16 @@ pub struct AtomIterator<R: ReadAtom> {
     /// The length of the container, if known.
     len: Option<u64>,
     defer_sample_sizes: bool,
+    raw_resume: Option<u64>,
 }
 
 impl<R: ReadAtom> AtomIterator<R> {
     /// Instantiate a new atom iterator.
     pub(crate) fn new(reader: R, len: Option<u64>) -> Self {
         let stack = Vec::with_capacity(MAX_ITERATION_DEPTH);
-        AtomIterator { reader, stack, pending: None, len, defer_sample_sizes: false }
+        AtomIterator {
+            reader, stack, pending: None, len, defer_sample_sizes: false, raw_resume: None,
+        }
     }
 
     pub(crate) fn use_deferred_sample_sizes(&mut self) {
@@ -663,6 +666,10 @@ impl<R: ReadAtom> AtomIterator<R> {
     ///
     /// Discards any unread data from the previous atom.
     pub(crate) fn next_header(&mut self) -> Result<Option<&AtomHeader>> {
+        // Positional reads must be resynchronized before structural iteration.
+        if self.raw_resume.is_some() {
+            return Err(AtomError::UnexpectedPosition);
+        }
         // If there is a pending atom, or it wasn't fully consumed, skip over it now.
         let _ = self.skip_atom();
 
@@ -807,8 +814,10 @@ impl<R: ReadAtom> AtomIterator<R> {
     where
         R: MediaSource,
     {
-        let atom = self.pending.take().ok_or(AtomError::NoPendingAtom)?;
+        let atom = self.pending.ok_or(AtomError::NoPendingAtom)?;
         self.seek_reader(atom.pos())?;
+        self.pending = None;
+        self.raw_resume = None;
         Ok(())
     }
 
@@ -820,13 +829,22 @@ impl<R: ReadAtom> AtomIterator<R> {
     where
         R: MediaSource,
     {
-        let atom = self.pending.take().ok_or(AtomError::NoPendingAtom)?;
-
-        match atom.end() {
-            Some(end) => self.seek_reader(end),
-            _ => {
-                // The atom has an unknown size. It is not possible to know where it ends.
-                Err(AtomError::UnknownAtomSize)
+        match self.pending {
+            Some(atom) => match atom.end() {
+                Some(end) => {
+                    self.seek_reader(end)?;
+                    self.pending = None;
+                    self.raw_resume = None;
+                    Ok(())
+                }
+                None => Err(AtomError::UnknownAtomSize),
+            },
+            None => {
+                if let Some(resume) = self.raw_resume {
+                    self.seek_reader(resume)?;
+                    self.raw_resume = None;
+                }
+                Err(AtomError::NoPendingAtom)
             }
         }
     }
@@ -892,7 +910,12 @@ impl<R: ReadAtom> AtomIterator<R> {
             return Err(AtomError::UnexpectedEndOfAtom);
         }
         let previous = self.reader.pos();
-        self.seek_reader(position)?;
+        if let Err(error) = self.seek_reader(position) {
+            if self.seek_reader(previous).is_err() {
+                self.raw_resume.get_or_insert(previous);
+            }
+            return Err(error);
+        }
         let parsed: Result<Option<(TrunAtom, u64)>> = (|| {
             let mut cursor = AtomIterator::new(&mut self.reader, Some(end));
             cursor.use_deferred_sample_sizes();
@@ -904,10 +927,13 @@ impl<R: ReadAtom> AtomIterator<R> {
             }
             Ok(None)
         })();
-        let restored = self.seek_reader(previous);
-        let value = parsed?;
-        restored?;
-        Ok(value)
+        match self.seek_reader(previous) {
+            Ok(()) => parsed,
+            Err(error) => {
+                self.raw_resume.get_or_insert(previous);
+                Err(error)
+            }
+        }
     }
 
     pub(crate) fn read_packet_at(&mut self, pos: u64, len: usize) -> Result<Box<[u8]>>
@@ -917,13 +943,21 @@ impl<R: ReadAtom> AtomIterator<R> {
         if self.len.is_none_or(|length| end > length) {
             return Err(AtomError::UnexpectedEndOfAtom);
         }
-        let saved = self.reader.pos();
-        self.seek_reader(pos)?;
-        let data = self.reader.read_boxed_slice_exact(len);
-        let restored = self.seek_reader(saved);
-        let data = data?;
-        restored?;
-        Ok(data)
+        let resume = *self.raw_resume.get_or_insert_with(|| self.reader.pos());
+        let result = self.seek_reader(pos).and_then(|()| {
+            self.reader.read_boxed_slice_exact(len).map_err(Into::into)
+        });
+        match result {
+            Ok(data) => Ok(data),
+            Err(error) => {
+                // On failure restore the structural position if possible; otherwise
+                // keep raw_resume set so structural iteration cannot proceed silently.
+                if self.seek_reader(resume).is_ok() {
+                    self.raw_resume = None;
+                }
+                Err(error)
+            }
+        }
     }
 
     /// Reads exactly the number of bytes requested, at the specified position.
@@ -1160,5 +1194,78 @@ impl<R: ReadAtom> AtomIterator<R> {
         let mut buf = [0u8; std::mem::size_of::<u64>()];
         self.read_buf_exact(&mut buf)?;
         Ok(f64::from_be_bytes(buf))
+    }
+}
+
+#[cfg(test)]
+mod positional_read_tests {
+    use super::*;
+    use std::io::{self, Cursor, Read, Seek, SeekFrom};
+    use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+    use symphonia_core::io::MediaSourceStream;
+
+    struct FailingSource {
+        data: Cursor<Vec<u8>>,
+        fail: Arc<AtomicBool>,
+    }
+
+    impl Read for FailingSource {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if self.fail.load(Ordering::SeqCst) {
+                return Err(io::Error::other("injected read failure"));
+            }
+            self.data.read(buf)
+        }
+    }
+    impl Seek for FailingSource {
+        fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> { self.data.seek(pos) }
+    }
+    impl MediaSource for FailingSource {
+        fn is_seekable(&self) -> bool { true }
+        fn byte_len(&self) -> Option<u64> { Some(self.data.get_ref().len() as u64) }
+    }
+
+    fn iterator() -> (AtomIterator<MediaSourceStream<'static>>, Arc<AtomicBool>) {
+        let mut data = Vec::new();
+        data.extend_from_slice(&8_u32.to_be_bytes()); data.extend_from_slice(b"ftyp");
+        data.extend_from_slice(&200_008_u32.to_be_bytes()); data.extend_from_slice(b"mdat");
+        data.extend(std::iter::repeat_n(0x5a, 200_000));
+        data.extend_from_slice(&8_u32.to_be_bytes()); data.extend_from_slice(b"free");
+        let length = data.len() as u64;
+        let fail = Arc::new(AtomicBool::new(false));
+        let input = FailingSource { data: Cursor::new(data), fail: Arc::clone(&fail) };
+        let source = MediaSourceStream::new(Box::new(input), Default::default());
+        (AtomIterator::new(source, Some(length)), fail)
+    }
+
+    #[test]
+    fn positional_reads_resume_pending_and_nonpending_structure() -> symphonia_core::errors::Result<()> {
+        let (mut it, _) = iterator();
+        assert_eq!(it.next_header()?.unwrap().atom_type(), AtomType::FileType);
+        it.skip_atom()?;
+        // A source-backed lookup can occur without any pending structural atom.
+        assert_eq!(&*it.read_packet_at(100_000, 4)?, &[0x5a; 4]);
+        assert!(matches!(it.next_header(), Err(AtomError::UnexpectedPosition)));
+        assert!(matches!(it.seek_atom_end(), Err(AtomError::NoPendingAtom)));
+        assert_eq!(it.next_header()?.unwrap().atom_type(), AtomType::MediaData);
+        // The same resynchronization must skip a pending mdat, not revisit its payload.
+        assert_eq!(&*it.read_packet_at(120_000, 4)?, &[0x5a; 4]);
+        it.seek_atom_end()?;
+        assert_eq!(it.next_header()?.unwrap().atom_type(), AtomType::Free);
+        Ok(())
+    }
+
+    #[test]
+    fn failed_positional_read_restores_the_pending_structure() -> symphonia_core::errors::Result<()> {
+        let (mut it, fail) = iterator();
+        assert_eq!(it.next_header()?.unwrap().atom_type(), AtomType::FileType);
+        it.skip_atom()?;
+        assert_eq!(it.next_header()?.unwrap().atom_type(), AtomType::MediaData);
+        fail.store(true, Ordering::SeqCst);
+        assert!(it.read_packet_at(100_000, 4).is_err());
+        fail.store(false, Ordering::SeqCst);
+        it.seek_atom_end()?;
+        assert_eq!(it.next_header()?.unwrap().atom_type(), AtomType::Free);
+        Ok(())
     }
 }

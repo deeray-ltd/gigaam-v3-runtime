@@ -27,7 +27,7 @@ use crate::schema::{MkvElement, MkvSchema};
 use crate::segment::{
     AttachmentsElement, AudioSeekHead, BlockGroupElement, BlockGroupRange, ChaptersElement, CuesElement, EbmlHeaderElement,
     InfoElement, MatroskaTicks, NonZeroMatroskaTicks, SeekHeadElement, SegmentTicks,
-    SignedTrackTicks, TagsElement, TargetTagsMap, TracksElement,
+    SignedTrackTicks, TagsElement, TargetTagsMap, TrackTicks, TracksElement,
 };
 
 const MKV_FORMAT_INFO: FormatInfo =
@@ -64,6 +64,21 @@ pub struct MkvReader<'s> {
     frames: VecDeque<Frame>,
     frame_ranges: VecDeque<FrameRange>,
     defer_blocks: bool,
+    selected_track: Option<u32>,
+    batch_pcm: Option<BatchPcm>,
+    pending_pcm: Option<PendingPcm>,
+}
+
+struct BatchPcm {
+    track_id: u32,
+    frame_bytes: u64,
+    max_frames: u64,
+}
+
+struct PendingPcm {
+    frame: FrameRange,
+    total_frames: u64,
+    consumed_frames: u64,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -365,7 +380,103 @@ impl<'s> MkvReader<'s> {
             frames: VecDeque::new(),
             frame_ranges: VecDeque::new(),
             defer_blocks: is_seekable && !retain_cues && total_len.is_some(),
+            selected_track: None,
+            batch_pcm: None,
+            pending_pcm: None,
         })
+    }
+
+    /// Selects the first usable audio track for seekable batch consumption.
+    pub fn select_for_batch(&mut self, track_id: u32) -> Result<()> {
+        use symphonia_core::formats::TrackType;
+        if !self.defer_blocks || self.pending_pcm.is_some() {
+            return Err(Error::DecodeError("mkv: batch selection requires seekable batch input"));
+        }
+        let selected = self.first_track_known_codec(TrackType::Audio)
+            .ok_or(Error::DecodeError("mkv: no selected audio track"))?;
+        if selected.id != track_id {
+            return Err(Error::DecodeError("mkv: requested batch track is not selected"));
+        }
+        self.selected_track = Some(track_id);
+        Ok(())
+    }
+
+    /// Enables bounded reads for the selected track on a seekable batch input.
+    /// The caller supplies validated interleaved PCM frame geometry for that track.
+    pub fn enable_batch_pcm(
+        &mut self,
+        track_id: u32,
+        frame_bytes: NonZero<usize>,
+        max_frames: NonZero<usize>,
+    ) -> Result<()> {
+        use symphonia_core::formats::TrackType;
+        if !self.defer_blocks || self.pending_pcm.is_some() || self.selected_track != Some(track_id) {
+            return Err(Error::DecodeError("mkv: bounded PCM mode requires seekable batch input"));
+        }
+        let selected = self.first_track_known_codec(TrackType::Audio)
+            .ok_or(Error::DecodeError("mkv: no selected audio track"))?;
+        if selected.id != track_id {
+            return Err(Error::DecodeError("mkv: bounded PCM track is not selected"));
+        }
+        let channels = selected.codec_params.as_ref().and_then(|params| params.audio())
+            .and_then(|params| params.channels.as_ref())
+            .ok_or(Error::DecodeError("mkv: bounded PCM channel layout is missing"))?
+            .count();
+        if channels == 0 || frame_bytes.get() % channels != 0 {
+            return Err(Error::DecodeError("mkv: invalid PCM frame geometry"));
+        }
+        let frame_bytes = u64::try_from(frame_bytes.get())
+            .map_err(|_| Error::DecodeError("mkv: PCM frame width exceeds u64"))?;
+        let max_frames = u64::try_from(max_frames.get())
+            .map_err(|_| Error::DecodeError("mkv: PCM frame limit exceeds u64"))?;
+        self.batch_pcm = Some(BatchPcm { track_id, frame_bytes, max_frames });
+        Ok(())
+    }
+
+    fn next_pcm_packet(&mut self) -> Result<Packet> {
+        let layout = self.batch_pcm.as_ref().ok_or(Error::DecodeError("mkv: PCM layout missing"))?;
+        let pending = self.pending_pcm.as_mut().ok_or(Error::DecodeError("mkv: PCM range missing"))?;
+        let end_frame = pending.consumed_frames.saturating_add(layout.max_frames)
+            .min(pending.total_frames);
+        let frames = end_frame.checked_sub(pending.consumed_frames)
+            .ok_or(Error::DecodeError("mkv: PCM frame range is invalid"))?;
+        let byte_offset = pending.consumed_frames.checked_mul(layout.frame_bytes)
+            .ok_or(Error::DecodeError("mkv: PCM offset overflow"))?;
+        let start = pending.frame.start.checked_add(byte_offset)
+            .ok_or(Error::DecodeError("mkv: PCM position overflow"))?;
+        let len = frames.checked_mul(layout.frame_bytes)
+            .ok_or(Error::DecodeError("mkv: PCM length overflow"))?;
+        let count = usize::try_from(len)
+            .map_err(|_| Error::DecodeError("mkv: PCM chunk too large"))?;
+        // Cumulative edges distribute the original duration without accumulating rounding error.
+        let edge = |index: u64| -> Result<u64> {
+            let value = u128::from(pending.frame.dur.get())
+                .checked_mul(u128::from(index))
+                .and_then(|total| total.checked_div(u128::from(pending.total_frames)))
+                .ok_or(Error::DecodeError("mkv: PCM time range is invalid"))?;
+            u64::try_from(value).map_err(|_| Error::DecodeError("mkv: PCM time overflow"))
+        };
+        let start_tick = edge(pending.consumed_frames)?;
+        let end_tick = edge(end_frame)?;
+        let pts = pending.frame.pts.checked_add_unsigned(TrackTicks::from(start_tick))
+            .ok_or(Error::DecodeError("mkv: PCM timestamp overflow"))?;
+        let duration = end_tick.checked_sub(start_tick)
+            .ok_or(Error::DecodeError("mkv: PCM time range is invalid"))?;
+        let track_id = pending.frame.track_num;
+        let data = self.iter.with_binary_range(start, len, |mut reader| {
+            use symphonia_core::io::ReadBytes;
+            Ok(reader.read_boxed_slice_exact(count)?)
+        })?;
+        pending.consumed_frames = end_frame;
+        if end_frame == pending.total_frames {
+            self.pending_pcm = None;
+        }
+        Ok(Packet::new(
+            track_id,
+            pts.into_ts(),
+            TrackTicks::from(duration).into_dur(),
+            data,
+        ))
     }
 
     fn seek_track_by_ts_forward(&mut self, track_id: u32, ts: Timestamp) -> Result<SeekedTo> {
@@ -674,7 +785,29 @@ impl FormatReader for MkvReader<'_> {
 
     fn next_packet(&mut self) -> Result<Option<Packet>> {
         loop {
+            if self.pending_pcm.is_some() {
+                return self.next_pcm_packet().map(Some);
+            }
             if let Some(frame) = self.frame_ranges.pop_front() {
+                if self.selected_track.is_some_and(|selected| selected != frame.track_num) {
+                    continue;
+                }
+                if let Some(layout) = &self.batch_pcm {
+                    if frame.track_num == layout.track_id && frame.len != 0 {
+                        if frame.len % layout.frame_bytes != 0 {
+                            return Err(Error::DecodeError(
+                                "mkv: PCM frame has incomplete interleaved samples",
+                            ));
+                        }
+                        let total_frames = frame.len / layout.frame_bytes;
+                        self.pending_pcm = Some(PendingPcm {
+                            frame,
+                            total_frames,
+                            consumed_frames: 0,
+                        });
+                        return self.next_pcm_packet().map(Some);
+                    }
+                }
                 let size = usize::try_from(frame.len).map_err(|_| Error::DecodeError("mkv: frame too large"))?;
                 let data = self.iter.with_binary_range(frame.start, frame.len, |mut reader| {
                     use symphonia_core::io::ReadBytes;
