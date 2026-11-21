@@ -496,19 +496,255 @@ mod tests {
         MultiChannelBatchSetup, MultiChannelBatchTranscriber,
     };
     use crate::batch::BatchSetup;
+    use crate::batch_replay::ReplayObservations;
     use crate::channel_selection::{BatchChannelPolicy, DuplicateClassification};
     use crate::contracts::VadProbability;
     use crate::contracts::{BatchConfig, PadPolicy, StageTimings};
     use crate::observations::{ObservationMode, WindowEvidence, WindowEvidenceObserver};
+    use crate::scratch::{ScratchFile, ScratchSpace};
     use crate::turns::TurnGap;
     use crate::vad_policy::{VadDurations, VadPadding, VadPolicyConfig, VadThresholds};
     use gigaam_audio::{
-        ChannelAudio, ChannelAudioView, DecodedAudio, FeatureMatrixView, SampleRate,
+        AudioMetadata, ChannelAudio, ChannelAudioView, ChannelCount, DecodedAudio,
+        FeatureMatrixView, FileChunkReader, FileDecoder, ReplayAudio, SampleRate,
     };
     use gigaam_recognition::{
         Decoded, ExecutionControl, FrameRate, SpeechProbabilityDetector, Token, WindowDecoder, Word,
     };
+    use std::io::{self, Read, Seek, SeekFrom, Write};
+    use std::num::{NonZeroU64, NonZeroUsize};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
+
+    struct ReplayInput {
+        metadata: AudioMetadata,
+        remaining: usize,
+    }
+
+    impl FileChunkReader for ReplayInput {
+        fn metadata(&self) -> AudioMetadata {
+            self.metadata
+        }
+
+        fn next_audio(&mut self, max: NonZeroUsize) -> Result<Option<DecodedAudio>, String> {
+            let count = self.remaining.min(max.get());
+            if count == 0 {
+                return Ok(None);
+            }
+            self.remaining -= count;
+            Ok(Some(audio_at_sample_rate(
+                16_000,
+                vec![channel(vec![0.25; count])],
+            )))
+        }
+    }
+
+    struct CheckedRead {
+        file: ScratchFile,
+        largest_range: Arc<AtomicUsize>,
+        bytes_since_seek: usize,
+        fail_read: bool,
+    }
+
+    impl Read for CheckedRead {
+        fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+            if self.fail_read {
+                return Err(io::Error::other("injected replay read failure"));
+            }
+            let read = self.file.read(bytes)?;
+            self.bytes_since_seek += read;
+            self.largest_range
+                .fetch_max(self.bytes_since_seek, Ordering::Relaxed);
+            Ok(read)
+        }
+    }
+
+    impl Write for CheckedRead {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.file.write(bytes)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.file.flush()
+        }
+    }
+
+    impl Seek for CheckedRead {
+        fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+            let offset = self.file.seek(position)?;
+            self.bytes_since_seek = 0;
+            Ok(offset)
+        }
+    }
+
+    struct ContinuousVad;
+
+    impl SpeechProbabilityDetector for ContinuousVad {
+        fn probabilities(&mut self, audio: ChannelAudioView<'_>) -> Result<Vec<f32>, String> {
+            Ok(vec![1.0; audio.samples().len().div_ceil(512)])
+        }
+
+        fn probabilities_bounded(
+            &mut self,
+            audio_length: usize,
+            read: &mut dyn FnMut(&mut [f32]) -> Result<(), String>,
+            emit: &mut dyn FnMut(&[f32]) -> Result<(), String>,
+        ) -> Result<(), String> {
+            let mut samples = [0.0; 512];
+            for start in (0..audio_length).step_by(samples.len()) {
+                let count = (audio_length - start).min(samples.len());
+                read(&mut samples[..count])?;
+                assert!(samples[..count].iter().all(|sample| *sample == 0.25));
+                emit(&[1.0])?;
+            }
+            Ok(())
+        }
+    }
+
+    fn replay_input(
+        frames: usize,
+        storage: CheckedRead,
+    ) -> Result<ReplayAudio<CheckedRead>, String> {
+        let rate = SampleRate::new(16_000)?;
+        ReplayAudio::prepare(
+            FileDecoder::from_reader(Box::new(ReplayInput {
+                metadata: AudioMetadata::new(rate, ChannelCount::new(1)?),
+                remaining: frames,
+            })),
+            storage,
+            rate,
+            false,
+            || Ok(()),
+        )
+        .map_err(|err| err.to_string())
+    }
+
+    #[test]
+    fn replay_continuous_speech_matches_window_and_word_output_with_fixed_read_sizes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let scratch = ScratchSpace::from_settings(None, Some("4194304"))?;
+        let mut limits = Vec::new();
+        for frames in [8199, 65_543] {
+            let observed = Arc::new(ChannelEvidence(Mutex::new(Vec::new())));
+            let largest_range = Arc::new(AtomicUsize::new(0));
+            let mut new_file = || {
+                Ok(CheckedRead {
+                    file: scratch.create()?,
+                    largest_range: Arc::clone(&largest_range),
+                    bytes_since_seek: 0,
+                    fail_read: false,
+                })
+            };
+            let mut replay = replay_input(frames, new_file()?)?;
+            let mut actual = Vec::new();
+            evidence_batch(BatchChannelPolicy::single_output(), Arc::clone(&observed))
+                .transcribe_replay(
+                    &mut replay,
+                    Some(ReplayObservations {
+                        detector: &mut ContinuousVad,
+                        policy: Some(vad_policy()),
+                        scored: false,
+                    }),
+                    &mut new_file,
+                    |channel, word| {
+                        assert_eq!(channel.index(), 0);
+                        actual.push(word);
+                        Ok(())
+                    },
+                )
+                .map_err(|error| format!("{error:?}"))?;
+            let trace = |observed: &ChannelEvidence| {
+                observed
+                    .0
+                    .lock()
+                    .expect("evidence test lock must not be poisoned")
+                    .iter()
+                    .map(|record| {
+                        (
+                            record.first_sample(),
+                            record.end_sec(),
+                            record.feature_frames(),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let windows = trace(&observed);
+            assert!(windows.len() > 2);
+            assert_eq!(
+                windows.last().map(|window| window.1),
+                Some(gigaam_primitives::usize_to_f32(frames) / 16_000.0)
+            );
+            let expected_evidence = Arc::new(ChannelEvidence(Mutex::new(Vec::new())));
+            let expected = evidence_batch(
+                BatchChannelPolicy::single_output(),
+                Arc::clone(&expected_evidence),
+            )
+            .transcribe_with_vad(
+                &audio_at_sample_rate(16_000, vec![channel(vec![0.25; frames])]),
+                &mut ContinuousVad,
+                vad_policy(),
+            )
+            .map_err(|error| format!("{error:?}"))?;
+            assert_eq!(windows, trace(&expected_evidence));
+            assert_eq!(actual, expected.channels()[0].words());
+            let bytes = largest_range.load(Ordering::Relaxed);
+            assert!((512 * size_of::<f32>()..=2048 * size_of::<f32>()).contains(&bytes));
+            limits.push((bytes, windows.iter().map(|window| window.2).max()));
+        }
+        assert_eq!(limits[0], limits[1]);
+        Ok(())
+    }
+
+    #[test]
+    fn replay_read_failure_stops_output_and_releases_scratch_on_drop()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const FRAMES: usize = 4096;
+        let quota = size_of::<f32>() * FRAMES;
+        let scratch = ScratchSpace::new(
+            std::env::temp_dir(),
+            NonZeroU64::new(u64::try_from(quota)?).expect("test quota is positive"),
+        )?;
+        let mut replay = replay_input(
+            FRAMES,
+            CheckedRead {
+                file: scratch.create()?,
+                largest_range: Arc::new(AtomicUsize::new(0)),
+                bytes_since_seek: 0,
+                fail_read: true,
+            },
+        )?;
+        let evidence = Arc::new(ChannelEvidence(Mutex::new(Vec::new())));
+        let error = evidence_batch(BatchChannelPolicy::single_output(), Arc::clone(&evidence))
+            .transcribe_replay(
+                &mut replay,
+                None,
+                || panic!("direct batch replay needs no observation scratch"),
+                |_, _| panic!("the first audio read failed before any word could be emitted"),
+            )
+            .expect_err("a storage read error terminates transcription");
+        assert!(
+            matches!(error, MultiChannelBatchError::Transcription(ref message)
+            if message.contains("injected replay read failure"))
+        );
+        assert!(
+            evidence
+                .0
+                .lock()
+                .expect("evidence test lock must not be poisoned")
+                .is_empty()
+        );
+        let mut replacement = scratch.create()?;
+        assert_eq!(
+            replacement
+                .write(&[0])
+                .expect_err("replay still owns its file")
+                .kind(),
+            io::ErrorKind::StorageFull,
+        );
+        drop(replay);
+        replacement.write_all(&vec![0; quota])?;
+        Ok(())
+    }
 
     struct ChannelEvidence(Mutex<Vec<WindowEvidence>>);
 
