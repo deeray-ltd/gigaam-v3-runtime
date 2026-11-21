@@ -164,13 +164,26 @@ impl<'input> ProbeableFormat<'input> for Sequential<OggReader<'_>> {
     }
 }
 
+impl<'input> ProbeableFormat<'input> for Sequential<WavReader<'_>> {
+    fn try_probe_new(
+        mss: MediaSourceStream<'input>,
+        opts: FormatOptions,
+    ) -> Result<Box<dyn FormatReader + 'input>> {
+        Ok(Box::new(WavReader::try_new_without_info(mss, opts)?))
+    }
+
+    fn probe_data() -> &'static [ProbeFormatData] {
+        WavReader::probe_data()
+    }
+}
+
 pub(crate) static BATCH_PROBE: LazyLock<Probe> = LazyLock::new(|| {
     let mut probe = Probe::default();
     probe.register_metadata::<symphonia::default::meta::Id3v2Reader<'_>>();
     probe.register_format::<AdtsReader<'_>>();
     probe.register_format::<Sequential<FlacReader<'_>>>();
     probe.register_format::<MpaReader<'_>>();
-    probe.register_format::<WavReader<'_>>();
+    probe.register_format::<Sequential<WavReader<'_>>>();
     probe.register_format::<Sequential<OggReader<'_>>>();
     probe.register_format::<Sequential<IsoMp4Reader<'_>>>();
     probe.register_format::<Sequential<MkvReader<'_>>>();

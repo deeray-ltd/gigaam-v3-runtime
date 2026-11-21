@@ -92,6 +92,9 @@ Each service image includes the license and source record for each demuxer under
 The [symphonia-codec-vorbis source record](crates/third-party/symphonia-codec-vorbis/SOURCE.md)
 identifies the MPL-2.0 source used by the build.
 
+The [symphonia-format-riff source record](crates/third-party/symphonia-format-riff/SOURCE.md)
+identifies the MPL-2.0 source used by the build.
+
 ## Attribution
 
 The GPLv3 and LGPLv3 texts in [COPYING](COPYING) and

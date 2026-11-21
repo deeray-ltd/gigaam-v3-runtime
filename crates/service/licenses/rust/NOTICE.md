@@ -14,9 +14,9 @@ locked Cargo metadata and checksum-verified local registry crate archives.
 - Selection: normal non-dev dependency edges only. Packages whose only library target
   is a procedural macro are excluded because their code is executed during compilation,
   not statically linked into `asr-serve`.
-- Registry packages: 100; the three selected closures are identical.
-- Cargo.lock SHA-256: `75136911a072cb4d1464919f8795f556686bd586c5d5e718bd7d7c2b824e9318`.
-- Closure SHA-256: `0674dc2482daba7889aa78328e7f20c9a259835700a4afb8051232df0ab44ae2`.
+- Registry packages: 99; the three selected closures are identical.
+- Cargo.lock SHA-256: `ef25ca046b35b5d54741ed342e1ec763b7284a248148aa617c372f930b9f5960`.
+- Closure SHA-256: `bc39573f01fff9a10f53ce7cafe92b1e19adb7c150daa629bb4748ed09a7adee`.
 - Project workspace code is covered by the parent `COPYING` and `COPYING.LESSER` files.
 
 ## Package records
@@ -859,16 +859,6 @@ locked Cargo metadata and checksum-verified local registry crate archives.
 - Source archive: `https://static.crates.io/crates/symphonia-core/symphonia-core-0.6.1.crate`.
 - Repository declared by package metadata: `https://github.com/pdeljanov/Symphonia`.
 - Authors declared by package metadata: `Philip Deljanov <philip.deljanov@gmail.com>`.
-- MPL-2.0 terms: `https://www.mozilla.org/MPL/2.0/`; obtain the checksum-bound source archive above.
-- Packaged license, permission, and copyright notices:
-  - `LICENSE`: `texts/c76f740d1521b9bed9ca7a04ad526c310493c62621b1341d623b431736533b30.txt` (SHA-256 `c76f740d1521b9bed9ca7a04ad526c310493c62621b1341d623b431736533b30`).
-
-### `symphonia-format-riff` 0.6.1
-- License expression: `MPL-2.0`.
-- Locked crate archive SHA-256: `1ff70929083a8c1a5f6cd7c904b6071c7914ad04739b510c2f7239dfc9b7dabe`.
-- Source archive: `https://static.crates.io/crates/symphonia-format-riff/symphonia-format-riff-0.6.1.crate`.
-- Repository declared by package metadata: `https://github.com/pdeljanov/Symphonia`.
-- Authors declared by package metadata: `Philip Deljanov <philip.deljanov@gmail.com>`; `dedobbin <dedobbindedobbin@gmail.com>`.
 - MPL-2.0 terms: `https://www.mozilla.org/MPL/2.0/`; obtain the checksum-bound source archive above.
 - Packaged license, permission, and copyright notices:
   - `LICENSE`: `texts/c76f740d1521b9bed9ca7a04ad526c310493c62621b1341d623b431736533b30.txt` (SHA-256 `c76f740d1521b9bed9ca7a04ad526c310493c62621b1341d623b431736533b30`).

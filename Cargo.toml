@@ -19,6 +19,7 @@ exclude = [
     "crates/third-party/symphonia-format-mkv",
     "crates/third-party/symphonia-format-ogg",
     "crates/third-party/symphonia-codec-vorbis",
+    "crates/third-party/symphonia-format-riff",
 ]
 resolver = "3"
 
@@ -39,3 +40,4 @@ symphonia-format-isomp4 = { path = "crates/third-party/symphonia-format-isomp4" 
 symphonia-format-mkv = { path = "crates/third-party/symphonia-format-mkv" }
 symphonia-format-ogg = { path = "crates/third-party/symphonia-format-ogg" }
 symphonia-codec-vorbis = { path = "crates/third-party/symphonia-codec-vorbis" }
+symphonia-format-riff = { path = "crates/third-party/symphonia-format-riff" }
