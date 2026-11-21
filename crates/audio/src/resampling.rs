@@ -11,6 +11,7 @@
 
 use crate::contracts::{ChannelAudio, DecodedAudio, SampleRate};
 use gigaam_primitives::{f64_to_f32, usize_to_f64};
+use std::sync::Arc;
 
 /// Maximum factor in either direction after reducing a rate ratio.
 const MAX_REDUCED_RATE_FACTOR: usize = 1000;
@@ -358,7 +359,7 @@ pub fn resample_audio(
 /// A streaming version of [`Resampler`]. `finish(self)` consumes the state, so no input can be
 /// accepted after its terminal tail has been emitted.
 pub struct StreamResampler {
-    resampler: Resampler,
+    resampler: Arc<Resampler>,
     buffer: Vec<f32>,
     input_start: usize,
     outputs_emitted: usize,
@@ -366,6 +367,10 @@ pub struct StreamResampler {
 
 impl StreamResampler {
     pub fn new(resampler: Resampler) -> Self {
+        Self::with_shared_filter(Arc::new(resampler))
+    }
+
+    pub(crate) fn with_shared_filter(resampler: Arc<Resampler>) -> Self {
         Self {
             resampler,
             buffer: Vec::new(),

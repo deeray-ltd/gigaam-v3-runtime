@@ -55,16 +55,66 @@ impl SpeechProbabilityDetector for VadDetector {
                 values.len()
             ));
         }
-        if let Some(index) = values
-            .iter()
-            .position(|value| !value.is_finite() || !(0.0..=1.0).contains(value))
-        {
-            return Err(format!(
-                "VAD probability at frame {index} must be finite in 0..=1"
-            ));
-        }
+        validate_probabilities(&values, 0)?;
         Ok(values)
     }
+
+    fn probabilities_bounded(
+        &mut self,
+        audio_length: usize,
+        read: &mut dyn FnMut(&mut [f32]) -> Result<(), String>,
+        emit: &mut dyn FnMut(&[f32]) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let expected = audio_length.div_ceil(512);
+        let mut samples_read = 0;
+        let mut frames_emitted = 0;
+        self.0.probabilities_bounded(
+            audio_length,
+            &mut |buffer| {
+                if buffer.is_empty() || buffer.len() > audio_length - samples_read {
+                    return Err("VAD requested invalid sample coverage".into());
+                }
+                read(buffer)?;
+                samples_read += buffer.len();
+                Ok(())
+            },
+            &mut |values| {
+                if values.is_empty() || values.len() > expected - frames_emitted {
+                    return Err(format!(
+                        "VAD returned invalid frame coverage, expected {expected} frames"
+                    ));
+                }
+                validate_probabilities(values, frames_emitted)?;
+                emit(values)?;
+                frames_emitted += values.len();
+                Ok(())
+            },
+        )?;
+        if samples_read != audio_length {
+            return Err(format!(
+                "VAD read {samples_read} samples, expected {audio_length}"
+            ));
+        }
+        if frames_emitted != expected {
+            return Err(format!(
+                "VAD returned {frames_emitted} frames, expected {expected}"
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn validate_probabilities(values: &[f32], first_frame: usize) -> Result<(), String> {
+    if let Some(index) = values
+        .iter()
+        .position(|value| !value.is_finite() || !(0.0..=1.0).contains(value))
+    {
+        return Err(format!(
+            "VAD probability at frame {} must be finite in 0..=1",
+            first_frame + index
+        ));
+    }
+    Ok(())
 }
 
 /// Registry assembled by the embedding process from linked implementations.
@@ -201,6 +251,84 @@ mod tests {
             Ok(self.0.clone())
         }
     }
+    struct BoundedDetector {
+        samples: usize,
+        values: Vec<f32>,
+    }
+    impl SpeechProbabilityDetector for BoundedDetector {
+        fn probabilities(&mut self, _: ChannelAudioView<'_>) -> Result<Vec<f32>, String> {
+            Err("fake detector requires the bounded path".into())
+        }
+
+        fn probabilities_bounded(
+            &mut self,
+            _: usize,
+            read: &mut dyn FnMut(&mut [f32]) -> Result<(), String>,
+            emit: &mut dyn FnMut(&[f32]) -> Result<(), String>,
+        ) -> Result<(), String> {
+            read(&mut vec![0.0; self.samples])?;
+            for values in self.values.chunks(1) {
+                emit(values)?;
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn legacy_provider_refuses_bounded_use_without_consuming_input() {
+        let mut detector = VadDetector(Box::new(FakeDetector(vec![0.0])));
+        let mut touched = false;
+        let error = detector
+            .probabilities_bounded(
+                1,
+                &mut |_| {
+                    touched = true;
+                    Ok(())
+                },
+                &mut |_| Err("unexpected output".into()),
+            )
+            .expect_err("legacy-only provider must refuse the bounded execution path");
+        assert!(error.contains("does not support bounded"));
+        assert!(!touched);
+    }
+
+    #[test]
+    fn bounded_provider_validates_global_frame_domain_and_coverage() {
+        let run = |samples, values| {
+            let mut detector = VadDetector(Box::new(BoundedDetector { samples, values }));
+            let mut output = Vec::new();
+            let result = detector.probabilities_bounded(
+                513,
+                &mut |input| {
+                    input.fill(1.0);
+                    Ok(())
+                },
+                &mut |values| {
+                    output.extend_from_slice(values);
+                    Ok(())
+                },
+            );
+            (output, result)
+        };
+        assert_eq!(run(513, vec![0.2, 0.8]), (vec![0.2, 0.8], Ok(())));
+
+        let (output, result) = run(513, vec![0.2, f32::NAN]);
+        assert_eq!(output, vec![0.2]);
+        assert!(
+            result
+                .expect_err("invalid probability must be rejected")
+                .contains("frame 1")
+        );
+        for (samples, values) in [
+            (512, vec![0.2, 0.8]),
+            (514, vec![0.2, 0.8]),
+            (513, vec![0.2]),
+            (513, vec![0.2, 0.8, 0.9]),
+        ] {
+            assert!(run(samples, values).1.is_err());
+        }
+    }
+
     fn package() -> ModelPackage {
         ModelPackage::open(std::path::Path::new(concat!(
             env!("CARGO_MANIFEST_DIR"),

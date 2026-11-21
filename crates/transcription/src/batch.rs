@@ -19,13 +19,15 @@ use crate::observations::{
 };
 use crate::padding::pad_noise;
 use crate::sample_windows::{SampleStride, SampleWindows};
-use crate::stitch::{Window, WindowWords, stitch_aligned};
+use crate::stitch::{Window, WindowWords, seam};
 use crate::vad_policy::{SpeechSegment, VadPolicyConfig, segments_from_probabilities};
 use gigaam_audio::{ChannelAudio, FeatureMatrix, FrontendProcessor};
 use gigaam_primitives::{trunc_f32_to_usize, usize_to_f32, usize_to_u64_checked};
 use gigaam_recognition::{
     ExecutionControl, FrameRate, ScoreDetail, SpeechProbabilityDetector, WindowDecoder, vad::VAD_SR,
 };
+use std::borrow::Cow;
+use std::ops::Range;
 use std::sync::Arc;
 
 /// Per-window geometry computed once by the window loop and threaded into per-window decoding,
@@ -40,21 +42,27 @@ struct WindowGeometry {
     end_sec: f32,
     first_sample: usize,
     first_frame: usize,
-    last_frame: usize,
     offset: f32,
     keep_until_sec: f32,
     subsampling_factor: Option<usize>,
     frontend_origin_sample: usize,
-    real_end_sample: usize,
 }
 
 /// The waveform crop's location in the source channel and its first planned window index.
 /// Feature and decoder coordinates remain local to this crop, even off the source hop grid.
 #[derive(Clone, Copy, Default)]
-struct SpanOrigin {
-    channel: Option<OriginalChannel>,
-    sample: usize,
-    window_index: usize,
+pub(crate) struct SpanOrigin {
+    pub(crate) channel: Option<OriginalChannel>,
+    pub(crate) sample: usize,
+    pub(crate) window_index: usize,
+}
+
+pub(crate) type WindowObservations<'a> = dyn FnMut(Range<usize>) -> Result<f32, String> + 'a;
+
+struct WindowScore {
+    first: usize,
+    end: usize,
+    maximum: f32,
 }
 
 /// A contiguous source envelope used for recognition, distinct from detector spans.
@@ -129,7 +137,7 @@ pub struct BatchTranscriber<D: WindowDecoder> {
     frame_rate: FrameRate,
     sample_rate: usize,
     timings: StageTimings,
-    score_observations: Option<(Vec<f32>, usize)>,
+    score_observations: Option<Vec<f32>>,
 }
 
 /// Typed capabilities required to create one batch transcriber.
@@ -178,6 +186,14 @@ impl<D: WindowDecoder> BatchTranscriber<D> {
         self.timings
     }
 
+    pub(crate) const fn full_window_samples(&self) -> usize {
+        self.config.full_window_samples()
+    }
+
+    pub(crate) fn record_vad_time(&mut self, seconds: f64) {
+        self.timings.add_vad(seconds);
+    }
+
     pub fn into_decoder(self) -> D {
         self.decoder
     }
@@ -216,15 +232,14 @@ impl<D: WindowDecoder> BatchTranscriber<D> {
 
     fn decode_frames(
         &mut self,
-        all_features: &FeatureMatrix,
+        features: &FeatureMatrix,
         geometry: WindowGeometry,
+        score: Option<WindowScore>,
     ) -> Result<Vec<TranscriptWord>, String> {
-        checkpoint(&self.control)?;
-        let features = all_features.frame_range(geometry.first_frame, geometry.last_frame)?;
         let feature_frames = features.frames();
         checkpoint(&self.control)?;
         let started = std::time::Instant::now();
-        let detail = if self.score_observations.is_some() {
+        let detail = if score.is_some() {
             gigaam_recognition::ScoreDetail::TokenLogProbabilities
         } else {
             gigaam_recognition::ScoreDetail::None
@@ -275,21 +290,7 @@ impl<D: WindowDecoder> BatchTranscriber<D> {
             })?;
             self.observations.emit_evidence(evidence);
         }
-        let provenance = if let Some((probabilities, source_len)) = &self.score_observations {
-            let first = geometry
-                .frontend_origin_sample
-                .checked_add(geometry.first_sample)
-                .ok_or_else(|| "window origin overflows".to_owned())?;
-            let end = geometry.real_end_sample.min(*source_len);
-            if first >= end {
-                return Err("scored window has no real source coverage".into());
-            }
-            let first_observation = first / 512;
-            let last_observation = (end - 1) / 512;
-            let observations = probabilities
-                .get(first_observation..=last_observation)
-                .ok_or_else(|| "missing window VAD observations".to_owned())?;
-            let maximum = observations.iter().copied().fold(0.0_f32, f32::max);
+        let provenance = if let Some(score) = score {
             let tokens = decoded
                 .tokens()
                 .ok_or_else(|| "decoder omitted token occurrences".to_owned())?
@@ -306,10 +307,10 @@ impl<D: WindowDecoder> BatchTranscriber<D> {
             }
             Some((
                 Arc::new(WindowProvenance {
-                    origin: first,
-                    end,
+                    origin: score.first,
+                    end: score.end,
                     sample_rate: self.sample_rate,
-                    no_speech_probability: 1.0 - f64::from(maximum),
+                    no_speech_probability: 1.0 - f64::from(score.maximum),
                     tokens,
                 }),
                 spans,
@@ -399,7 +400,7 @@ impl<D: WindowDecoder> BatchTranscriber<D> {
         let started = std::time::Instant::now();
         let cached = self.score_observations.is_some();
         let probabilities = match &self.score_observations {
-            Some((probabilities, _)) => probabilities.clone(),
+            Some(probabilities) => probabilities.clone(),
             None => detector.probabilities(input.view())?,
         };
         checkpoint(&self.control)?;
@@ -458,7 +459,7 @@ impl<D: WindowDecoder> BatchTranscriber<D> {
             return Err("invalid diagnostic VAD observations".into());
         }
         self.timings.add_vad(started.elapsed().as_secs_f64());
-        self.score_observations = Some((probabilities, input.len()));
+        self.score_observations = Some(probabilities);
         let result = match policy {
             Some(policy) => {
                 self.transcribe_channel_with_vad_in_context(input, detector, policy, channel)
@@ -484,34 +485,52 @@ impl<D: WindowDecoder> BatchTranscriber<D> {
         input_samples: &[f32],
         origin: SpanOrigin,
     ) -> Result<Transcript, String> {
+        let mut words = Vec::new();
+        let windows = self.transcribe_span_to(
+            input_samples.len(),
+            origin,
+            None,
+            |range| Ok(Cow::Borrowed(&input_samples[range])),
+            |word| {
+                words.push(word);
+                Ok(())
+            },
+        )?;
+        Ok(Transcript::new(words, windows))
+    }
+
+    pub(crate) fn transcribe_span_to<'a>(
+        &mut self,
+        input_length: usize,
+        origin: SpanOrigin,
+        mut read_observations: Option<&mut WindowObservations<'_>>,
+        mut read_samples: impl FnMut(Range<usize>) -> Result<Cow<'a, [f32]>, String>,
+        mut emit_word: impl FnMut(TranscriptWord) -> Result<(), String>,
+    ) -> Result<usize, String> {
         checkpoint(&self.control)?;
         let sample_rate_f32 = usize_to_f32(self.sample_rate);
         let full_length = self.config.full_window_samples();
-        let real_seconds = usize_to_f32(input_samples.len()) / sample_rate_f32;
-        let padded: Vec<f32>;
-        let samples: &[f32] = if self.config.padding() == PadPolicy::PadToWindow
-            && input_samples.len() < full_length
-        {
-            let mut value = input_samples.to_vec();
-            let seed = usize_to_u64_checked(input_samples.len())
-                .map_err(|error| format!("batch padding seed: {error}"))?;
-            value.extend(pad_noise(full_length - input_samples.len(), seed));
-            padded = value;
-            &padded
-        } else {
-            input_samples
-        };
+        let real_seconds = usize_to_f32(input_length) / sample_rate_f32;
+        let padded =
+            if self.config.padding() == PadPolicy::PadToWindow && input_length < full_length {
+                let mut value = read_samples(0..input_length)?.into_owned();
+                if value.len() != input_length {
+                    return Err("batch source returned an incomplete sample range".into());
+                }
+                let seed = usize_to_u64_checked(input_length)
+                    .map_err(|error| format!("batch padding seed: {error}"))?;
+                value.extend(pad_noise(full_length - input_length, seed));
+                Some(value)
+            } else {
+                None
+            };
         // Keep a small punctuation tail but never include a word beginning in synthetic padding.
         let keep_until = real_seconds + 0.5;
-        let frontend_started = std::time::Instant::now();
-        let features = self.frontend.log_mel(samples)?;
-        checkpoint(&self.control)?;
-        self.timings
-            .add_frontend(frontend_started.elapsed().as_secs_f64());
-        let feature_count = features.frames();
+        let sample_count = padded.as_ref().map_or(input_length, Vec::len);
+        let feature_count = self.frontend.frame_count(sample_count)?;
         let hop = self.frontend.hop_length();
         let fft_length = self.frontend.fft_length();
-        let length = usize_to_u64_checked(samples.len())
+        let length = usize_to_u64_checked(sample_count)
             .map_err(|error| format!("batch span length: {error}"))?;
         let width = usize_to_u64_checked(full_length)
             .map_err(|error| format!("batch window length: {error}"))?;
@@ -532,7 +551,14 @@ impl<D: WindowDecoder> BatchTranscriber<D> {
         } else {
             None
         };
-        let mut window_words = Vec::new();
+        let mut previous: Option<WindowWords> = None;
+        let source_start = usize_to_f32(origin.sample) / sample_rate_f32;
+        let mut emit_final = |word: TranscriptWord| {
+            if word.start() < real_seconds {
+                emit_word(word.capped_end(real_seconds)?.shifted(source_start)?)?;
+            }
+            Ok::<_, String>(())
+        };
         for (window_index, window) in windows.enumerate() {
             checkpoint(&self.control)?;
             let first_sample = usize::try_from(window.start)
@@ -563,6 +589,51 @@ impl<D: WindowDecoder> BatchTranscriber<D> {
             } else {
                 WindowKind::Body
             };
+            let frontend_started = std::time::Instant::now();
+            let features =
+                self.frontend
+                    .log_mel_range(
+                        sample_count,
+                        first_frame..last_frame,
+                        |range| match &padded {
+                            Some(samples) => Ok(Cow::Borrowed(&samples[range])),
+                            None => read_samples(range),
+                        },
+                    )?;
+            self.timings
+                .add_frontend(frontend_started.elapsed().as_secs_f64());
+            let real_end_sample = origin
+                .sample
+                .checked_add(last_sample.min(input_length))
+                .ok_or_else(|| "window real end overflows".to_owned())?;
+            let score = if read_observations.is_some() || self.score_observations.is_some() {
+                let first = origin
+                    .sample
+                    .checked_add(first_sample)
+                    .ok_or_else(|| "window origin overflows".to_owned())?;
+                if first >= real_end_sample {
+                    return Err("scored window has no real source coverage".into());
+                }
+                let observations = first / 512..real_end_sample.div_ceil(512);
+                let maximum = match &mut read_observations {
+                    Some(read) => read(observations)?,
+                    None => self
+                        .score_observations
+                        .as_ref()
+                        .and_then(|probabilities| probabilities.get(observations))
+                        .ok_or_else(|| "missing window VAD observations".to_owned())?
+                        .iter()
+                        .copied()
+                        .fold(0.0_f32, f32::max),
+                };
+                Some(WindowScore {
+                    first,
+                    end: real_end_sample,
+                    maximum,
+                })
+            } else {
+                None
+            };
             let words = self.decode_frames(
                 &features,
                 WindowGeometry {
@@ -576,30 +647,35 @@ impl<D: WindowDecoder> BatchTranscriber<D> {
                     end_sec: end,
                     first_sample,
                     first_frame,
-                    last_frame,
                     offset,
                     keep_until_sec: end.min(keep_until),
                     subsampling_factor,
                     frontend_origin_sample: origin.sample,
-                    real_end_sample: origin
-                        .sample
-                        .checked_add(last_sample.min(input_samples.len()))
-                        .ok_or_else(|| "window real end overflows".to_owned())?,
                 },
+                score,
             )?;
-            window_words.push(WindowWords::new(Window::new(start, end)?, words));
+            let current = WindowWords::new(Window::new(start, end)?, words);
+            previous = if let Some(previous) = previous {
+                let cut = seam(previous.words(), previous.end(), &current, 0.25)?;
+                for word in previous.into_words().into_iter().take(cut.previous_count()) {
+                    emit_final(word)?;
+                }
+                let window = current.window();
+                let mut words = current.into_words();
+                words.drain(..cut.current_skip());
+                Some(WindowWords::new(window, words))
+            } else {
+                Some(current)
+            };
         }
         checkpoint(&self.control)?;
-        let words = stitch_aligned(&window_words, 0.25)?
-            .into_iter()
-            .filter(|word| word.start() < real_seconds)
-            .map(|word| {
-                word.capped_end(real_seconds)?
-                    .shifted(usize_to_f32(origin.sample) / sample_rate_f32)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        if let Some(previous) = previous {
+            for word in previous.into_words() {
+                emit_final(word)?;
+            }
+        }
         checkpoint(&self.control)?;
-        Ok(Transcript::new(words, window_count))
+        Ok(window_count)
     }
 }
 

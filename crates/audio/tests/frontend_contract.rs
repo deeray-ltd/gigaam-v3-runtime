@@ -155,6 +155,33 @@ fn scalar_and_batched_frontends_match_and_short_clips_have_zero_frames() -> Resu
 }
 
 #[test]
+fn centered_frame_ranges_use_reflection_at_source_edges() -> Result<(), String> {
+    use std::borrow::Cow;
+
+    let centered = TempPack::new(config(4, "0.0001").replace("center=false", "center=true"))?;
+    write_valid_assets(&centered)?;
+    let plain = TempPack::new(config(4, "0.0001"))?;
+    write_valid_assets(&plain)?;
+    let samples = [0.1_f32, -0.2, 0.3, -0.4, 0.5, -0.6, 0.7, -0.8];
+    let reflected = [
+        0.3_f32, -0.2, 0.1, -0.2, 0.3, -0.4, 0.5, -0.6, 0.7, -0.8, 0.7, -0.6,
+    ];
+    for mode in [FrontendMode::Scalar, FrontendMode::Batched] {
+        let reference = processor(&plain, mode)?.log_mel(&reflected)?;
+        let processor = processor(&centered, mode)?;
+        for (frames, source) in [(0..1, 0..3), (2..3, 2..6), (4..5, 5..8), (1..4, 0..8)] {
+            let expected = reference.frame_range(frames.start, frames.end)?;
+            let actual = processor.log_mel_range(samples.len(), frames, |range| {
+                assert_eq!(range, source);
+                Ok(Cow::Borrowed(&samples[range]))
+            })?;
+            assert_eq!(actual, expected);
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn frontend_refuses_invalid_mode_dimensions_weights_clamps_and_fft_plan() -> Result<(), String> {
     assert!(FrontendMode::parse("scalar ").is_err());
 

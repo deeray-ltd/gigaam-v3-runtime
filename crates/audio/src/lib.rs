@@ -21,6 +21,7 @@ mod formats;
 mod frontend;
 mod g711;
 mod live_input;
+mod replay;
 mod resampling;
 
 pub use channel_analysis::channel_correlation;
@@ -37,6 +38,7 @@ pub use g711::{alaw_to_i16, ulaw_to_i16};
 pub use live_input::{
     LiveChunkReader, LiveDecoder, LiveDecoderProvider, LiveDecoders, SelectedLiveDecoder,
 };
+pub use replay::{ReplayAudio, ReplayError};
 pub use resampling::{RatePair, Resampler, ResamplerConfig, StreamResampler, resample_audio};
 
 #[cfg(test)]

@@ -13,6 +13,8 @@ use crate::contracts::{FeatureMatrix, FrontendMode, SampleRate};
 use crate::fft::{Complex, RealFft};
 use gigaam_model_package::{FrontendDefinition, FrontendWeights};
 use gigaam_primitives::f64_to_f32;
+use std::borrow::Cow;
+use std::ops::Range;
 
 struct MelBand {
     first_bin: usize,
@@ -285,13 +287,15 @@ impl FrontendProcessor {
         if samples.iter().any(|sample| !sample.is_finite()) {
             return Err("frontend input samples must be finite".into());
         }
-        match self.mode {
-            FrontendMode::Scalar => self.log_mel_scalar(samples),
-            FrontendMode::Batched => self.log_mel_batched(samples),
-        }
+        self.log_mel_range(
+            samples.len(),
+            0..self.frame_count(samples.len())?,
+            |range| Ok(Cow::Borrowed(&samples[range])),
+        )
     }
 
-    fn frame_count(&self, samples: usize) -> Result<usize, String> {
+    /// Number of frames on the feature grid of a complete waveform span.
+    pub fn frame_count(&self, samples: usize) -> Result<usize, String> {
         let effective_length = if self.centered {
             let padding = self
                 .fft_length
@@ -306,6 +310,11 @@ impl FrontendProcessor {
         if effective_length < self.fft_length {
             Ok(0)
         } else {
+            if self.centered && samples <= self.fft_length / 2 {
+                return Err(
+                    "centered frontend input must be longer than its reflect-padding width".into(),
+                );
+            }
             effective_length
                 .checked_sub(self.fft_length)
                 .and_then(|value| value.checked_div(self.hop_length))
@@ -314,49 +323,80 @@ impl FrontendProcessor {
         }
     }
 
-    fn centered<'a>(
+    /// Computes a contiguous subset of the feature grid of a waveform span. The reader receives
+    /// only the contiguous source samples needed by those frames. Centering reflects at the
+    /// span's ends, including when a frame range begins or ends inside the span.
+    pub fn log_mel_range<'a>(
         &self,
-        samples: &'a [f32],
-        padded: &'a mut Vec<f32>,
-    ) -> Result<&'a [f32], String> {
-        if !self.centered {
-            return Ok(samples);
+        sample_count: usize,
+        frames: Range<usize>,
+        read_samples: impl FnOnce(Range<usize>) -> Result<Cow<'a, [f32]>, String>,
+    ) -> Result<FeatureMatrix, String> {
+        if frames.start > frames.end || frames.end > self.frame_count(sample_count)? {
+            return Err("frontend frame range is outside the waveform span".into());
         }
-        let padding = self.fft_length / 2;
-        if samples.len() <= padding {
-            return Err(
-                "centered frontend input must be longer than its reflect-padding width".into(),
-            );
-        }
-        let capacity = samples
-            .len()
-            .checked_add(checked_product(padding, 2, "frontend centered input")?)
-            .ok_or_else(|| "frontend centered input length overflows usize".to_owned())?;
-        padded.clear();
-        padded
-            .try_reserve(capacity)
-            .map_err(|_| "frontend centered input cannot reserve memory".to_owned())?;
-        for offset in (1..=padding).rev() {
-            padded.push(samples[offset]);
-        }
-        padded.extend_from_slice(samples);
-        for offset in 1..=padding {
-            let source = samples
-                .len()
-                .checked_sub(1 + offset)
-                .ok_or_else(|| "frontend reflect-padding index underflows".to_owned())?;
-            padded.push(samples[source]);
-        }
-        Ok(padded)
-    }
-
-    fn log_mel_scalar(&self, samples: &[f32]) -> Result<FeatureMatrix, String> {
-        let frames = self.frame_count(samples.len())?;
-        if frames == 0 {
+        if frames.is_empty() {
             return FeatureMatrix::new(self.mel_bins, 0, Vec::new());
         }
-        let mut padded = Vec::new();
-        let centered = self.centered(samples, &mut padded)?;
+        let padding = if self.centered {
+            self.fft_length / 2
+        } else {
+            0
+        };
+        let padded_start = checked_product(frames.start, self.hop_length, "frontend frame start")?;
+        let padded_end = checked_product(frames.end - 1, self.hop_length, "frontend frame end")?
+            .checked_add(self.fft_length)
+            .ok_or_else(|| "frontend frame end overflows usize".to_owned())?;
+        let last_real = padding
+            .checked_add(sample_count - 1)
+            .ok_or_else(|| "frontend waveform ends outside the sample grid".to_owned())?;
+        let source_index = |index| {
+            if index < padding {
+                padding - index
+            } else if index > last_real {
+                sample_count - 1 - (index - last_real)
+            } else {
+                index - padding
+            }
+        };
+        let first = source_index(padded_start);
+        let last = source_index(padded_end - 1);
+        let start = if (padded_start..padded_end).contains(&padding) {
+            0
+        } else {
+            first.min(last)
+        };
+        let end = if (padded_start..padded_end).contains(&last_real) {
+            sample_count
+        } else {
+            first.max(last) + 1
+        };
+        let samples = read_samples(start..end)?;
+        if samples.len() != end - start {
+            return Err("frontend source returned an incomplete sample range".into());
+        }
+        if samples.iter().any(|sample| !sample.is_finite()) {
+            return Err("frontend input samples must be finite".into());
+        }
+        let padded = if padded_start < padding || padded_end - 1 > last_real {
+            let mut reflected = Vec::new();
+            reflected
+                .try_reserve_exact(padded_end - padded_start)
+                .map_err(|_| "frontend centered input cannot reserve memory".to_owned())?;
+            reflected.extend(
+                (padded_start..padded_end).map(|index| samples[source_index(index) - start]),
+            );
+            Cow::Owned(reflected)
+        } else {
+            samples
+        };
+        match self.mode {
+            FrontendMode::Scalar => self.log_mel_scalar(&padded, frames.len()),
+            FrontendMode::Batched => self.log_mel_batched(&padded, frames.len()),
+        }
+    }
+
+    fn log_mel_scalar(&self, samples: &[f32], frames: usize) -> Result<FeatureMatrix, String> {
         let output_len = checked_product(self.mel_bins, frames, "frontend output dimensions")?;
         let mut output = Vec::new();
         let mut column = Vec::new();
@@ -374,7 +414,7 @@ impl FrontendProcessor {
             let end = offset
                 .checked_add(self.fft_length)
                 .ok_or_else(|| "frontend frame end overflows usize".to_owned())?;
-            self.frame_log_mel(&centered[offset..end], &mut column, &mut scratch)?;
+            self.frame_log_mel(&samples[offset..end], &mut column, &mut scratch)?;
             for (mel_bin, value) in column.iter().copied().enumerate() {
                 let destination = checked_product(mel_bin, frames, "frontend output index")?
                     .checked_add(frame)
@@ -385,13 +425,7 @@ impl FrontendProcessor {
         FeatureMatrix::new(self.mel_bins, frames, output)
     }
 
-    fn log_mel_batched(&self, samples: &[f32]) -> Result<FeatureMatrix, String> {
-        let frames = self.frame_count(samples.len())?;
-        if frames == 0 {
-            return FeatureMatrix::new(self.mel_bins, 0, Vec::new());
-        }
-        let mut padded = Vec::new();
-        let centered = self.centered(samples, &mut padded)?;
+    fn log_mel_batched(&self, samples: &[f32], frames: usize) -> Result<FeatureMatrix, String> {
         let half_length = self.fft_length / 2;
         let packed_len = checked_product(half_length, frames, "batched frontend dimensions")?;
         let output_len =
@@ -418,8 +452,8 @@ impl FrontendProcessor {
                 let target = checked_product(index, frames, "batched frontend packed index")?
                     .checked_add(frame)
                     .ok_or_else(|| "batched frontend packed index overflows usize".to_owned())?;
-                real[target] = centered[left] * self.window[index * 2];
-                imaginary[target] = centered[right] * self.window[index * 2 + 1];
+                real[target] = samples[left] * self.window[index * 2];
+                imaginary[target] = samples[right] * self.window[index * 2 + 1];
             }
         }
         let mut scratch_real = vec![0.0_f32; packed_len];

@@ -10,16 +10,18 @@
 //! Atomic multi-channel batch transcription over one mutable recognition decoder.
 
 use crate::batch::{BatchSetup, BatchTranscriber};
+use crate::batch_replay::{self, ReplayObservations};
 use crate::channel_selection::{
-    BatchChannelPolicy, DuplicateClassification, OriginalChannel, SourceChannelCount,
-    select_batch_channels,
+    BatchChannelPolicy, BatchChannelSelection, DuplicateClassification, OriginalChannel,
+    SourceChannelCount, select_batch_by, select_batch_channels,
 };
-use crate::contracts::{StageTimings, Transcript, Turn, checkpoint};
+use crate::contracts::{StageTimings, Transcript, TranscriptWord, Turn, checkpoint};
 use crate::turns::{ChannelTranscript, TurnGap, channel_segments, turns};
 use crate::vad_policy::VadPolicyConfig;
-use gigaam_audio::{ChannelAudio, DecodedAudio};
+use gigaam_audio::{ChannelAudio, DecodedAudio, ReplayAudio};
 use gigaam_recognition::{ExecutionControl, SpeechProbabilityDetector, WindowDecoder};
 use std::fmt::{Display, Formatter};
+use std::io::{self, Read, Seek, Write};
 
 /// Typed options that determine multi-channel batch selection and final turn construction.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -107,6 +109,25 @@ struct MultiChannelBatchResultInput {
 }
 
 impl MultiChannelBatchResult {
+    /// Collects wire projections where the caller explicitly elects to retain the full output.
+    pub fn from_channels(
+        selection: &BatchChannelSelection,
+        channels: Vec<ChannelTranscript>,
+        turn_gap: TurnGap,
+        timings: StageTimings,
+    ) -> Result<Self, String> {
+        let segments = channel_segments(&channels, turn_gap)?;
+        let turns = turns(&channels, turn_gap)?;
+        Self::new(MultiChannelBatchResultInput {
+            source_channels: selection.source_channels(),
+            duplicate: selection.duplicate(),
+            channels,
+            segments,
+            turns,
+            timings,
+        })
+    }
+
     fn new(input: MultiChannelBatchResultInput) -> Result<Self, String> {
         validate_selected_channels(input.source_channels, &input.channels)?;
         validate_stage_timings(input.timings, "multi-channel batch result")?;
@@ -180,6 +201,72 @@ impl<D: WindowDecoder> MultiChannelBatchTranscriber<D> {
     /// Warms the one decoder before its single consuming batch operation.
     pub fn warmup(&mut self) -> Result<(), String> {
         self.batch.warmup()
+    }
+
+    /// Recognizes a replayable source, emitting finalized words in physical-channel order.
+    pub fn transcribe_replay<F: Read + Write + Seek>(
+        mut self,
+        input: &mut ReplayAudio<F>,
+        mut observations: Option<ReplayObservations<'_>>,
+        mut create_file: impl FnMut() -> io::Result<F>,
+        mut emit: impl FnMut(OriginalChannel, TranscriptWord) -> Result<(), String>,
+    ) -> Result<(BatchChannelSelection, StageTimings), MultiChannelBatchError> {
+        checkpoint(&self.control).map_err(MultiChannelBatchError::Transcription)?;
+        let rate = input
+            .sample_rate()
+            .as_usize()
+            .map_err(MultiChannelBatchError::Input)?;
+        if rate != self.batch.sample_rate() {
+            return Err(MultiChannelBatchError::Input(format!(
+                "batch input sample rate {rate} Hz does not match frontend sample rate {} Hz",
+                self.batch.sample_rate(),
+            )));
+        }
+        let channels =
+            SourceChannelCount::new(input.channels()).map_err(MultiChannelBatchError::Input)?;
+        let selection = select_batch_by(
+            channels,
+            self.options.channel_policy(),
+            |_, _| {
+                input
+                    .stereo_correlation(|| checkpoint(&self.control))
+                    .map_err(|error| match error {
+                        gigaam_audio::ReplayError::Audio(message) => {
+                            MultiChannelBatchError::Selection(message)
+                        }
+                        gigaam_audio::ReplayError::Storage(error) => {
+                            MultiChannelBatchError::Transcription(format!(
+                                "batch scratch storage: {error}"
+                            ))
+                        }
+                        gigaam_audio::ReplayError::Cancelled(message) => {
+                            MultiChannelBatchError::Transcription(message)
+                        }
+                    })
+            },
+            MultiChannelBatchError::Selection,
+        )?;
+        let mut aggregate = ChannelTimingAggregate::new(self.batch.timings())
+            .map_err(MultiChannelBatchError::Transcription)?;
+        for &channel in selection.selection().channels() {
+            checkpoint(&self.control).map_err(MultiChannelBatchError::Transcription)?;
+            let timings_before = self.batch.timings();
+            batch_replay::transcribe_channel(
+                &mut self.batch,
+                input,
+                channel,
+                &self.control,
+                observations.as_mut(),
+                &mut create_file,
+                &mut |word| emit(channel, word),
+            )
+            .map_err(MultiChannelBatchError::Transcription)?;
+            aggregate
+                .record(timings_before, self.batch.timings())
+                .map_err(MultiChannelBatchError::Transcription)?;
+        }
+        checkpoint(&self.control).map_err(MultiChannelBatchError::Transcription)?;
+        Ok((selection, aggregate.finish()))
     }
 
     /// Transcribes every selected source channel or returns no result.
