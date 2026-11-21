@@ -8,7 +8,7 @@
 use symphonia_core::codecs::CodecId;
 use symphonia_core::codecs::video::{VIDEO_EXTRA_DATA_ID_NULL, VideoExtraData};
 use symphonia_core::errors::Error;
-use symphonia_core::io::BufReader;
+use symphonia_core::io::{BufReader, ReadBytes};
 
 use symphonia_common::mpeg::audio::*;
 use symphonia_common::mpeg::formats::*;
@@ -33,30 +33,29 @@ impl Atom for EsdsAtom {
             .data_left()?
             .ok_or(Error::DecodeError("isomp4 (esds): expected atom size to be known"))?;
 
-        let mut descriptor = None;
-
-        if size > MIN_OBJECT_DESCRIPTOR_SIZE {
-            // Read into buffer to be able to use a buffer reader.
-            let buf = it.read_boxed_slice_exact(size as usize)?;
-
-            let mut reader = BufReader::new(&buf);
-
-            // Read the object descriptor header.
-            let (desc_tag, desc_len) = read_object_descriptor_header(&mut reader)?;
-
-            // Read the ES descriptor.
-            if desc_tag == ClassTag::EsDescriptor {
-                descriptor = Some(ESDescriptor::read(&mut reader, desc_len)?);
-            }
+        if size <= MIN_OBJECT_DESCRIPTOR_SIZE {
+            return decode_error("isomp4 (esds): missing es descriptor in esds");
         }
 
-        let Some(es_desc) = descriptor
-        else {
-            return decode_error("isomp4 (esds): missing es descriptor in esds");
+        let es_desc = match it.read_scoped_batch_atom_data(size, |reader| read_es_descriptor(reader))? {
+            Some(descriptor) => descriptor,
+            None => {
+                let size = usize::try_from(size)
+                    .map_err(|_| Error::LimitError("isomp4 (esds): atom size exceeds usize"))?;
+                let buf = it.read_boxed_slice_exact(size)?;
+                read_es_descriptor(&mut BufReader::new(&buf))?
+            }
         };
-
         Ok(EsdsAtom { es_desc })
     }
+}
+
+fn read_es_descriptor<R: ReadBytes>(reader: &mut R) -> Result<ESDescriptor> {
+    let (tag, len) = read_object_descriptor_header(reader)?;
+    if tag != ClassTag::EsDescriptor {
+        return decode_error("isomp4 (esds): missing es descriptor in esds");
+    }
+    Ok(ESDescriptor::read(reader, len)?)
 }
 
 impl EsdsAtom {
@@ -109,6 +108,92 @@ impl EsdsAtom {
                 .push(VideoExtraData { id: VIDEO_EXTRA_DATA_ID_NULL, data: ds_config.extra_data });
         }
 
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{self, Cursor, Read, Seek, SeekFrom};
+    use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+    use symphonia_core::io::{MediaSource, MediaSourceStream};
+    use crate::atoms::AtomType;
+
+    struct CountedSource(Cursor<Vec<u8>>, Arc<AtomicUsize>);
+
+    impl Read for CountedSource {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let count = self.0.read(buf)?;
+            self.1.fetch_add(count, Ordering::Relaxed);
+            Ok(count)
+        }
+    }
+
+    impl Seek for CountedSource {
+        fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> { self.0.seek(pos) }
+    }
+
+    impl MediaSource for CountedSource {
+        fn is_seekable(&self) -> bool { true }
+        fn byte_len(&self) -> Option<u64> { u64::try_from(self.0.get_ref().len()).ok() }
+    }
+
+    fn descriptor(tag: u8, size: usize) -> Vec<u8> {
+        let mut header = vec![tag];
+        for shift in [21, 14, 7, 0] {
+            let digit = u8::try_from((size >> shift) & 0x7f).expect("seven descriptor-size bits");
+            header.push(if shift == 0 { digit } else { digit | 0x80 });
+        }
+        header
+    }
+
+    fn fixture(padding: usize, truncated: bool) -> Vec<u8> {
+        let mut decoder_config = vec![0x40, 0x15];
+        decoder_config.extend([0; 11]); // Buffer size and bit rates.
+        decoder_config.extend(descriptor(0x05, 2));
+        decoder_config.extend([0x11, 0x88]); // AAC-LC, 48 kHz, mono AudioSpecificConfig.
+        let mut es = vec![0, 1, 0]; // ES identifier and flags.
+        es.extend(descriptor(0x04, decoder_config.len()));
+        es.extend(decoder_config);
+        es.extend(descriptor(0xc0, padding));
+        es.resize(es.len() + padding, 0); // Ignored user-private descriptor.
+        es.extend(descriptor(0x06, 1));
+        es.push(2); // MP4 SL configuration.
+        let desc = descriptor(0x03, es.len() + usize::from(truncated));
+        let size = u32::try_from(12 + desc.len() + es.len()).expect("fixture atom size");
+        let mut data = size.to_be_bytes().to_vec();
+        data.extend(b"esds\0\0\0\0");
+        data.extend(desc);
+        data.extend(es);
+        data.extend(b"\0\0\0\x08free");
+        data
+    }
+
+    #[test]
+    fn batch_reads_esds_without_materializing_its_private_descriptor() -> symphonia_core::errors::Result<()> {
+        let padding = 512 * 1024;
+        for (batch, size, truncated) in [(false, 0, false), (true, padding, false), (true, 0, true)] {
+            let data = fixture(size, truncated);
+            let length = u64::try_from(data.len()).expect("fixture source size");
+            let bytes_read = Arc::new(AtomicUsize::new(0));
+            let input = CountedSource(Cursor::new(data), Arc::clone(&bytes_read));
+            let mut it = AtomIterator::new(MediaSourceStream::new(Box::new(input), Default::default()), Some(length));
+            if batch {
+                it.use_deferred_sample_sizes();
+            }
+            assert_eq!(it.next_header()?.unwrap().atom_type(), AtomType::Esds);
+            let result = it.read_atom::<EsdsAtom>();
+            if truncated {
+                assert!(result.is_err());
+            } else {
+                let config = result?.es_desc.dec_config;
+                assert_eq!(config.object_type_indication, 0x40);
+                assert_eq!(config.dec_specific_info.unwrap().extra_data.as_ref(), [0x11, 0x88]);
+            }
+            assert_eq!(it.next_header()?.unwrap().atom_type(), AtomType::Free);
+            assert!(bytes_read.load(Ordering::Relaxed) < padding);
+        }
         Ok(())
     }
 }

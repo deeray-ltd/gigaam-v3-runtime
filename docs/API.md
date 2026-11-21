@@ -359,9 +359,13 @@ For container inputs with leading ID3v2 tags, the decoder checks each tag extent
 its metadata payload before opening the audio stream. Embedded cover art is ignored by
 transcription. The decoded audio clock still starts at the first emitted source sample.
 
-Native FLAC batch inputs retain the STREAMINFO and encoded audio frames. The batch
-decoder skips other declared metadata blocks. For Ogg-FLAC, it preserves decoder
-setup and skips optional embedded pictures and comment packets.
+Batch FLAC input retains STREAMINFO and the encoded audio frames. The reader skips
+other metadata blocks in native FLAC. For seekable Matroska it reads STREAMINFO
+from the validated codec data range. For Ogg-FLAC, it preserves decoder setup
+and skips optional embedded pictures and comment packets.
+
+For seekable Matroska, the batch reader validates and skips the segment title
+and application strings. It checks that required elements are present.
 
 For the selected Vorbis audio track in a seekable Matroska input, the batch
 decoder retains the identification and setup packets and skips comment bodies.
@@ -375,6 +379,11 @@ decoder's frame boundaries. The reported sample clock follows the same decoded
 samples and channel order. ISO-BMFF sample descriptions with advisory or
 unspecified packet fields use the same bounded reads and existing PCM
 interpretation.
+
+The seekable ISO-BMFF batch reader skips edit-list records and compatible
+brands after checking their declared ranges. It parses elementary stream
+descriptors from the file and skips unused descriptors. Fragment tables stay
+file-backed when the movie metadata follows the audio fragments.
 
 ## Offline CLI
 

@@ -542,6 +542,9 @@ impl<'s> IsoMp4Reader<'s> {
             mss.seek(SeekFrom::Start(0))?;
 
             it = AtomIterator::new(mss, total_len);
+            if defer_sizes {
+                it.use_deferred_sample_sizes();
+            }
 
             while let Some(header) = it.next_header()? {
                 if let AtomType::MovieFragment | AtomType::MediaData = header.atom_type() {

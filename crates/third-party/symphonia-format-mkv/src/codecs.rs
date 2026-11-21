@@ -47,6 +47,11 @@ pub(crate) fn make_track_codec_params<R: ReadEbml>(
         (Some(CodecId::Audio(CODEC_ID_VORBIS)), Some(BinaryData::Source(range))) => {
             Some(vorbis_extra_data_from_source(it, range)?)
         }
+        (Some(CodecId::Audio(CODEC_ID_FLAC)), Some(BinaryData::Source(range))) => {
+            Some(it.with_binary_range(range.start, range.end - range.start, |mut reader| {
+                flac_extra_data(&mut reader)
+            })?)
+        }
         (id, Some(private)) => {
             let bytes = match private {
                 BinaryData::Inline(bytes) => bytes,
@@ -64,7 +69,7 @@ pub(crate) fn make_track_codec_params<R: ReadEbml>(
                 Some(CodecId::Audio(CODEC_ID_VORBIS)) => {
                     vorbis_extra_data_from_codec_private(&bytes)?
                 }
-                Some(CodecId::Audio(CODEC_ID_FLAC)) => flac_extra_data_from_codec_private(&bytes)?,
+                Some(CodecId::Audio(CODEC_ID_FLAC)) => flac_extra_data(&mut BufReader::new(&bytes))?,
                 _ => bytes,
             })
         }
@@ -302,27 +307,27 @@ fn vorbis_extra_data_from_source<R: ReadEbml>(
     Ok(extra.into_boxed_slice())
 }
 
-fn flac_extra_data_from_codec_private(codec_private: &[u8]) -> Result<Box<[u8]>> {
-    let mut reader = BufReader::new(codec_private);
-
+fn flac_extra_data(reader: &mut impl ReadBytes) -> Result<Box<[u8]>> {
     let marker = reader.read_quad_bytes()?;
     if marker != *b"fLaC" {
         return decode_error("mkv (flac): missing flac stream marker");
     }
 
-    // The codec private data contains all header/matadata blocks. Extract the stream information
-    // block (typically the first).
+    // Only STREAMINFO is needed by the decoder. The batch reader restricts
+    // reads and skips to the declared codec private range.
     loop {
-        let header = MetadataBlockHeader::read(&mut reader)?;
+        let header = MetadataBlockHeader::read(reader)?;
 
         match header.block_type {
             MetadataBlockType::StreamInfo => {
                 // Ensure the stream information block is the expected size.
                 if !StreamInfo::is_valid_size(u64::from(header.block_len)) {
-                    return decode_error("isomp4 (flac): invalid stream info block length");
+                    return decode_error("mkv (flac): invalid stream info block length");
                 }
 
-                break Ok(reader.read_boxed_slice_exact(header.block_len as usize)?);
+                let length = usize::try_from(header.block_len)
+                    .map_err(|_| Error::DecodeError("mkv (flac): stream info length exceeds usize"))?;
+                break Ok(reader.read_boxed_slice_exact(length)?);
             }
             _ => reader.ignore_bytes(u64::from(header.block_len))?,
         }

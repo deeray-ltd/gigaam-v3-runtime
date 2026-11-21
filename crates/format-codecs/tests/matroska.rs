@@ -59,6 +59,10 @@ mod vorbis {
     // indexing and metadata removed so the two payloads can be varied independently.
     const CONTROL: &[u8] = include_bytes!("fixtures/vorbis-sine.mkv");
     const SEGMENT: &[u8] = b"\x18\x53\x80\x67";
+    const INFO: &[u8] = b"\x15\x49\xA9\x66";
+    const TITLE: &[u8] = b"\x7B\xA9";
+    const MUXING_APP: &[u8] = b"\x4D\x80";
+    const WRITING_APP: &[u8] = b"\x57\x41";
     const TRACKS: &[u8] = b"\x16\x54\xAE\x6B";
     const TRACK_ENTRY: &[u8] = b"\xAE";
     const CODEC_PRIVATE: &[u8] = b"\x63\xA2";
@@ -212,6 +216,29 @@ mod vorbis {
         Ok(result)
     }
 
+    fn fixture_with_info(
+        replace: impl Fn(&[u8]) -> Result<Vec<u8>, Box<dyn Error>>,
+    ) -> Result<Vec<u8>, Box<dyn Error>> {
+        let mut file = Vec::new();
+        for (id, body) in children(CONTROL)? {
+            if id == SEGMENT {
+                let mut segment = Vec::new();
+                for (child, payload) in children(body)? {
+                    let updated = if child == INFO {
+                        replace(payload)?
+                    } else {
+                        payload.to_vec()
+                    };
+                    segment.extend(element(child, updated)?);
+                }
+                file.extend(element(id, segment)?);
+            } else {
+                file.extend(element(id, body.to_vec())?);
+            }
+        }
+        Ok(file)
+    }
+
     struct Decoded {
         pcm: Vec<u32>,
         open_bytes: usize,
@@ -278,6 +305,61 @@ mod vorbis {
         assert!(large.total_bytes < SMALL_PADDING);
         Ok(())
     }
+
+    #[test]
+    fn batch_skips_segment_info_text_and_preserves_pcm() -> Result<(), Box<dyn Error>> {
+        let baseline = decode(CONTROL.to_vec())?;
+        for length in [0, SMALL_PADDING, LARGE_PADDING] {
+            let input = fixture_with_info(|body| {
+                let mut info = Vec::new();
+                for (id, payload) in children(body)? {
+                    if ![TITLE, MUXING_APP, WRITING_APP].contains(&id) {
+                        info.extend(element(id, payload.to_vec())?);
+                    }
+                }
+                for id in [TITLE, MUXING_APP, WRITING_APP] {
+                    info.extend(element(id, vec![b'x'; length])?);
+                }
+                Ok(info)
+            })?;
+            let result = decode(input)?;
+            assert_eq!(result.pcm, baseline.pcm);
+            assert!(result.total_bytes < SMALL_PADDING);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn batch_refuses_missing_or_overrunning_required_segment_info_text()
+    -> Result<(), Box<dyn Error>> {
+        for missing in [MUXING_APP, WRITING_APP] {
+            let input = fixture_with_info(|body| {
+                let mut info = Vec::new();
+                for (id, payload) in children(body)? {
+                    if id != missing {
+                        info.extend(element(id, payload.to_vec())?);
+                    }
+                }
+                Ok(info)
+            })?;
+            assert!(decode(input).is_err());
+        }
+
+        let input = fixture_with_info(|body| {
+            let mut info = Vec::new();
+            for (id, payload) in children(body)? {
+                if id != WRITING_APP {
+                    info.extend(element(id, payload.to_vec())?);
+                }
+            }
+            let mut writing_app = element(WRITING_APP, vec![b'x'; 64])?;
+            writing_app.pop().ok_or("nonempty writing app")?;
+            info.extend(writing_app);
+            Ok(info)
+        })?;
+        assert!(decode(input).is_err());
+        Ok(())
+    }
 }
 
 fn uint(id: &[u8], value: u64) -> Result<Vec<u8>, String> {
@@ -285,6 +367,135 @@ fn uint(id: &[u8], value: u64) -> Result<Vec<u8>, String> {
     let first = bytes.iter().position(|byte| *byte != 0).unwrap_or(7);
     element(id, bytes[first..].to_vec())
 }
+
+mod flac {
+    use super::*;
+    use gigaam_audio::FileDecoder;
+
+    // A self-contained 16-sample, mono FLAC frame with a verbatim subframe
+    // and valid header and frame CRCs. The source samples are given in the test.
+    const FRAME: [u8; 42] = [
+        0xff, 0xf8, 0x60, 0x08, 0x00, 0x0f, 0x96, 0x02, 0x00, 0x00, 0x20, 0x00, 0xe0, 0x00, 0x40,
+        0x00, 0xc0, 0x00, 0x7f, 0xff, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x20, 0x00, 0xe0, 0x00,
+        0x40, 0x00, 0xc0, 0x00, 0x7f, 0xff, 0x80, 0x00, 0x00, 0x00, 0x14, 0x45,
+    ];
+
+    fn codec_private(padding_blocks: &[usize]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        let mut bytes = b"fLaC".to_vec();
+        bytes.extend([if padding_blocks.is_empty() { 0x80 } else { 0 }, 0, 0, 34]);
+        bytes.extend([0, 16, 0, 16]); // Minimum and maximum block size.
+        bytes.extend([0; 6]); // Unknown minimum and maximum frame size.
+        let stream_format = (16_000_u64 << 44) | (15 << 36) | 16;
+        bytes.extend(stream_format.to_be_bytes()); // 16 kHz, mono, 16 bits, 16 samples.
+        bytes.extend([0; 16]); // No STREAMINFO MD5 signature.
+        for (index, &length) in padding_blocks.iter().enumerate() {
+            let [high, a, b, c] = u32::try_from(length)?.to_be_bytes();
+            assert_eq!(high, 0);
+            let kind = if index + 1 == padding_blocks.len() {
+                0x81
+            } else {
+                1
+            };
+            bytes.extend([kind, a, b, c]);
+            bytes.resize(bytes.len() + length, 0);
+        }
+        Ok(bytes)
+    }
+
+    fn fixture(private: Vec<u8>) -> Result<Vec<u8>, String> {
+        let mut ebml = element(&[0x42, 0x82], b"matroska".to_vec())?;
+        ebml.extend(uint(&[0x42, 0xf7], 1)?);
+        ebml.extend(uint(&[0x42, 0x87], 2)?);
+        ebml.extend(uint(&[0x42, 0x85], 2)?);
+        let mut file = element(&[0x1a, 0x45, 0xdf, 0xa3], ebml)?;
+        let mut info = element(&[0x4d, 0x80], b"fixture".to_vec())?;
+        info.extend(element(&[0x57, 0x41], b"fixture".to_vec())?);
+        let mut segment = element(&[0x15, 0x49, 0xa9, 0x66], info)?;
+
+        let mut track = uint(&[0xd7], 1)?;
+        track.extend(uint(&[0x73, 0xc5], 1)?);
+        track.extend(uint(&[0x83], 2)?);
+        track.extend(element(&[0x86], b"A_FLAC".to_vec())?);
+        track.extend(element(&[0x63, 0xa2], private)?);
+        let mut audio = element(&[0xb5], 16_000_f64.to_be_bytes().to_vec())?;
+        audio.extend(uint(&[0x9f], 1)?);
+        audio.extend(uint(&[0x62, 0x64], 16)?);
+        track.extend(element(&[0xe1], audio)?);
+        segment.extend(element(
+            &[0x16, 0x54, 0xae, 0x6b],
+            element(&[0xae], track)?,
+        )?);
+
+        let mut cluster = uint(&[0xe7], 0)?;
+        let mut packet = vec![0x81, 0, 0, 0x80];
+        packet.extend(FRAME);
+        cluster.extend(element(&[0xa3], packet)?);
+        segment.extend(element(&[0x1f, 0x43, 0xb6, 0x75], cluster)?);
+        file.extend(element(&[0x18, 0x53, 0x80, 0x67], segment)?);
+        Ok(file)
+    }
+
+    fn open(bytes: Vec<u8>, bytes_read: &Arc<AtomicUsize>) -> Result<FileDecoder, String> {
+        let providers: Vec<Arc<dyn FileDecoderProvider>> =
+            vec![Arc::new(gigaam_format_codecs::Containers)];
+        let source = CountedSource {
+            cursor: Cursor::new(bytes),
+            bytes_read: Arc::clone(bytes_read),
+        };
+        FileDecoders::new(providers)?.open(Box::new(source), Some("mkv"))
+    }
+
+    #[test]
+    fn batch_flac_reads_streaminfo_without_loading_optional_metadata()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let samples = [0_i16, 8192, -8192, 16384, -16384, i16::MAX, i16::MIN, 0].repeat(2);
+        let expected: Vec<_> = samples
+            .into_iter()
+            .map(|sample| f32::from(sample) / 32768.0)
+            .collect();
+        let chunk_limit = NonZeroUsize::new(7).ok_or("positive chunk limit")?;
+        let small = 256 * 1024;
+        let large = 2 * 1024 * 1024;
+        for padding in [&[][..], &[small], &[large], &[large, large, large]] {
+            let bytes_read = Arc::new(AtomicUsize::new(0));
+            let mut decoder = open(fixture(codec_private(padding)?)?, &bytes_read)?;
+            assert_eq!(decoder.metadata().sample_rate().hertz(), 16_000);
+            assert_eq!(decoder.metadata().channel_count().get(), 1);
+            let mut pcm = Vec::new();
+            while let Some(chunk) = decoder.next_chunk(chunk_limit)? {
+                assert_eq!(chunk.first_frame(), u64::try_from(pcm.len())?);
+                pcm.extend_from_slice(chunk.audio().channels()[0].samples());
+                assert_eq!(chunk.end_frame(), u64::try_from(pcm.len())?);
+            }
+            assert_eq!(pcm, expected);
+            assert!(decoder.next_chunk(chunk_limit)?.is_none());
+            assert!(
+                bytes_read.load(Ordering::Relaxed) < small,
+                "decoder must not read the body of any large optional FLAC metadata block"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn batch_flac_refuses_truncated_declared_extents() -> Result<(), Box<dyn std::error::Error>> {
+        // A preceding PADDING header claims bytes outside CodecPrivate.
+        let private = b"fLaC\x01\x00\x01\x00\x00".to_vec();
+        let bytes_read = Arc::new(AtomicUsize::new(0));
+        assert!(open(fixture(private)?, &bytes_read).is_err());
+
+        // STREAMINFO is complete, but the containing CodecPrivate ends past the file.
+        let mut truncated = fixture(codec_private(&[64])?)?;
+        let start = truncated
+            .windows(4)
+            .position(|span| span == b"fLaC")
+            .ok_or("FLAC marker")?;
+        truncated.truncate(start + 4 + 4 + 34 + 4 + 1);
+        assert!(open(truncated, &bytes_read).is_err());
+        Ok(())
+    }
+}
+
 fn samples(frame: usize) -> (i16, i16) {
     (
         if frame.is_multiple_of(2) {

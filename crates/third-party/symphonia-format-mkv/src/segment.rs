@@ -1029,15 +1029,15 @@ impl EbmlElement<MkvSchema> for InfoElement {
                 }
                 MkvElement::Title => {
                     // Non-mandatory element. No schema-defined default.
-                    title = Some(it.read_string_no_default()?);
+                    title = Some(it.read_metadata_string()?);
                 }
                 MkvElement::MuxingApp => {
                     // Mandatory element. No schema-defined default.
-                    muxing_app = Some(it.read_string_no_default()?);
+                    muxing_app = Some(it.read_metadata_string()?);
                 }
                 MkvElement::WritingApp => {
                     // Mandatory element. No schema-defined default.
-                    writing_app = Some(it.read_string_no_default()?);
+                    writing_app = Some(it.read_metadata_string()?);
                 }
                 other => {
                     // Unexpected child element.
