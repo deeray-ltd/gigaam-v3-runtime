@@ -15,8 +15,8 @@ locked Cargo metadata and checksum-verified local registry crate archives.
   is a procedural macro are excluded because their code is executed during compilation,
   not statically linked into `asr-serve`.
 - Registry packages: 111; the three selected closures are identical.
-- Cargo.lock SHA-256: `1f422f5d4faab0036721633604a48c1f2bc40f512594ef32831fadd5247d676e`.
-- Closure SHA-256: `edf3f6a5c2c88510af9adc68b391dd3b92dfa80283f19e1be3474acd0bdef83e`.
+- Cargo.lock SHA-256: `b3747f8a37602873c17fa285c1d37b7fbf62dcf6ac8fc74030159bd3c281be7a`.
+- Closure SHA-256: `b35311a94f9f0e66c501ba864f1e9a0c7ed1f69cf059ea0bdffd6c5d3cd3c370`.
 - Project workspace code is covered by the parent `COPYING` and `COPYING.LESSER` files.
 
 ## Package records
@@ -782,10 +782,10 @@ locked Cargo metadata and checksum-verified local registry crate archives.
   - `LICENSE-APACHE`: `texts/a9040321c3712d8fd0b09cf52b17445de04a23a10165049ae187cd39e5c86be5.txt` (SHA-256 `a9040321c3712d8fd0b09cf52b17445de04a23a10165049ae187cd39e5c86be5`).
   - `LICENSE-MIT`: `texts/b4eb00df6e2a4d22518fcaa6a2b4646f249b3a3c9814509b22bd2091f1392ff1.txt` (SHA-256 `b4eb00df6e2a4d22518fcaa6a2b4646f249b3a3c9814509b22bd2091f1392ff1`).
 
-### `sha2` 0.11.0
+### `sha2` 0.11.1
 - License expression: `MIT OR Apache-2.0`.
-- Locked crate archive SHA-256: `446ba717509524cb3f22f17ecc096f10f4822d76ab5c0b9822c5f9c284e825f4`.
-- Source archive: `https://static.crates.io/crates/sha2/sha2-0.11.0.crate`.
+- Locked crate archive SHA-256: `47d7069beb7d6ac7b9acd1039986e73443f24234f41074da099d6f994ac9ad19`.
+- Source archive: `https://static.crates.io/crates/sha2/sha2-0.11.1.crate`.
 - Repository declared by package metadata: `https://github.com/RustCrypto/hashes`.
 - Authors declared by package metadata: `RustCrypto Developers`.
 - Packaged license, permission, and copyright notices:
