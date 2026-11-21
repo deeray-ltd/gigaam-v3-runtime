@@ -77,12 +77,13 @@ final image. Inspect the built images to verify the shipped files.
 
 ## Modified Symphonia demuxers
 
-The ISO-BMFF and Matroska format crates use local copies of version 0.6.1 with a
-sequential batch read path. Their MPL-2.0 license and modified source accompany
+The ISO-BMFF, Matroska and Ogg format crates use local copies of version 0.6.1 with
+batch read paths. Their MPL-2.0 license and modified source accompany
 the corresponding GigaAM v3 Runtime checkout. See the exact upstream revision and
 archive in the [ISO-BMFF source record](crates/third-party/symphonia-format-isomp4/SOURCE.md)
-and [Matroska source record](crates/third-party/symphonia-format-mkv/SOURCE.md).
-Each service image includes the license and source record for both demuxers under
+[Matroska source record](crates/third-party/symphonia-format-mkv/SOURCE.md) and
+[Ogg source record](crates/third-party/symphonia-format-ogg/SOURCE.md).
+Each service image includes the license and source record for each demuxer under
 `/usr/share/licenses/gigaam-v3-runtime`. The modified source is available under
 `crates/third-party` in the repository revision used to build the image.
 

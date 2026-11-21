@@ -14,9 +14,9 @@ locked Cargo metadata and checksum-verified local registry crate archives.
 - Selection: normal non-dev dependency edges only. Packages whose only library target
   is a procedural macro are excluded because their code is executed during compilation,
   not statically linked into `asr-serve`.
-- Registry packages: 102; the three selected closures are identical.
-- Cargo.lock SHA-256: `36f08d568f3bb5fcede8bccb808c1eb140200ed9cfab092604858fdeb75f28c8`.
-- Closure SHA-256: `561d01a1787a8e99da8e04979eb1e9ae9ad7f24d7942ad734d758246fe790986`.
+- Registry packages: 101; the three selected closures are identical.
+- Cargo.lock SHA-256: `f9641fa2c452c151da9785b32db694d95c040cd7db84c54cffea66b30342313f`.
+- Closure SHA-256: `931947486d65f139923d0bbbb630f8f86c2c502de7bd20546c999360e27da9b3`.
 - Project workspace code is covered by the parent `COPYING` and `COPYING.LESSER` files.
 
 ## Package records
@@ -867,16 +867,6 @@ locked Cargo metadata and checksum-verified local registry crate archives.
 - License expression: `MPL-2.0`.
 - Locked crate archive SHA-256: `01c412864d599d4750d0c3d684d7e093ec05e5309681ef5252cc1096a437f6e0`.
 - Source archive: `https://static.crates.io/crates/symphonia-core/symphonia-core-0.6.1.crate`.
-- Repository declared by package metadata: `https://github.com/pdeljanov/Symphonia`.
-- Authors declared by package metadata: `Philip Deljanov <philip.deljanov@gmail.com>`.
-- MPL-2.0 terms: `https://www.mozilla.org/MPL/2.0/`; obtain the checksum-bound source archive above.
-- Packaged license, permission, and copyright notices:
-  - `LICENSE`: `texts/c76f740d1521b9bed9ca7a04ad526c310493c62621b1341d623b431736533b30.txt` (SHA-256 `c76f740d1521b9bed9ca7a04ad526c310493c62621b1341d623b431736533b30`).
-
-### `symphonia-format-ogg` 0.6.1
-- License expression: `MPL-2.0`.
-- Locked crate archive SHA-256: `0b5495e7f7e3c7035328d82b6d6e377eef289bb0c4105bdeb557fc93a833f994`.
-- Source archive: `https://static.crates.io/crates/symphonia-format-ogg/symphonia-format-ogg-0.6.1.crate`.
 - Repository declared by package metadata: `https://github.com/pdeljanov/Symphonia`.
 - Authors declared by package metadata: `Philip Deljanov <philip.deljanov@gmail.com>`.
 - MPL-2.0 terms: `https://www.mozilla.org/MPL/2.0/`; obtain the checksum-bound source archive above.

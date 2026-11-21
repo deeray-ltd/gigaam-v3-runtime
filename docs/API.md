@@ -359,6 +359,10 @@ For container inputs with leading ID3v2 tags, the decoder checks each tag extent
 its metadata payload before opening the audio stream. Embedded cover art is ignored by
 transcription. The decoded audio clock still starts at the first emitted source sample.
 
+Native FLAC batch inputs retain the STREAMINFO and encoded audio frames. The batch
+decoder skips other declared metadata blocks. For Ogg-FLAC, it preserves decoder
+setup and skips optional embedded pictures and comment packets.
+
 ## Offline CLI
 
 The asr executable has exactly five commands. Each command places its required input file

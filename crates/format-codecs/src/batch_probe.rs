@@ -2,6 +2,7 @@
 // Copyright (C) 2026 Yuriy Krasilnikov
 // Copyright (C) 2026 Deeray Ltd.
 
+use std::io::{Seek, SeekFrom};
 use std::sync::LazyLock;
 use symphonia::core::{
     errors::Result,
@@ -10,7 +11,7 @@ use symphonia::core::{
         Track, TrackType,
         probe::{Probe, ProbeFormatData, ProbeableFormat, Score, Scoreable},
     },
-    io::{MediaSourceStream, ScopedStream},
+    io::{MediaSource, MediaSourceStream, ScopedStream},
     meta::{ChapterGroup, Metadata},
     packet::Packet,
 };
@@ -91,14 +92,49 @@ impl<'input> ProbeableFormat<'input> for Sequential<MkvReader<'_>> {
     }
 }
 
+impl<'input> ProbeableFormat<'input> for Sequential<FlacReader<'_>> {
+    fn try_probe_new(
+        mut mss: MediaSourceStream<'input>,
+        opts: FormatOptions,
+    ) -> Result<Box<dyn FormatReader + 'input>> {
+        if let Some(length) = mss.byte_len().filter(|_| mss.is_seekable()) {
+            let start = mss.stream_position()?;
+            if let Some(layout) = crate::flac_audio::audio_layout(&mut mss, start, length)? {
+                let source = crate::flac_audio::FlacAudioSource::new(mss, layout);
+                mss = MediaSourceStream::new(Box::new(source), Default::default());
+            } else {
+                mss.seek(SeekFrom::Start(start))?;
+            }
+        }
+        Ok(Box::new(FlacReader::try_new(mss, opts)?))
+    }
+
+    fn probe_data() -> &'static [ProbeFormatData] {
+        FlacReader::probe_data()
+    }
+}
+
+impl<'input> ProbeableFormat<'input> for Sequential<OggReader<'_>> {
+    fn try_probe_new(
+        mss: MediaSourceStream<'input>,
+        opts: FormatOptions,
+    ) -> Result<Box<dyn FormatReader + 'input>> {
+        Ok(Box::new(OggReader::try_new_batch(mss, opts)?))
+    }
+
+    fn probe_data() -> &'static [ProbeFormatData] {
+        OggReader::probe_data()
+    }
+}
+
 pub(crate) static BATCH_PROBE: LazyLock<Probe> = LazyLock::new(|| {
     let mut probe = Probe::default();
     probe.register_metadata::<symphonia::default::meta::Id3v2Reader<'_>>();
     probe.register_format::<AdtsReader<'_>>();
-    probe.register_format::<FlacReader<'_>>();
+    probe.register_format::<Sequential<FlacReader<'_>>>();
     probe.register_format::<MpaReader<'_>>();
     probe.register_format::<WavReader<'_>>();
-    probe.register_format::<OggReader<'_>>();
+    probe.register_format::<Sequential<OggReader<'_>>>();
     probe.register_format::<Sequential<IsoMp4Reader<'_>>>();
     probe.register_format::<Sequential<MkvReader<'_>>>();
     probe

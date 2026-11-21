@@ -487,11 +487,15 @@ impl<'s> IsoMp4Reader<'s> {
                     }
                 }
                 AtomType::Meta => {
-                    // Read the metadata atom and append it to the log.
-                    let mut meta = it.read_atom::<MetaAtom>()?;
-
-                    if let Some(rev) = meta.take_metadata() {
-                        metadata.push(rev);
+                    if it.omit_user_metadata() {
+                        // Ancillary metadata is not consumed by the seekable batch adapter.
+                        it.skip_atom()?;
+                    }
+                    else {
+                        let mut meta = it.read_atom::<MetaAtom>()?;
+                        if let Some(rev) = meta.take_metadata() {
+                            metadata.push(rev);
+                        }
                     }
                 }
                 AtomType::Free => (),

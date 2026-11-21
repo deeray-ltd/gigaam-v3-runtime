@@ -60,7 +60,13 @@ impl Atom for MoovAtom {
                     mvex = Some(it.read_atom::<MvexAtom>()?);
                 }
                 AtomType::UserData => {
-                    udta = Some(it.read_atom::<UdtaAtom>()?);
+                    if it.omit_user_metadata() {
+                        // The current udta reader exposes only metadata, not codec or timing state.
+                        it.skip_atom()?;
+                    }
+                    else {
+                        udta = Some(it.read_atom::<UdtaAtom>()?);
+                    }
                 }
                 _ => (),
             }
