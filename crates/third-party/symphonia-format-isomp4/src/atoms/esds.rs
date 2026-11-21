@@ -37,25 +37,29 @@ impl Atom for EsdsAtom {
             return decode_error("isomp4 (esds): missing es descriptor in esds");
         }
 
-        let es_desc = match it.read_scoped_batch_atom_data(size, |reader| read_es_descriptor(reader))? {
+        let es_desc = match it.read_scoped_batch_atom_data(size, |reader| read_es_descriptor(reader, true))? {
             Some(descriptor) => descriptor,
             None => {
                 let size = usize::try_from(size)
                     .map_err(|_| Error::LimitError("isomp4 (esds): atom size exceeds usize"))?;
                 let buf = it.read_boxed_slice_exact(size)?;
-                read_es_descriptor(&mut BufReader::new(&buf))?
+                read_es_descriptor(&mut BufReader::new(&buf), false)?
             }
         };
         Ok(EsdsAtom { es_desc })
     }
 }
 
-fn read_es_descriptor<R: ReadBytes>(reader: &mut R) -> Result<ESDescriptor> {
+fn read_es_descriptor<R: ReadBytes>(reader: &mut R, bound_aac_config: bool) -> Result<ESDescriptor> {
     let (tag, len) = read_object_descriptor_header(reader)?;
     if tag != ClassTag::EsDescriptor {
         return decode_error("isomp4 (esds): missing es descriptor in esds");
     }
-    Ok(ESDescriptor::read(reader, len)?)
+    if bound_aac_config {
+        Ok(ESDescriptor::read_with_bounded_aac_config(reader, len)?)
+    } else {
+        Ok(ESDescriptor::read(reader, len)?)
+    }
 }
 
 impl EsdsAtom {
@@ -148,11 +152,12 @@ mod tests {
         header
     }
 
-    fn fixture(padding: usize, truncated: bool) -> Vec<u8> {
+    fn fixture(padding: usize, config_tail: usize, truncated: bool) -> Vec<u8> {
         let mut decoder_config = vec![0x40, 0x15];
         decoder_config.extend([0; 11]); // Buffer size and bit rates.
-        decoder_config.extend(descriptor(0x05, 2));
+        decoder_config.extend(descriptor(0x05, 2 + config_tail));
         decoder_config.extend([0x11, 0x88]); // AAC-LC, 48 kHz, mono AudioSpecificConfig.
+        decoder_config.resize(decoder_config.len() + config_tail, 0);
         let mut es = vec![0, 1, 0]; // ES identifier and flags.
         es.extend(descriptor(0x04, decoder_config.len()));
         es.extend(decoder_config);
@@ -174,7 +179,7 @@ mod tests {
     fn batch_reads_esds_without_materializing_its_private_descriptor() -> symphonia_core::errors::Result<()> {
         let padding = 512 * 1024;
         for (batch, size, truncated) in [(false, 0, false), (true, padding, false), (true, 0, true)] {
-            let data = fixture(size, truncated);
+            let data = fixture(size, 0, truncated);
             let length = u64::try_from(data.len()).expect("fixture source size");
             let bytes_read = Arc::new(AtomicUsize::new(0));
             let input = CountedSource(Cursor::new(data), Arc::clone(&bytes_read));
@@ -193,6 +198,33 @@ mod tests {
             }
             assert_eq!(it.next_header()?.unwrap().atom_type(), AtomType::Free);
             assert!(bytes_read.load(Ordering::Relaxed) < padding);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn batch_retains_only_the_aac_decoder_configuration_prefix()
+    -> symphonia_core::errors::Result<()> {
+        for (batch, tail) in [(false, 33), (true, 512 * 1024)] {
+            let data = fixture(0, tail, false);
+            let length = u64::try_from(data.len()).expect("fixture source size");
+            let bytes_read = Arc::new(AtomicUsize::new(0));
+            let input = CountedSource(Cursor::new(data), Arc::clone(&bytes_read));
+            let mut it = AtomIterator::new(
+                MediaSourceStream::new(Box::new(input), Default::default()), Some(length)
+            );
+            if batch {
+                it.use_deferred_sample_sizes();
+            }
+            assert_eq!(it.next_header()?.expect("descriptor atom").atom_type(), AtomType::Esds);
+            let info = it.read_atom::<EsdsAtom>()?.es_desc.dec_config
+                .dec_specific_info.expect("fixture AAC configuration");
+            assert_eq!(&info.extra_data[..2], &[0x11, 0x88]);
+            assert_eq!(info.extra_data.len(), if batch { 32 } else { 2 + tail });
+            assert_eq!(it.next_header()?.expect("following atom").atom_type(), AtomType::Free);
+            if batch {
+                assert!(bytes_read.load(Ordering::Relaxed) < tail);
+            }
         }
         Ok(())
     }
