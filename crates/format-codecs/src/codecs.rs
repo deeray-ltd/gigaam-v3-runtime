@@ -318,6 +318,18 @@ pub fn decode_bytes(encoded: EncodedAudio) -> Result<DecodedAudio, String> {
     }
 }
 
+impl gigaam_audio::FileChunkReader for CodecFileReader {
+    fn metadata(&self) -> AudioMetadata {
+        CodecFileReader::metadata(self)
+    }
+    fn next_audio(
+        &mut self,
+        max_frames: std::num::NonZeroUsize,
+    ) -> Result<Option<DecodedAudio>, String> {
+        CodecFileReader::next_audio(self, max_frames.get())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -420,17 +432,5 @@ mod tests {
         }
 
         Ok(())
-    }
-}
-
-impl gigaam_audio::FileChunkReader for CodecFileReader {
-    fn metadata(&self) -> AudioMetadata {
-        CodecFileReader::metadata(self)
-    }
-    fn next_audio(
-        &mut self,
-        max_frames: std::num::NonZeroUsize,
-    ) -> Result<Option<DecodedAudio>, String> {
-        CodecFileReader::next_audio(self, max_frames.get())
     }
 }
