@@ -9,10 +9,11 @@
 
 //! OpenAI batch HTTP routes and multipart adaptation.
 
+use crate::openai::ApiError;
 use axum::{
     Router,
-    extract::{DefaultBodyLimit, FromRequest, Multipart, Request, State},
-    http::StatusCode,
+    extract::{Request, State},
+    http::{StatusCode, header::CONTENT_TYPE},
     response::Response,
     routing::{get, post},
 };
@@ -27,11 +28,9 @@ use gigaam_transcription::{BatchChannelPolicy, TurnGap};
 use std::time::Instant;
 
 pub(crate) fn routes(state: BatchService) -> Router {
-    let limit = state.upload_limit_bytes();
     Router::new()
         .route("/v1/audio/transcriptions", post(openai_transcribe))
         .route("/v1/models", get(openai_models))
-        .layer(DefaultBodyLimit::max(limit))
         .with_state(state)
 }
 
@@ -77,14 +76,37 @@ pub(super) async fn parse_openai_multipart(
     state: &BatchService,
     request: Request,
 ) -> Result<crate::openai::Input, crate::openai::ApiError> {
-    let mut multipart = Multipart::from_request(request, state)
-        .await
-        .map_err(|error| crate::openai::ApiError::new(error.status(), error.to_string(), None))?;
+    let boundary = request
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| multra::parse_boundary(value).ok())
+        .ok_or_else(|| ApiError::bad("Invalid `multipart/form-data` request", None))?;
+    let limit = u64::try_from(state.upload_limit_bytes()).map_err(|_| {
+        ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "upload limit is not supported",
+            None,
+        )
+    })?;
+    let constraints = multra::Constraints::new().size_limit(
+        multra::SizeLimit::new()
+            .whole_stream(limit)
+            .headers(limit)
+            .preamble(limit)
+            .boundary_padding(limit),
+    );
+    let mut multipart = multra::Multipart::try_with_constraints(
+        request.into_body().into_data_stream(),
+        boundary,
+        constraints,
+    )
+    .map_err(openai_multipart_error)?;
     let mut fields = Vec::new();
     while let Some(mut field) = multipart
         .next_field()
         .await
-        .map_err(|error| crate::openai::ApiError::new(error.status(), error.to_string(), None))?
+        .map_err(openai_multipart_error)?
     {
         if fields.len() >= 16 {
             return Err(crate::openai::ApiError::bad(
@@ -98,20 +120,26 @@ pub(super) async fn parse_openai_multipart(
             .to_owned();
         let filename = field.file_name().map(str::to_owned);
         let mut bytes = Vec::new();
-        while let Some(chunk) = field.chunk().await.map_err(|error| {
-            crate::openai::ApiError::new(error.status(), error.to_string(), None)
-        })? {
+        while let Some(chunk) = field.chunk().await.map_err(openai_multipart_error)? {
             if name != "file" && chunk.len() > 16 * 1024 - bytes.len() {
-                return Err(crate::openai::ApiError::bad(
-                    "multipart text field exceeds 16 KiB",
-                    None,
-                ));
+                return Err(ApiError::bad("multipart text field exceeds 16 KiB", None));
             }
             bytes.extend_from_slice(&chunk);
         }
         fields.push((name, filename, bytes));
     }
     crate::openai::parse_fields_for_variant(fields, state.variant())
+}
+
+fn openai_multipart_error(error: multra::Error) -> ApiError {
+    let status = match &error {
+        multra::Error::StreamSizeExceeded { .. } => StatusCode::PAYLOAD_TOO_LARGE,
+        multra::Error::StreamReadFailed(_) | multra::Error::LockFailure => {
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+        _ => StatusCode::BAD_REQUEST,
+    };
+    ApiError::new(status, error.to_string(), None)
 }
 
 pub(super) async fn openai_transcribe(

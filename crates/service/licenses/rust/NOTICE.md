@@ -14,9 +14,9 @@ locked Cargo metadata and checksum-verified local registry crate archives.
 - Selection: normal non-dev dependency edges only. Packages whose only library target
   is a procedural macro are excluded because their code is executed during compilation,
   not statically linked into `asr-serve`.
-- Registry packages: 103; the three selected closures are identical.
-- Cargo.lock SHA-256: `216522bdb8d7b28965e90fd11cbd0180b6062c71908a98082d3ee7e819f7b3e3`.
-- Closure SHA-256: `97e74497caf296bec83ac40415f7562b585650f8332e2e0033a96369ed3774ac`.
+- Registry packages: 102; the three selected closures are identical.
+- Cargo.lock SHA-256: `d619a3adb3c006a4ad5d9a9b250b64384c1cacb6c49087ca0de1f235ce2a7bd7`.
+- Closure SHA-256: `ec4960fc2f2afab3284da3090e3726670ab99c1e7c09c6f102b5323393b94cc9`.
 - Project workspace code is covered by the parent `COPYING` and `COPYING.LESSER` files.
 
 ## Package records
@@ -527,12 +527,12 @@ locked Cargo metadata and checksum-verified local registry crate archives.
 - Packaged license, permission, and copyright notices:
   - `LICENSE`: `texts/07919255c7e04793d8ea760d6c2ce32d19f9ff02bdbdde3ce90b1e1880929a9b.txt` (SHA-256 `07919255c7e04793d8ea760d6c2ce32d19f9ff02bdbdde3ce90b1e1880929a9b`).
 
-### `multer` 3.1.0
+### `multra` 1.3.0
 - License expression: `MIT`.
-- Locked crate archive SHA-256: `83e87776546dc87511aa5ee218730c92b666d7264ab6ed41f9d215af9cd5224b`.
-- Source archive: `https://static.crates.io/crates/multer/multer-3.1.0.crate`.
-- Repository declared by package metadata: `https://github.com/rwf2/multer`.
-- Authors declared by package metadata: `Rousan Ali <hello@rousan.io>`.
+- Locked crate archive SHA-256: `9efd1a1c4fd9d0672b27b5936c30432c5a62a06be674b53501d3d950422a0fe3`.
+- Source archive: `https://static.crates.io/crates/multra/multra-1.3.0.crate`.
+- Repository declared by package metadata: `https://github.com/salvo-rs/multra`.
+- Authors declared by package metadata: `Rousan Ali <hello@rousan.io>`; `Chris Young <chris@sonc.ai>`.
 - Packaged license, permission, and copyright notices:
   - `LICENSE`: `texts/cfb47b4c5832e5a204d86140ba385e683309e3c82f670e65dfaf491b13c5e2c4.txt` (SHA-256 `cfb47b4c5832e5a204d86140ba385e683309e3c82f670e65dfaf491b13c5e2c4`).
 
@@ -771,15 +771,6 @@ locked Cargo metadata and checksum-verified local registry crate archives.
 - Packaged license, permission, and copyright notices:
   - `LICENSE-APACHE`: `texts/a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2.txt` (SHA-256 `a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2`).
   - `LICENSE-MIT`: `texts/378f5840b258e2779c39418f3f2d7b2ba96f1c7917dd6be0713f88305dbda397.txt` (SHA-256 `378f5840b258e2779c39418f3f2d7b2ba96f1c7917dd6be0713f88305dbda397`).
-
-### `spin` 0.9.9
-- License expression: `MIT`.
-- Locked crate archive SHA-256: `3763264f6b73151db08c50ff20d7d8a0b8796e021cdea7ceedad07b80155fa0e`.
-- Source archive: `https://static.crates.io/crates/spin/spin-0.9.9.crate`.
-- Repository declared by package metadata: `https://github.com/mvdnes/spin-rs.git`.
-- Authors declared by package metadata: `Mathijs van de Nes <git@mathijs.vd-nes.nl>`; `John Ericson <git@JohnEricson.me>`; `Joshua Barretto <joshua.s.barretto@gmail.com>`.
-- Packaged license, permission, and copyright notices:
-  - `LICENSE`: `texts/6ac8711fb340c62ce0a4ecd463342d3fa0e8e70de697c863a2e1c0c53006003c.txt` (SHA-256 `6ac8711fb340c62ce0a4ecd463342d3fa0e8e70de697c863a2e1c0c53006003c`).
 
 ### `symphonia` 0.5.5
 - License expression: `MPL-2.0`.
