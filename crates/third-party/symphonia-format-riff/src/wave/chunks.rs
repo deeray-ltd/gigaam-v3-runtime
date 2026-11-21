@@ -17,7 +17,7 @@ use symphonia_core::codecs::audio::well_known::{
 };
 use symphonia_core::errors::{Error, Result, decode_error, unsupported_error};
 use symphonia_core::formats::Track;
-use symphonia_core::io::{MediaSourceStream, ReadBytes};
+use symphonia_core::io::{MediaSource, MediaSourceStream, ReadBytes};
 use symphonia_core::meta::{MetadataBuilder, MetadataRevision};
 
 use symphonia_metadata::embedded::riff;
@@ -673,6 +673,22 @@ pub fn read_info_chunk(source: &mut MediaSourceStream<'_>, len: u32) -> Result<M
     list.finish(source)?;
 
     Ok(builder.build())
+}
+
+pub(super) fn skip_info_chunk(source: &mut MediaSourceStream<'_>, len: u32) -> Result<()> {
+    let end = source
+        .pos()
+        .checked_add(u64::from(len))
+        .ok_or(Error::DecodeError("wav: INFO list extent overflow"))?;
+    if source.byte_len().is_some_and(|length| end > length) {
+        return decode_error("wav: INFO list exceeds the source");
+    }
+
+    let mut list = ChunksReader::<RiffInfoListChunks>::new(Some(len), ByteOrder::LittleEndian);
+    while let Some(RiffInfoListChunks::Info(info)) = list.next(source)? {
+        source.ignore_bytes(u64::from(info.len))?;
+    }
+    list.finish(source)
 }
 
 /// Corrects a WAVE channel mask that doesn't is not valid for the stated number of channels.

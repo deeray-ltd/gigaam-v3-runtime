@@ -27,6 +27,9 @@ use crate::common::{
 mod chunks;
 use chunks::*;
 
+#[cfg(test)]
+mod tests;
+
 /// WAVE is actually a RIFF stream, with a "RIFF" ASCII stream marker.
 const WAVE_STREAM_MARKER: [u8; 4] = *b"RIFF";
 /// A possible RIFF form is "wave".
@@ -59,7 +62,20 @@ pub struct WavReader<'s> {
 }
 
 impl<'s> WavReader<'s> {
-    pub fn try_new(mut mss: MediaSourceStream<'s>, opts: FormatOptions) -> Result<Self> {
+    pub fn try_new(mss: MediaSourceStream<'s>, opts: FormatOptions) -> Result<Self> {
+        Self::try_new_impl(mss, opts, true)
+    }
+
+    /// Open WAVE audio while validating the `LIST/INFO` structure and skipping tag values.
+    pub fn try_new_without_info(mss: MediaSourceStream<'s>, opts: FormatOptions) -> Result<Self> {
+        Self::try_new_impl(mss, opts, false)
+    }
+
+    fn try_new_impl(
+        mut mss: MediaSourceStream<'s>,
+        opts: FormatOptions,
+        read_info: bool,
+    ) -> Result<Self> {
         // A Wave file is one large RIFF chunk, with the actual meta and audio data contained in
         // nested chunks. Therefore, the file starts with a RIFF chunk header (chunk ID & size).
 
@@ -133,7 +149,8 @@ impl<'s> WavReader<'s> {
                     // Riff Lists can have many different forms, but WavReader only supports Info
                     // lists.
                     match &list.form {
-                        b"INFO" => metadata.push(read_info_chunk(&mut mss, list.len)?),
+                        b"INFO" if read_info => metadata.push(read_info_chunk(&mut mss, list.len)?),
+                        b"INFO" => skip_info_chunk(&mut mss, list.len)?,
                         _ => list.skip(&mut mss)?,
                     }
                 }
