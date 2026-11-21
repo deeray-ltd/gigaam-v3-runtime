@@ -2100,12 +2100,13 @@ mod tests {
             Duration::from_secs(5),
         )?)?);
         let metrics = telemetry.metrics_arc();
-        let state = state_with_telemetry(
+        let mut state = state_with_telemetry(
             &fixture,
             admission,
             Arc::clone(&metrics),
             telemetry.producer(),
         )?;
+        state.request_body_limit = RequestBodyLimit::new(64 * 1024)?;
         fn request(parts: &[(&str, &str)]) -> Result<Request, String> {
             let mut body = Vec::new();
             for (name, value) in parts {
@@ -2188,6 +2189,74 @@ mod tests {
         );
         assert_eq!(metric_counter(&metrics, "asr_transcribe_requests_total"), 1);
         assert_eq!(metric_counter(&metrics, "asr_transcribe_errors_total"), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn multipart_counts_epilogue_and_preserves_file_bytes() -> Result<(), String> {
+        let fixture = crate::tests::assembly_fixture()?;
+        let telemetry = test_support::prepare(32, 1)?;
+        let admission = Arc::new(AdmissionState::new(&ServiceAdmission::new(
+            1,
+            1,
+            Duration::from_secs(5),
+        )?)?);
+        let mut state = state_with_telemetry(
+            &fixture,
+            admission,
+            telemetry.metrics_arc(),
+            telemetry.producer(),
+        )?;
+        let audio = [0, 1, 127, 128, 255, 13, 10, 42];
+        let mut body = b"--b\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\ngigaam-v3\r\n--b\r\nContent-Disposition: form-data; name=\"file\"; filename=\"x.wav\"\r\n\r\n".to_vec();
+        body.extend(audio);
+        body.extend(b"\r\n--b--\r\nepilogue");
+        let request = |bytes: Vec<u8>| {
+            Request::builder()
+                .header("content-type", "multipart/form-data; boundary=b")
+                .body(axum::body::Body::from(bytes))
+                .map_err(|e| e.to_string())
+        };
+        state.request_body_limit = RequestBodyLimit::new(100 * 1024)?;
+        let mut preamble = vec![b'p'; 33 * 1024];
+        preamble.extend(b"\r\n");
+        preamble.extend(&body);
+        let mut long_header = b"--b\r\nX-Long: ".to_vec();
+        long_header.extend(vec![b'x'; 65 * 1024]);
+        long_header.extend(
+            b"\r\nContent-Disposition: form-data; name=\"file\"; filename=\"x.wav\"\r\n\r\n",
+        );
+        long_header.extend(audio);
+        long_header.extend(b"\r\n--b\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\ngigaam-v3\r\n--b--\r\n");
+        let mut padding = b"--b".to_vec();
+        padding.extend(vec![b' '; 9 * 1024]);
+        padding.extend(
+            b"\r\nContent-Disposition: form-data; name=\"file\"; filename=\"x.wav\"\r\n\r\n",
+        );
+        padding.extend(audio);
+        padding.extend(b"\r\n--b\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\ngigaam-v3\r\n--b--\r\n");
+        for candidate in [preamble, long_header, padding] {
+            let input = parse_openai_multipart(&state, request(candidate)?)
+                .await
+                .map_err(|e| format!("{e:?}"))?;
+            assert_eq!(input.audio, audio);
+        }
+        state.request_body_limit = RequestBodyLimit::new(body.len() + 1)?;
+        let below = parse_openai_multipart(&state, request(body.clone())?)
+            .await
+            .map_err(|e| format!("{e:?}"))?;
+        assert_eq!(below.audio, audio);
+        state.request_body_limit = RequestBodyLimit::new(body.len())?;
+        let input = parse_openai_multipart(&state, request(body.clone())?)
+            .await
+            .map_err(|e| format!("{e:?}"))?;
+        assert_eq!(input.audio, audio);
+        body.push(b'x');
+        let error = parse_openai_multipart(&state, request(body)?)
+            .await
+            .err()
+            .ok_or("expected size refusal")?;
+        assert_eq!(error.response().status(), StatusCode::PAYLOAD_TOO_LARGE);
         Ok(())
     }
 
@@ -2293,8 +2362,130 @@ mod tests {
             let response = send(address, body).await?;
             assert!(response.starts_with("HTTP/1.1 413"), "{response}");
         }
+        let mut chunked = tokio::net::TcpStream::connect(address)
+            .await
+            .map_err(|e| e.to_string())?;
+        chunked.write_all(format!("POST /v1/audio/transcriptions HTTP/1.1\r\nHost: {address}\r\nContent-Type: multipart/form-data; boundary=b\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n").as_bytes()).await.map_err(|e| e.to_string())?;
+        let prefix = b"--b\r\nContent-Disposition: form-data; name=\"file\"; filename=\"x.wav\"\r\n\r\nx\r\n--b--\r\n";
+        for bytes in [prefix.as_slice(), &[b'x'; 128][..]] {
+            chunked
+                .write_all(format!("{:x}\r\n", bytes.len()).as_bytes())
+                .await
+                .map_err(|e| e.to_string())?;
+            chunked.write_all(bytes).await.map_err(|e| e.to_string())?;
+            chunked
+                .write_all(b"\r\n")
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+        chunked
+            .write_all(b"0\r\n\r\n")
+            .await
+            .map_err(|e| e.to_string())?;
+        let mut response = Vec::new();
+        chunked
+            .read_to_end(&mut response)
+            .await
+            .map_err(|e| e.to_string())?;
+        let response = String::from_utf8(response).map_err(|e| e.to_string())?;
+        assert!(response.starts_with("HTTP/1.1 413"), "{response}");
         let malformed = send(address, b"--b\r\nmalformed\r\n\r\n").await?;
         assert!(malformed.starts_with("HTTP/1.1 400"), "{malformed}");
+        server.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn openai_upload_timeout_and_disconnect_release_reader() -> Result<(), String> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let fixture = crate::tests::assembly_fixture()?;
+        let telemetry = test_support::prepare(16, 1)?;
+        let admission = Arc::new(AdmissionState::new(&ServiceAdmission::new(
+            1,
+            1,
+            Duration::from_secs(5),
+        )?)?);
+        let mut state = state_with_telemetry(
+            &fixture,
+            Arc::clone(&admission),
+            telemetry.metrics_arc(),
+            telemetry.producer(),
+        )?;
+        state.upload_timeout = Duration::from_millis(100);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .map_err(|e| e.to_string())?;
+        let address = listener.local_addr().map_err(|e| e.to_string())?;
+        let server = tokio::spawn(async move { axum::serve(listener, openai_routes(state)).await });
+        let header = format!(
+            "POST /v1/audio/transcriptions HTTP/1.1\r\nHost: {address}\r\nContent-Type: multipart/form-data; boundary=b\r\nContent-Length: 100\r\nConnection: close\r\n\r\n--b\r\n"
+        );
+        let mut slow = tokio::net::TcpStream::connect(address)
+            .await
+            .map_err(|e| e.to_string())?;
+        slow.write_all(header.as_bytes())
+            .await
+            .map_err(|e| e.to_string())?;
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(2), slow.read_to_end(&mut response))
+            .await
+            .map_err(|e| e.to_string())?
+            .map_err(|e| e.to_string())?;
+        assert!(
+            String::from_utf8(response)
+                .map_err(|e| e.to_string())?
+                .starts_with("HTTP/1.1 408")
+        );
+        let reader = admission
+            .admit_upload()
+            .map_err(|_| "reader not released after timeout")?;
+        drop(reader);
+        server.abort();
+        let mut state = state_with_telemetry(
+            &fixture,
+            Arc::clone(&admission),
+            telemetry.metrics_arc(),
+            telemetry.producer(),
+        )?;
+        state.upload_timeout = Duration::from_secs(30);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .map_err(|e| e.to_string())?;
+        let address = listener.local_addr().map_err(|e| e.to_string())?;
+        let server = tokio::spawn(async move { axum::serve(listener, openai_routes(state)).await });
+        let header = format!(
+            "POST /v1/audio/transcriptions HTTP/1.1\r\nHost: {address}\r\nContent-Type: multipart/form-data; boundary=b\r\nContent-Length: 100\r\nConnection: close\r\n\r\n--b\r\n"
+        );
+        let mut disconnected = tokio::net::TcpStream::connect(address)
+            .await
+            .map_err(|e| e.to_string())?;
+        disconnected
+            .write_all(header.as_bytes())
+            .await
+            .map_err(|e| e.to_string())?;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match admission.admit_upload() {
+                    Ok(reader) => drop(reader),
+                    Err(_) => break,
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+        drop(disconnected);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Ok(reader) = admission.admit_upload() {
+                    drop(reader);
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .map_err(|e| e.to_string())?;
         server.abort();
         Ok(())
     }
