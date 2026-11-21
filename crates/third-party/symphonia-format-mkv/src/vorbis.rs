@@ -6,11 +6,13 @@
 
 use symphonia_common::xiph::audio::vorbis::vorbis_channels_to_channels;
 
+pub(crate) const IDENTIFICATION_BYTES: usize = 30;
+
 /// Bounds the prefix used by the Symphonia 0.6.1 Vorbis audio decoder. Matroska supplies
 /// the identification and setup packets concatenated in `extra_data`. The decoder
 /// derives its geometry from the identification packet itself.
 pub(crate) fn audio_packet_prefix_len(extra_data: &[u8]) -> Option<u64> {
-    let identification = extra_data.get(..30)?;
+    let identification = extra_data.get(..IDENTIFICATION_BYTES)?;
     let channels = identification[11];
     let block_sizes = identification[28];
     let short_block_exp = block_sizes & 0x0f;

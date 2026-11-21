@@ -371,12 +371,13 @@ and skips optional embedded pictures and comment packets.
 For seekable Matroska, the batch reader validates and skips the segment title
 and application strings. It checks that required elements are present.
 
-For the selected Vorbis audio track in a seekable Matroska input, the batch
-decoder retains the identification and setup packets and skips comment bodies.
+For the selected Vorbis track in seekable Matroska batch input, the reader
+skips comments and reads setup data through the framing bit when the
+identification packet has the standard fixed size.
 It validates each audio packet's full declared range, then reads only the prefix
 bounded by the channel count and maximum block size in the Vorbis header. Packet
-timestamps and durations are preserved. Decoder initialization loads the setup
-packet and its decoded tables into memory.
+timestamps and durations are preserved. Decoder initialization retains the
+required setup bytes and decoded tables.
 
 Batch readers split PCM ranges in Matroska and ISO-BMFF at the selected PCM
 decoder's frame boundaries. The reported sample clock follows the same decoded

@@ -126,7 +126,11 @@ mod vorbis {
         Ok(())
     }
 
-    fn with_comment(tracks: &[u8], description_bytes: usize) -> Result<Vec<u8>, Box<dyn Error>> {
+    fn with_headers(
+        tracks: &[u8],
+        description_bytes: usize,
+        setup_padding: usize,
+    ) -> Result<Vec<u8>, Box<dyn Error>> {
         let entries = children(tracks)?;
         let [(TRACK_ENTRY, track)] = entries.as_slice() else {
             return Err("expected one test track".into());
@@ -166,6 +170,7 @@ mod vorbis {
         private.extend(ident);
         private.extend(comment);
         private.extend(setup);
+        private.resize(private.len() + setup_padding, 0);
 
         // Put CodecPrivate before CodecID to exercise field-order independence.
         let mut updated = element(CODEC_PRIVATE, private)?;
@@ -177,7 +182,11 @@ mod vorbis {
         Ok(element(TRACK_ENTRY, updated)?)
     }
 
-    fn fixture(comment: Option<usize>, packet_padding: usize) -> Result<Vec<u8>, Box<dyn Error>> {
+    fn fixture(
+        comment: Option<usize>,
+        packet_padding: usize,
+        setup_padding: usize,
+    ) -> Result<Vec<u8>, Box<dyn Error>> {
         let mut result = Vec::new();
         let mut packet = 0;
         for (id, body) in children(CONTROL)? {
@@ -188,7 +197,7 @@ mod vorbis {
             let mut segment = Vec::new();
             for (id, body) in children(body)? {
                 let updated = match (id, comment) {
-                    (TRACKS, Some(count)) => with_comment(body, count)?,
+                    (TRACKS, Some(count)) => with_headers(body, count, setup_padding)?,
                     (CLUSTER, _) if packet_padding != 0 => {
                         let mut cluster = Vec::new();
                         for (id, body) in children(body)? {
@@ -216,7 +225,8 @@ mod vorbis {
         Ok(result)
     }
 
-    fn fixture_with_info(
+    fn fixture_with_segment_element(
+        target: &[u8],
         replace: impl Fn(&[u8]) -> Result<Vec<u8>, Box<dyn Error>>,
     ) -> Result<Vec<u8>, Box<dyn Error>> {
         let mut file = Vec::new();
@@ -224,7 +234,7 @@ mod vorbis {
             if id == SEGMENT {
                 let mut segment = Vec::new();
                 for (child, payload) in children(body)? {
-                    let updated = if child == INFO {
+                    let updated = if child == target {
                         replace(payload)?
                     } else {
                         payload.to_vec()
@@ -282,8 +292,8 @@ mod vorbis {
     #[test]
     fn batch_ignores_vorbis_comment_body_before_codec_id() -> Result<(), Box<dyn Error>> {
         let baseline = decode(CONTROL.to_vec())?;
-        let small = decode(fixture(Some(SMALL_PADDING), 0)?)?;
-        let large = decode(fixture(Some(LARGE_PADDING), 0)?)?;
+        let small = decode(fixture(Some(SMALL_PADDING), 0, 0)?)?;
+        let large = decode(fixture(Some(LARGE_PADDING), 0, 0)?)?;
         assert_eq!(baseline.pcm, small.pcm);
         assert_eq!(baseline.pcm, large.pcm);
         // A longer comment requires more lacing bytes, plus buffered reads at
@@ -297,8 +307,8 @@ mod vorbis {
     #[test]
     fn batch_ignores_vorbis_audio_packet_suffix() -> Result<(), Box<dyn Error>> {
         let baseline = decode(CONTROL.to_vec())?;
-        let small = decode(fixture(None, SMALL_PADDING)?)?;
-        let large = decode(fixture(None, LARGE_PADDING)?)?;
+        let small = decode(fixture(None, SMALL_PADDING, 0)?)?;
+        let large = decode(fixture(None, LARGE_PADDING, 0)?)?;
         assert_eq!(baseline.pcm, small.pcm);
         assert_eq!(baseline.pcm, large.pcm);
         assert!(large.open_bytes <= small.open_bytes + 64 * 1024);
@@ -307,10 +317,57 @@ mod vorbis {
     }
 
     #[test]
+    fn batch_reads_only_the_required_vorbis_setup() -> Result<(), Box<dyn Error>> {
+        let baseline = decode(CONTROL.to_vec())?;
+        let small = decode(fixture(Some(0), 0, SMALL_PADDING)?)?;
+        let large = decode(fixture(Some(0), 0, LARGE_PADDING)?)?;
+        assert_eq!(baseline.pcm, small.pcm);
+        assert_eq!(baseline.pcm, large.pcm);
+        assert!(large.open_bytes <= small.open_bytes + 64 * 1024);
+        assert!(large.total_bytes < SMALL_PADDING);
+        Ok(())
+    }
+
+    #[test]
+    fn batch_initializes_only_the_selected_vorbis_setup() -> Result<(), Box<dyn Error>> {
+        const TRACK_NUMBER: &[u8] = b"\xD7";
+        const TRACK_UID: &[u8] = b"\x73\xC5";
+        let baseline = decode(CONTROL.to_vec())?;
+        let input = fixture_with_segment_element(TRACKS, |body| {
+            let entries = children(body)?;
+            let [(TRACK_ENTRY, track)] = entries.as_slice() else {
+                return Err("expected one original test track".into());
+            };
+            let mut second = Vec::new();
+            for (id, value) in children(track)? {
+                match id {
+                    TRACK_NUMBER | TRACK_UID => second.extend(element(id, vec![2])?),
+                    CODEC_PRIVATE => {
+                        let mut packets = value.get(1..).ok_or("missing test Vorbis headers")?;
+                        let ident_len = read_xiph_length(&mut packets)?;
+                        let comment_len = read_xiph_length(&mut packets)?;
+                        let setup_start = value.len() - packets.len() + ident_len + comment_len;
+                        assert!(value[setup_start..].starts_with(b"\x05vorbis"));
+                        // The secondary track has never been decoded. Its abbreviated
+                        // setup must not prevent transcription of the first track.
+                        second.extend(element(id, value[..setup_start + 7].to_vec())?);
+                    }
+                    _ => second.extend(element(id, value.to_vec())?),
+                }
+            }
+            let mut tracks = body.to_vec();
+            tracks.extend(element(TRACK_ENTRY, second)?);
+            Ok(tracks)
+        })?;
+        assert_eq!(decode(input)?.pcm, baseline.pcm);
+        Ok(())
+    }
+
+    #[test]
     fn batch_skips_segment_info_text_and_preserves_pcm() -> Result<(), Box<dyn Error>> {
         let baseline = decode(CONTROL.to_vec())?;
         for length in [0, SMALL_PADDING, LARGE_PADDING] {
-            let input = fixture_with_info(|body| {
+            let input = fixture_with_segment_element(INFO, |body| {
                 let mut info = Vec::new();
                 for (id, payload) in children(body)? {
                     if ![TITLE, MUXING_APP, WRITING_APP].contains(&id) {
@@ -333,7 +390,7 @@ mod vorbis {
     fn batch_refuses_missing_or_overrunning_required_segment_info_text()
     -> Result<(), Box<dyn Error>> {
         for missing in [MUXING_APP, WRITING_APP] {
-            let input = fixture_with_info(|body| {
+            let input = fixture_with_segment_element(INFO, |body| {
                 let mut info = Vec::new();
                 for (id, payload) in children(body)? {
                     if id != missing {
@@ -345,7 +402,7 @@ mod vorbis {
             assert!(decode(input).is_err());
         }
 
-        let input = fixture_with_info(|body| {
+        let input = fixture_with_segment_element(INFO, |body| {
             let mut info = Vec::new();
             for (id, payload) in children(body)? {
                 if id != WRITING_APP {

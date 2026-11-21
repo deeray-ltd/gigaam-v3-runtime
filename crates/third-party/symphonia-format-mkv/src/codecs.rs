@@ -34,10 +34,12 @@ use crate::ebml::{BinaryData, EbmlIterator, ReadEbml};
 use crate::lacing::read_xiph_sizes;
 use crate::schema::MkvSchema;
 use crate::segment::TrackElement;
+use crate::vorbis::IDENTIFICATION_BYTES;
 
 pub(crate) fn make_track_codec_params<R: ReadEbml>(
     mut track: TrackElement,
     it: &mut EbmlIterator<R, MkvSchema>,
+    compact_vorbis_setup: bool,
 ) -> Result<Option<CodecParameters>> {
     // Get the codec ID for the track.
     let codec_id = get_codec_id(&track);
@@ -45,7 +47,7 @@ pub(crate) fn make_track_codec_params<R: ReadEbml>(
         (_, None) => None,
         (Some(CodecId::Audio(_)), Some(_)) if track.audio.is_none() => None,
         (Some(CodecId::Audio(CODEC_ID_VORBIS)), Some(BinaryData::Source(range))) => {
-            Some(vorbis_extra_data_from_source(it, range)?)
+            Some(vorbis_extra_data_from_source(it, range, compact_vorbis_setup)?)
         }
         (Some(CodecId::Audio(CODEC_ID_FLAC)), Some(BinaryData::Source(range))) => {
             Some(it.with_binary_range(range.start, range.end - range.start, |mut reader| {
@@ -259,6 +261,7 @@ fn vorbis_extra_data_from_codec_private(extra: &[u8]) -> Result<Box<[u8]>> {
 fn vorbis_extra_data_from_source<R: ReadEbml>(
     it: &mut EbmlIterator<R, MkvSchema>,
     range: Range<u64>,
+    compact_setup: bool,
 ) -> Result<Box<[u8]>> {
     let (mut start, mut packet_lengths) =
         it.with_binary_range(range.start, range.end - range.start, |mut reader| {
@@ -293,8 +296,21 @@ fn vorbis_extra_data_from_source<R: ReadEbml>(
         ident.ok_or(Error::DecodeError("mkv: missing vorbis identification packet"))?;
     let (setup_start, setup_len) =
         setup.ok_or(Error::DecodeError("mkv: missing vorbis setup packet"))?;
-    let size = usize::try_from(ident_len + setup_len)
-        .map_err(|_| Error::LimitError("mkv: vorbis headers do not fit in memory"))?;
+    let setup_prefix_len =
+        if compact_setup && usize::try_from(ident_len).ok() == Some(IDENTIFICATION_BYTES) {
+            let mut header = [0; IDENTIFICATION_BYTES];
+            it.with_binary_range(ident_start, ident_len, |mut reader| {
+                Ok(reader.read_buf_exact(&mut header)?)
+            })?;
+            it.with_binary_range(setup_start, setup_len, |mut reader| {
+                symphonia_codec_vorbis::vorbis_setup_prefix_len(&header, &mut reader)
+            })?
+        } else {
+            setup_len
+        };
+    let size = ident_len.checked_add(setup_prefix_len)
+        .and_then(|len| usize::try_from(len).ok())
+        .ok_or(Error::LimitError("mkv: vorbis headers do not fit in memory"))?;
     let mut extra = Vec::new();
     extra.try_reserve_exact(size)
         .map_err(|_| Error::LimitError("mkv: could not allocate vorbis headers"))?;
@@ -303,7 +319,9 @@ fn vorbis_extra_data_from_source<R: ReadEbml>(
         .map_err(|_| Error::LimitError("mkv: vorbis identification packet does not fit in memory"))?;
     let (ident_buf, setup_buf) = extra.split_at_mut(ident_size);
     it.with_binary_range(ident_start, ident_len, |mut reader| Ok(reader.read_buf_exact(ident_buf)?))?;
-    it.with_binary_range(setup_start, setup_len, |mut reader| Ok(reader.read_buf_exact(setup_buf)?))?;
+    it.with_binary_range(setup_start, setup_prefix_len, |mut reader| {
+        Ok(reader.read_buf_exact(setup_buf)?)
+    })?;
     Ok(extra.into_boxed_slice())
 }
 
