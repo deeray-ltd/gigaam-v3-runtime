@@ -4,12 +4,13 @@
 
 //! Fixed-16-kHz VAD command adapter.
 
+use crate::audio_io::load;
 use crate::composition;
 use crate::configuration;
 use crate::grammar::{VadChannels, VadInvocation};
 use crate::numeric::usize_to_u32;
 use crate::projection::{self, VadSummary};
-use gigaam_audio::{DecodedAudio, SampleRate, load};
+use gigaam_audio::{DecodedAudio, SampleRate};
 use gigaam_recognition::{RequiredEncoderRoles, SpeechProbabilityDetector, vad::VAD_SR};
 use gigaam_transcription::{SpeechSegment, VadPolicyConfig, speech_segments};
 use std::time::{Duration, Instant};

@@ -307,7 +307,10 @@ pub(crate) mod tests {
 
     fn native_fixture_apis() -> Result<super::ApiRegistry, String> {
         let mut apis = super::ApiRegistry::default();
-        apis.register(NativeFixtureApi)?;
+        apis.register_file_formats(
+            NativeFixtureApi,
+            gigaam_audio::FileDecoders::new(vec![std::sync::Arc::new(gigaam_format_wav::Wave)])?,
+        )?;
         Ok(apis)
     }
 

@@ -11,9 +11,8 @@
 
 mod common;
 
-use gigaam_audio::{
-    FrontendProcessor, SampleRate, channel_correlation, load, read_wav, resample_audio,
-};
+use gigaam_audio::{FrontendProcessor, SampleRate, channel_correlation, resample_audio};
+use gigaam_format_wav::read_wav;
 use gigaam_model_package::{EncoderPrecision, ModelPackage};
 use gigaam_recognition::{DirectRecognizer, ExecutionControl};
 use gigaam_transcription::{
@@ -21,6 +20,14 @@ use gigaam_transcription::{
     TurnGap, merge, turns, word_edits,
 };
 use std::sync::Arc;
+
+fn load(path: &std::path::Path) -> Result<gigaam_audio::DecodedAudio, String> {
+    if path.extension().is_some_and(|extension| extension == "wav") {
+        gigaam_format_wav::read_wav(path)
+    } else {
+        gigaam_format_codecs::load(path)
+    }
+}
 
 fn transcribe(
     pack: &ModelPackage,

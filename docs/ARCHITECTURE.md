@@ -217,11 +217,31 @@ channel permits, transports frames, and projects the result.
 | Package | Principal components |
 | --- | --- |
 | gigaam-model-package | schema parser, compatibility validator, contained regular-asset resolver, typed package definition |
-| gigaam-audio | container/raw/interleaved decoders, G.711 conversion, resampler, frontend, channel analysis |
+| gigaam-audio | decoded audio contracts, interleaved sample conversion, G.711 conversion, resampler, frontend, channel analysis |
+| gigaam-format-wav | strict WAV file decoding |
+| gigaam-format-raw | headerless live format providers |
+| gigaam-format-codecs | linked container and codec file decoding |
 | gigaam-recognition | CTC/RNN-T/VAD contracts, native-output validation, provider plan, ORT adapters, execution control, scheduler |
 | gigaam-transcription | batch and multichannel batch flows, stream and multichannel stream flows, stitching, endpointing, turns, dialog, observations |
 | gigaam-service | startup/configuration, capabilities/policy context, admission, HTTP, WebSocket, router, health, lifecycle, JSON, metrics, log, telemetry |
 | gigaam-cli | grammar, typed configuration, command composition, stdout/stderr projection |
+
+### Embedding API adapters
+
+An embedding executable composes format providers explicitly. Register Native with
+`ApiRegistry::register_audio_formats`, supplying `FileDecoders` and `LiveDecoders` for its
+file and WebSocket routes; register OpenAI with `register_file_formats`. The stock process
+links WAV and container providers for both file routes and the raw-format providers for
+Native, with `pcm16` as the explicit live default. `LiveDecoders::new` accepts the linked
+providers and an optional default ID; a process may omit the raw crate, choose a different
+provider or configure no default. An unknown selector or absent default is refused.
+
+`ApiRegistry::register` alone installs only the adapter: it does not attach audio formats.
+Embedders migrating from implicit formats must use the appropriate registration method and
+provide their chosen implementations. Direct multichannel stream consumers must pass a
+`SelectedLiveDecoder` in their setup and call `MultiChannelSession::new_with_decoder`;
+the production transcription crate does not select a raw implementation itself. CLI file commands compose their own file providers;
+its offline streaming command consumes already decoded audio rather than a raw wire stream.
 
 ## Boundaries not claimed by this architecture
 

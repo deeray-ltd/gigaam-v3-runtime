@@ -5,7 +5,7 @@
 //! Host-owned execution resources for live transcription.
 
 use crate::metrics::Metrics;
-use gigaam_audio::FrontendProcessor;
+use gigaam_audio::{FrontendProcessor, LiveDecoders, SelectedLiveDecoder};
 use gigaam_model_package::VariantPackage;
 use gigaam_recognition::{ExecutionControl, ExecutionScheduler, ScheduledRecognizer};
 use gigaam_transcription::TranscriptionObservation;
@@ -103,9 +103,9 @@ pub(crate) fn project_observations(metrics: &Metrics, observations: &[Transcript
 }
 
 /// Typed stream parameters supplied by a protocol adapter after decoding its request.
-pub struct StreamInput {
+pub struct StreamInput<F = gigaam_audio::SampleFormat> {
     pub rate: gigaam_audio::SampleRate,
-    pub format: gigaam_audio::SampleFormat,
+    pub format: F,
     pub channels: usize,
     pub emission: gigaam_transcription::StreamEmissionMode,
     pub config: StreamConfig,
@@ -126,10 +126,10 @@ pub(crate) fn validate_endpoint_capability(
     Ok(())
 }
 
-pub(crate) fn prepare_stream(
+pub(crate) fn prepare_stream<F>(
     context: &crate::context::ApplicationContext,
-    input: StreamInput,
-) -> Result<gigaam_transcription::MultiChannelStreamSetup, String> {
+    input: StreamInput<F>,
+) -> Result<gigaam_transcription::MultiChannelStreamSetup<F>, String> {
     use gigaam_transcription::{
         BackchannelDuration, BackchannelPolicy, CorrelationThreshold, MultiChannelStreamOptions,
         MultiChannelStreamSetup, MultiChannelStreamSetupInput, SelectionWindowSamples,
@@ -265,6 +265,7 @@ pub struct LiveService {
     admission: Arc<crate::admission::AdmissionState>,
     metrics: Arc<Metrics>,
     telemetry: LiveTelemetry,
+    audio_decoders: LiveDecoders,
 }
 
 /// Stream defaults configured by the host.
@@ -276,7 +277,7 @@ pub struct StreamDefaults {
 }
 
 /// A validated setup, before capacity has been reserved.
-pub struct PreparedLiveStream(gigaam_transcription::MultiChannelStreamSetup);
+pub struct PreparedLiveStream(gigaam_transcription::MultiChannelStreamSetup<SelectedLiveDecoder>);
 impl PreparedLiveStream {
     pub fn source_channels(&self) -> gigaam_transcription::SourceChannelCount {
         self.0.source_channels()
@@ -344,6 +345,7 @@ impl LiveService {
             admission,
             metrics,
             telemetry,
+            audio_decoders: LiveDecoders::default(),
         }
     }
     #[cfg(test)]
@@ -363,11 +365,26 @@ impl LiveService {
     pub fn supports_stream(&self) -> bool {
         self.context.capabilities.pack.variant().family() == gigaam_model_package::ModelFamily::Ctc
     }
-    pub fn validate(&self, input: StreamInput) -> Result<PreparedLiveStream, String> {
+    /// Binds the decoder allowlist used by one route.
+    pub fn with_audio_decoders(mut self, decoders: LiveDecoders) -> Self {
+        self.audio_decoders = decoders;
+        self
+    }
+
+    pub fn audio_decoder(&self, selector: Option<&str>) -> Result<SelectedLiveDecoder, String> {
+        self.audio_decoders.select(selector)
+    }
+
+    pub fn validate<F: Into<SelectedLiveDecoder>>(
+        &self,
+        input: StreamInput<F>,
+    ) -> Result<PreparedLiveStream, String> {
         if !self.supports_stream() {
             return Err("stream requires CTC".into());
         }
-        Ok(PreparedLiveStream(prepare_stream(&self.context, input)?))
+        Ok(PreparedLiveStream(
+            prepare_stream(&self.context, input)?.select_decoder(),
+        ))
     }
     pub fn reserve(&self, setup: PreparedLiveStream) -> Result<LiveReservation, LiveRefusal> {
         let permits =
@@ -417,7 +434,7 @@ impl LiveReservation {
         let mut factory = ServiceStreamChannelFactory::new(&service.context.capabilities);
         let worker_lease = Arc::clone(&lease);
         let started = spawn_leased(worker_lease, move || {
-            gigaam_transcription::MultiChannelSession::new(setup.0, &mut factory)
+            gigaam_transcription::MultiChannelSession::new_with_decoder(setup.0, &mut factory)
         })
         .await
         .map_err(|error| format!("stream session initialization task failed: {error}"))
@@ -558,7 +575,7 @@ mod lease_tests {
         let service = LiveService::new(context, Arc::clone(&admission), metrics, producer);
         let setup = service.validate(StreamInput {
             rate,
-            format: SampleFormat::Pcm16,
+            format: gigaam_format_raw::select(SampleFormat::Pcm16)?,
             channels: 1,
             emission: StreamEmissionMode::Words,
             config: service

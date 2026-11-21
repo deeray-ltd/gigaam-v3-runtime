@@ -1,0 +1,24 @@
+[package]
+name = "gigaam-format-wav"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+gigaam-audio = { path = "../audio" }
+
+gigaam-primitives = { path = "../primitives" }
+
+[dev-dependencies]
+gigaam-format-raw = { path = "../format-raw" }
+
+[features]
+golden-tests = []
+
+[[test]]
+name = "wav_golden"
+required-features = ["golden-tests"]

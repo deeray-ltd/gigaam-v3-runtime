@@ -21,8 +21,9 @@ use crate::dialog::{BackchannelPolicy, DialogMerger};
 use crate::stream::{StreamSession, StreamSetup};
 use crate::turns::TurnGap;
 use gigaam_audio::{
-    ChannelAudio, ChannelAudioView, ChannelCount, RatePair, RawDecoder, Resampler, ResamplerConfig,
-    SampleFormat, SampleRate, StreamResampler,
+    AudioMetadata, ChannelAudio, ChannelAudioView, ChannelCount, DecodedChunk, LiveDecoder,
+    RatePair, Resampler, ResamplerConfig, SampleFormat, SampleRate, SelectedLiveDecoder,
+    StreamResampler,
 };
 use gigaam_recognition::{SpeechProbabilityDetector, WindowDecoder};
 use std::cmp::Ordering;
@@ -77,8 +78,8 @@ impl MultiChannelStreamOptions {
 ///
 /// The input remains mutable only until [`MultiChannelStreamSetup::new`] validates and owns it.
 #[derive(Clone, Debug, PartialEq)]
-pub struct MultiChannelStreamSetupInput {
-    pub sample_format: SampleFormat,
+pub struct MultiChannelStreamSetupInput<F = SampleFormat> {
+    pub sample_format: F,
     pub source_sample_rate: SampleRate,
     pub source_channels: SourceChannelCount,
     pub stream_config: StreamConfig,
@@ -87,17 +88,17 @@ pub struct MultiChannelStreamSetupInput {
 
 /// Complete immutable configuration shared by every channel of one incremental stream.
 #[derive(Clone, Debug, PartialEq)]
-pub struct MultiChannelStreamSetup {
-    sample_format: SampleFormat,
+pub struct MultiChannelStreamSetup<F = SampleFormat> {
+    sample_format: F,
     source_channels: SourceChannelCount,
     rate_pair: RatePair,
     stream_config: StreamConfig,
     options: MultiChannelStreamOptions,
 }
 
-impl MultiChannelStreamSetup {
+impl<F> MultiChannelStreamSetup<F> {
     /// Validates the audio shape, supported rate conversion, and single-channel stream contract.
-    pub fn new(input: MultiChannelStreamSetupInput) -> Result<Self, String> {
+    pub fn new(input: MultiChannelStreamSetupInput<F>) -> Result<Self, String> {
         let MultiChannelStreamSetupInput {
             sample_format,
             source_sample_rate,
@@ -116,9 +117,18 @@ impl MultiChannelStreamSetup {
         })
     }
 
-    /// Returns the wire sample format accepted by this stream.
-    pub const fn sample_format(&self) -> SampleFormat {
-        self.sample_format
+    /// Resolves the stream's audio decoder while preserving its validated geometry.
+    pub fn select_decoder(self) -> MultiChannelStreamSetup<SelectedLiveDecoder>
+    where
+        F: Into<SelectedLiveDecoder>,
+    {
+        MultiChannelStreamSetup {
+            sample_format: self.sample_format.into(),
+            source_channels: self.source_channels,
+            rate_pair: self.rate_pair,
+            stream_config: self.stream_config,
+            options: self.options,
+        }
     }
 
     /// Returns the validated number of original interleaved source channels.
@@ -144,6 +154,13 @@ impl MultiChannelStreamSetup {
     /// Returns the typed activation, emission, turn, and backchannel choices.
     pub const fn options(&self) -> MultiChannelStreamOptions {
         self.options
+    }
+}
+
+impl MultiChannelStreamSetup<SampleFormat> {
+    /// Returns the wire sample format accepted by a raw stream.
+    pub const fn sample_format(&self) -> SampleFormat {
+        self.sample_format
     }
 }
 
@@ -683,7 +700,7 @@ fn dialogue_order(left: &DialogTurn, right: &DialogTurn) -> Ordering {
 
 /// Owns the complete online multi-channel transcription lifecycle from raw frames to dialogue.
 pub struct MultiChannelSession<D: WindowDecoder, V: SpeechProbabilityDetector> {
-    decoder: Option<RawDecoder>,
+    decoder: Option<LiveDecoder>,
     source_channels: SourceChannelCount,
     candidates: Vec<OnlineCandidate<D, V>>,
     lifecycle: OnlineLifecycle,
@@ -740,15 +757,36 @@ impl ChannelRateAdapter {
 
 impl<D: WindowDecoder, V: SpeechProbabilityDetector> MultiChannelSession<D, V> {
     /// Creates, validates, and warms one candidate session for every original source channel.
+    #[cfg(test)]
     pub fn new<F>(setup: MultiChannelStreamSetup, factory: &mut F) -> Result<Self, String>
     where
         F: StreamChannelFactory<Decoder = D, Detector = V>,
     {
-        let decoder = RawDecoder::new(
-            setup.sample_format,
+        let selected = gigaam_format_raw::select(setup.sample_format)?;
+        Self::new_with_decoder(
+            MultiChannelStreamSetup {
+                sample_format: selected,
+                source_channels: setup.source_channels,
+                rate_pair: setup.rate_pair,
+                stream_config: setup.stream_config,
+                options: setup.options,
+            },
+            factory,
+        )
+    }
+
+    /// Opens the selected audio decoder before creating or warming recognition sessions.
+    pub fn new_with_decoder<F>(
+        setup: MultiChannelStreamSetup<SelectedLiveDecoder>,
+        factory: &mut F,
+    ) -> Result<Self, String>
+    where
+        F: StreamChannelFactory<Decoder = D, Detector = V>,
+    {
+        let decoder = setup.sample_format.open(AudioMetadata::new(
             setup.rate_pair.input(),
             ChannelCount::new(setup.source_channels.get())?,
-        )?;
+        ))?;
         let lifecycle = match setup.options.channel_policy() {
             StreamingChannelPolicy::AllChannels => {
                 OnlineLifecycle::Active(ChannelSelection::all(setup.source_channels)?)
@@ -805,18 +843,9 @@ impl<D: WindowDecoder, V: SpeechProbabilityDetector> MultiChannelSession<D, V> {
                 ));
             }
         };
-        let Some(chunk) = decoded else {
-            return Ok(MultiChannelStep {
-                emission_groups: Vec::new(),
-                observations,
-            });
-        };
-        let (_, channels) = chunk.into_audio().into_parts();
-        let result = match self.buffering_parameters() {
-            Some((threshold, analysis_window)) => {
-                self.push_buffered(channels, threshold, analysis_window, &mut observations)
-            }
-            None => self.push_active(channels, &mut observations),
+        let result = match decoded {
+            Some(chunk) => self.push_decoded(chunk, &mut observations),
+            None => Ok(Vec::new()),
         };
         match result {
             Ok(emission_groups) => Ok(MultiChannelStep {
@@ -824,6 +853,20 @@ impl<D: WindowDecoder, V: SpeechProbabilityDetector> MultiChannelSession<D, V> {
                 observations,
             }),
             Err(error) => Err(self.fail(error, observations)),
+        }
+    }
+
+    fn push_decoded(
+        &mut self,
+        chunk: DecodedChunk,
+        observations: &mut Vec<TranscriptionObservation>,
+    ) -> Result<Vec<MultiChannelEmissionGroup>, String> {
+        let (_, channels) = chunk.into_audio().into_parts();
+        match self.buffering_parameters() {
+            Some((threshold, analysis_window)) => {
+                self.push_buffered(channels, threshold, analysis_window, observations)
+            }
+            None => self.push_active(channels, observations),
         }
     }
 
@@ -844,10 +887,17 @@ impl<D: WindowDecoder, V: SpeechProbabilityDetector> MultiChannelSession<D, V> {
                 ));
             }
         };
-        if let Err(error) = decoder.finish() {
-            return Err(MultiChannelFailure::from_committed(error, Vec::new()));
-        }
+        let tail = decoder
+            .finish()
+            .map_err(|error| MultiChannelFailure::from_committed(error, Vec::new()))?;
         let mut observations = Vec::new();
+        let mut emissions = match tail {
+            Some(chunk) => match self.push_decoded(chunk, &mut observations) {
+                Ok(emissions) => emissions,
+                Err(error) => return Err(self.fail(error, observations)),
+            },
+            None => Vec::new(),
+        };
         let result = match self.buffering_parameters() {
             Some((threshold, analysis_window)) => {
                 self.finish_buffered(threshold, analysis_window, &mut observations)
@@ -863,10 +913,13 @@ impl<D: WindowDecoder, V: SpeechProbabilityDetector> MultiChannelSession<D, V> {
             }
         };
         match result {
-            Ok(emission_groups) => Ok(MultiChannelStep {
-                emission_groups,
-                observations,
-            }),
+            Ok(emission_groups) => {
+                emissions.extend(emission_groups);
+                Ok(MultiChannelStep {
+                    emission_groups: emissions,
+                    observations,
+                })
+            }
             Err(error) => Err(MultiChannelFailure::from_committed(error, observations)),
         }
     }
@@ -1956,7 +2009,7 @@ mod tests {
             control,
         })?;
         session.warmup()?;
-        let complete_audio = gigaam_audio::decode_samples(SampleFormat::Pcm16, bytes)?;
+        let complete_audio = gigaam_format_raw::decode_samples(SampleFormat::Pcm16, bytes)?;
         session.push(&complete_audio)?;
         session.flush()?;
         Ok(trace

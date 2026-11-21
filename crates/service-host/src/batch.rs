@@ -46,9 +46,7 @@ mod native_http;
 #[path = "../../api-openai/src/http.rs"]
 mod openai_http;
 
-use gigaam_audio::{
-    ChannelAudio, ChannelAudioView, DecodedAudio, EncodedAudio, FileDecoder, resample_audio,
-};
+use gigaam_audio::{ChannelAudio, ChannelAudioView, DecodedAudio, EncodedAudio, resample_audio};
 use gigaam_recognition::{ExecutionControl, ExecutionState, SpeechProbabilityDetector};
 use gigaam_transcription::{
     BatchChannelPolicy, BatchSetup, MultiChannelBatchError, MultiChannelBatchOptions,
@@ -78,6 +76,7 @@ pub struct BatchService {
     request_timeout: Duration,
     upload_timeout: Duration,
     request_body_limit: RequestBodyLimit,
+    decoders: Option<gigaam_audio::FileDecoders>,
 }
 
 /// Cohesive private inputs assembled by the facade for the HTTP adapter state.
@@ -113,7 +112,13 @@ impl BatchService {
             request_timeout,
             upload_timeout,
             request_body_limit,
+            decoders: None,
         }
+    }
+
+    pub(crate) fn with_file_decoders(mut self, decoders: gigaam_audio::FileDecoders) -> Self {
+        self.decoders = Some(decoders);
+        self
     }
 }
 
@@ -237,10 +242,12 @@ impl BatchService {
         };
         let context = Arc::clone(&self.context);
         let metrics = Arc::clone(&self.metrics);
+        let decoders = self.decoders.clone();
         execute_admitted_work(execution, move |control| {
             let capabilities = &context.capabilities;
             let (result, duration, source_rate, rtf) = run_batch(
                 BatchExecution {
+                    decoders: decoders.as_ref(),
                     context: &context,
                     metrics: &metrics,
                     request,
@@ -523,8 +530,11 @@ fn do_transcribe_with_vad_factory<D: SpeechProbabilityDetector>(
     let work_variant = work.context.capabilities.pack.variant().as_str();
     let progress = work.progress;
     let request = native_batch_request(query, work.bytes)?;
+    let decoders = gigaam_audio::FileDecoders::new(vec![Arc::new(gigaam_format_wav::Wave)])
+        .map_err(TranscribeError::BadRequest)?;
     let (result, duration, source_rate, rtf) = run_batch(
         BatchExecution {
+            decoders: Some(&decoders),
             context: work.context,
             metrics: work.metrics,
             request,
@@ -560,6 +570,7 @@ pub struct BatchRequest {
 }
 
 struct BatchExecution<'a> {
+    decoders: Option<&'a gigaam_audio::FileDecoders>,
     context: &'a ApplicationContext,
     metrics: &'a Metrics,
     request: BatchRequest,
@@ -572,6 +583,7 @@ fn run_batch<D: SpeechProbabilityDetector>(
     factory: impl FnOnce() -> Result<D, String>,
 ) -> Result<(MultiChannelBatchResult, f32, u32, f32), TranscribeError> {
     let BatchExecution {
+        decoders,
         context,
         metrics,
         request:
@@ -619,7 +631,11 @@ fn run_batch<D: SpeechProbabilityDetector>(
     }
     let loaded = progress.stage(BatchStage::AudioDecode, || {
         let encoded = EncodedAudio::new(audio, extension).map_err(TranscribeError::BadRequest)?;
-        let mut decoder = FileDecoder::open(encoded).map_err(TranscribeError::BadRequest)?;
+        let mut decoder = match decoders {
+            Some(decoders) => decoders.open_encoded(encoded),
+            None => Err("audio format is unavailable on this route".to_owned()),
+        }
+        .map_err(TranscribeError::BadRequest)?;
         decoder
             .collect_remaining()
             .map_err(TranscribeError::BadRequest)
@@ -1383,7 +1399,10 @@ mod tests {
             request_timeout: Duration::from_secs(1),
             upload_timeout: Duration::from_secs(1),
             request_body_limit: RequestBodyLimit::new(8_192)?,
-        }))
+        })
+        .with_file_decoders(gigaam_audio::FileDecoders::new(vec![Arc::new(
+            gigaam_format_wav::Wave,
+        )])?))
     }
 
     #[derive(Debug, Eq, PartialEq)]
@@ -1410,6 +1429,42 @@ mod tests {
         assert!(line.contains("\"event\":\"transcribe_phase\""), "{line}");
         assert!(line.contains(&format!("\"phase\":\"{phase}\"")), "{line}");
         assert!(line.contains(&format!("\"state\":\"{state}\"")), "{line}");
+    }
+
+    #[tokio::test]
+    async fn unconfigured_file_route_refuses_even_valid_wave() -> Result<(), String> {
+        let fixture = crate::tests::assembly_fixture()?;
+        let telemetry = test_support::prepare(16, 1)?;
+        let admission = Arc::new(AdmissionState::new(&ServiceAdmission::new(
+            1,
+            1,
+            Duration::from_secs(5),
+        )?)?);
+        let mut state = state_with_telemetry(
+            &fixture,
+            admission,
+            telemetry.metrics_arc(),
+            telemetry.producer(),
+        )?;
+        state.decoders = None;
+        let audio = crate::tests::pcm16_wav_silence(fixture.frontend.sample_rate().hertz(), 640)?;
+        let response = project(
+            transcribe(
+                State(state),
+                HeaderMap::new(),
+                RawQuery(Some("ext=wav".into())),
+                Bytes::from(audio),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(response.status, StatusCode::BAD_REQUEST);
+        assert!(
+            std::str::from_utf8(&response.body)
+                .map_err(|e| e.to_string())?
+                .contains("audio format is unavailable on this route")
+        );
+        Ok(())
     }
 
     #[tokio::test]

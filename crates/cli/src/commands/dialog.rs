@@ -4,11 +4,11 @@
 
 //! Offline multi-channel dialogue command adapter.
 
+use crate::audio_io::load;
 use crate::composition;
 use crate::configuration;
 use crate::grammar::DialogInvocation;
 use crate::projection;
-use gigaam_audio::load;
 use gigaam_recognition::RequiredEncoderRoles;
 use gigaam_transcription::{
     BackchannelDuration, BackchannelPolicy, OfflineDialogSetup, OfflineDialogSetupInput, TurnGap,

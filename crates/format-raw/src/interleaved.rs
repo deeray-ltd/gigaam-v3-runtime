@@ -9,8 +9,7 @@
 
 //! Stateful raw interleaved sample decoding across arbitrary byte partitions.
 
-use crate::contracts::{ChannelAudio, ChannelCount, SampleFormat};
-use crate::g711;
+use gigaam_audio::{ChannelAudio, ChannelCount, SampleFormat, alaw_to_i16, ulaw_to_i16};
 
 /// Stateful raw interleaved decoder. It owns byte-partition handling; contracts own the sample
 /// value types and format enum. External IEEE-754 float samples must be finite and in the closed
@@ -48,13 +47,13 @@ fn decode_sample(format: SampleFormat, bytes: &[u8]) -> Result<f32, String> {
             let byte = *bytes
                 .first()
                 .ok_or_else(|| "interleaved A-law sample width is invalid".to_owned())?;
-            Ok(f32::from(g711::alaw_to_i16(byte)) / 32_768.0)
+            Ok(f32::from(alaw_to_i16(byte)) / 32_768.0)
         }
         SampleFormat::Ulaw => {
             let byte = *bytes
                 .first()
                 .ok_or_else(|| "interleaved mu-law sample width is invalid".to_owned())?;
-            Ok(f32::from(g711::ulaw_to_i16(byte)) / 32_768.0)
+            Ok(f32::from(ulaw_to_i16(byte)) / 32_768.0)
         }
     }
 }
@@ -144,8 +143,7 @@ impl InterleavedFrameDecoder {
     }
 }
 
-/// Decodes one complete noninterleaved channel. Transport orchestration may retain its own
-/// multichannel byte remainder, but sample-format conversion remains an Audio responsibility.
+/// Decodes one complete noninterleaved channel with the same raw sample rules.
 pub fn decode_samples(format: SampleFormat, bytes: &[u8]) -> Result<ChannelAudio, String> {
     if !bytes.len().is_multiple_of(format.bytes_per_sample()) {
         return Err(format!(
@@ -170,7 +168,7 @@ pub fn decode_samples(format: SampleFormat, bytes: &[u8]) -> Result<ChannelAudio
 #[cfg(test)]
 mod tests {
     use super::{InterleavedFrameDecoder, decode_samples};
-    use crate::{ChannelAudio, ChannelCount, SampleFormat};
+    use gigaam_audio::{ChannelAudio, ChannelCount, SampleFormat};
 
     fn payload(format: SampleFormat) -> Vec<u8> {
         match format {

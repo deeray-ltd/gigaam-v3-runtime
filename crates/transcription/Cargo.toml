@@ -15,7 +15,9 @@ gigaam-primitives = { path = "../primitives" }
 gigaam-recognition = { path = "../recognition", default-features = false }
 
 [dev-dependencies]
-gigaam-audio = { path = "../audio", features = ["decoders"] }
+gigaam-format-raw = { path = "../format-raw" }
+gigaam-format-wav = { path = "../format-wav" }
+gigaam-format-codecs = { path = "../format-codecs" }
 gigaam-model-package = { path = "../model-package" }
 
 [features]

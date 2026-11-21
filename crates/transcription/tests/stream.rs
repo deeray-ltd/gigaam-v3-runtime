@@ -11,7 +11,8 @@
 
 mod common;
 
-use gigaam_audio::{ChannelAudio, SampleRate, read_wav};
+use gigaam_audio::{ChannelAudio, SampleRate};
+use gigaam_format_wav::read_wav;
 use gigaam_model_package::{EncoderPrecision, ModelPackage};
 use gigaam_recognition::{DirectRecognizer, ExecutionControl, Vad};
 use gigaam_transcription::{

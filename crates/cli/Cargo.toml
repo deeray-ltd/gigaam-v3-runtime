@@ -17,11 +17,13 @@ path = "src/main.rs"
 gigaam-primitives = { path = "../primitives" }
 gigaam-model-package = { path = "../model-package" }
 gigaam-audio = { path = "../audio" }
+gigaam-format-wav = { path = "../format-wav" }
+gigaam-format-codecs = { path = "../format-codecs", optional = true }
 gigaam-recognition = { path = "../recognition", default-features = false }
 gigaam-transcription = { path = "../transcription" }
 
 [features]
 default = ["cuda"]
 cuda = ["gigaam-recognition/cuda"]
-decoders = ["gigaam-audio/decoders"]
+decoders = ["dep:gigaam-format-codecs"]
 tensorrt = ["cuda", "gigaam-recognition/tensorrt"]

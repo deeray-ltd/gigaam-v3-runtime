@@ -9,8 +9,9 @@
 
 //! Strict RIFF/WAV container traversal and decoding.
 
-use crate::contracts::{ChannelAudio, ChannelCount, DecodedAudio, SampleRate};
-use crate::{AudioMetadata, g711};
+use gigaam_audio::{
+    AudioMetadata, ChannelAudio, ChannelCount, DecodedAudio, SampleRate, alaw_to_i16, ulaw_to_i16,
+};
 use gigaam_primitives::{i32_to_f32, u32_to_usize};
 
 const RIFF_HEADER_LENGTH: usize = 12;
@@ -194,13 +195,13 @@ fn decode_wav_sample(format: WavFormat, sample: &[u8]) -> Result<f32, String> {
             let byte = *sample
                 .first()
                 .ok_or_else(|| "WAV A-law sample is truncated".to_owned())?;
-            Ok(f32::from(g711::alaw_to_i16(byte)) / 32_768.0)
+            Ok(f32::from(alaw_to_i16(byte)) / 32_768.0)
         }
         (ULAW_TAG, 8) => {
             let byte = *sample
                 .first()
                 .ok_or_else(|| "WAV mu-law sample is truncated".to_owned())?;
-            Ok(f32::from(g711::ulaw_to_i16(byte)) / 32_768.0)
+            Ok(f32::from(ulaw_to_i16(byte)) / 32_768.0)
         }
         _ => Err("WAV format escaped its validated parser contract".into()),
     }
@@ -317,8 +318,7 @@ fn wav_io(error: std::io::Error) -> String {
 /// Parses exactly one unambiguous complete RIFF/WAV payload.
 pub fn parse_wav(bytes: &[u8]) -> Result<DecodedAudio, String> {
     let mut reader = WavReader::open(Cursor::new(bytes))?;
-    let metadata = reader.metadata();
-    crate::decoded_input::collect_audio(metadata, || reader.next_audio(usize::MAX))
+    gigaam_audio::collect_audio(reader.metadata(), || reader.next_audio(usize::MAX))
 }
 
 fn decode_frames(format: WavFormat, data: &[u8], frames: usize) -> Result<DecodedAudio, String> {
@@ -354,9 +354,166 @@ fn decode_frames(format: WavFormat, data: &[u8], frames: usize) -> Result<Decode
     DecodedAudio::new(format.sample_rate, channels)
 }
 
+impl<R: Read + Seek + Send> gigaam_audio::FileChunkReader for WavReader<R> {
+    fn metadata(&self) -> AudioMetadata {
+        WavReader::metadata(self)
+    }
+    fn next_audio(
+        &mut self,
+        max_frames: std::num::NonZeroUsize,
+    ) -> Result<Option<DecodedAudio>, String> {
+        WavReader::next_audio(self, max_frames.get())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::parse_wav;
+    use gigaam_audio::{ChannelCount, SampleFormat, SampleRate};
+    use gigaam_format_raw::RawDecoder;
+    use std::num::NonZeroUsize;
+    fn stereo_float_wav(frames: u32, duplicate_data: bool) -> Vec<u8> {
+        let mut wav = Vec::new();
+        wav.extend_from_slice(b"RIFF");
+        let bytes = frames * 8;
+        let extra = if duplicate_data { 8 } else { 0 };
+        wav.extend_from_slice(&(36 + bytes + extra).to_le_bytes());
+        wav.extend_from_slice(b"WAVEfmt ");
+        wav.extend_from_slice(&16_u32.to_le_bytes());
+        wav.extend_from_slice(&3_u16.to_le_bytes());
+        wav.extend_from_slice(&2_u16.to_le_bytes());
+        wav.extend_from_slice(&48_000_u32.to_le_bytes());
+        wav.extend_from_slice(&384_000_u32.to_le_bytes());
+        wav.extend_from_slice(&8_u16.to_le_bytes());
+        wav.extend_from_slice(&32_u16.to_le_bytes());
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&bytes.to_le_bytes());
+        for _ in 0..frames {
+            wav.extend_from_slice(&1.25_f32.to_le_bytes());
+            wav.extend_from_slice(&(-0.25_f32).to_le_bytes());
+        }
+        if duplicate_data {
+            wav.extend_from_slice(b"data\0\0\0\0");
+        }
+        wav
+    }
+
+    #[test]
+    fn strict_wav_scans_structure_then_reads_only_requested_frames() -> Result<(), String> {
+        let mut decoder = crate::open_encoded(gigaam_audio::EncodedAudio::new(
+            stereo_float_wav(1003, false),
+            Some("MP3".into()),
+        )?)?;
+        assert_eq!(decoder.metadata().sample_rate().hertz(), 48_000);
+        assert_eq!(decoder.metadata().channel_count().get(), 2);
+        let limit = NonZeroUsize::new(100).expect("100 is nonzero");
+        let mut frames = 0;
+        while let Some(chunk) = decoder.next_chunk(limit)? {
+            assert_eq!(chunk.first_frame(), frames);
+            let audio = chunk.audio();
+            assert!(audio.frames() <= 100);
+            assert!(
+                audio.channels()[0]
+                    .samples()
+                    .iter()
+                    .all(|sample| *sample == 1.25)
+            );
+            assert!(
+                audio.channels()[1]
+                    .samples()
+                    .iter()
+                    .all(|sample| *sample == -0.25)
+            );
+            frames = chunk.end_frame();
+        }
+        assert_eq!(frames, 1003);
+        assert!(decoder.next_chunk(limit)?.is_none());
+        assert!(
+            crate::open_encoded(gigaam_audio::EncodedAudio::new(
+                stereo_float_wav(3, true),
+                None
+            )?)
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn wav_and_raw_share_source_positions_and_physical_samples() -> Result<(), String> {
+        let frames = [
+            (0_i16, 16384_i16),
+            (-32768, -8192),
+            (8192, 32767),
+            (1234, -2345),
+        ];
+        let bytes: Vec<u8> = frames
+            .iter()
+            .flat_map(|(left, right)| left.to_le_bytes().into_iter().chain(right.to_le_bytes()))
+            .collect();
+        let mut wav = Vec::new();
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(
+            &(36_u32 + u32::try_from(bytes.len()).map_err(|e| e.to_string())?).to_le_bytes(),
+        );
+        wav.extend_from_slice(b"WAVEfmt ");
+        wav.extend_from_slice(&16_u32.to_le_bytes());
+        wav.extend_from_slice(&1_u16.to_le_bytes());
+        wav.extend_from_slice(&2_u16.to_le_bytes());
+        wav.extend_from_slice(&8_000_u32.to_le_bytes());
+        wav.extend_from_slice(&32_000_u32.to_le_bytes());
+        wav.extend_from_slice(&4_u16.to_le_bytes());
+        wav.extend_from_slice(&16_u16.to_le_bytes());
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(
+            &u32::try_from(bytes.len())
+                .map_err(|e| e.to_string())?
+                .to_le_bytes(),
+        );
+        wav.extend_from_slice(&bytes);
+        let expected: [Vec<f32>; 2] = [
+            frames
+                .iter()
+                .map(|(v, _)| f32::from(*v) / 32768.0)
+                .collect(),
+            frames
+                .iter()
+                .map(|(_, v)| f32::from(*v) / 32768.0)
+                .collect(),
+        ];
+        let mut file = crate::open_encoded(gigaam_audio::EncodedAudio::new(wav, None)?)?;
+        let mut live = RawDecoder::new(
+            SampleFormat::Pcm16,
+            SampleRate::new(8000)?,
+            ChannelCount::new(2)?,
+        )?;
+        assert_eq!(file.metadata(), live.metadata());
+        let mut file_channels = [Vec::new(), Vec::new()];
+        let mut file_position = 0;
+        while let Some(chunk) = file.next_chunk(NonZeroUsize::new(3).ok_or("nonzero")?)? {
+            assert_eq!(chunk.first_frame(), file_position);
+            file_position = chunk.end_frame();
+            for (out, channel) in file_channels.iter_mut().zip(chunk.audio().channels()) {
+                out.extend_from_slice(channel.samples());
+            }
+        }
+        let mut live_channels = [Vec::new(), Vec::new()];
+        let mut live_position = 0;
+        for part in bytes.chunks(3) {
+            if let Some(chunk) = live.push(part)? {
+                assert_eq!(chunk.first_frame(), live_position);
+                live_position = chunk.end_frame();
+                for (out, channel) in live_channels.iter_mut().zip(chunk.audio().channels()) {
+                    out.extend_from_slice(channel.samples());
+                }
+            }
+        }
+        live.finish()?;
+        assert_eq!(file_position, 4);
+        assert_eq!(live_position, 4);
+        assert_eq!(file_channels, expected);
+        assert_eq!(live_channels, expected);
+        Ok(())
+    }
 
     fn pcm16_wav(samples: &[i16], sample_rate: u32) -> Result<Vec<u8>, String> {
         let data_length = samples

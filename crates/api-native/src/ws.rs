@@ -63,9 +63,9 @@ impl EmitMode {
 }
 
 #[derive(Clone, Debug)]
-struct StreamQuery {
+struct StreamQuery<F = SampleFormat> {
     rate: SampleRate,
-    format: SampleFormat,
+    format: F,
     channels: usize,
     emit: EmitMode,
     config: StreamConfig,
@@ -82,8 +82,12 @@ struct StreamDefaults {
     backchannel_max_sec: f32,
 }
 
-impl StreamQuery {
-    fn parse(raw: Option<&str>, defaults: StreamDefaults) -> Result<Self, String> {
+impl<F> StreamQuery<F> {
+    fn parse_with(
+        raw: Option<&str>,
+        defaults: StreamDefaults,
+        select_decoder: impl FnOnce(Option<&str>) -> Result<F, String>,
+    ) -> Result<Self, String> {
         let parameters = QueryParameters::parse(raw)?;
         parameters.reject_unknown(&[
             "model",
@@ -124,10 +128,7 @@ impl StreamQuery {
         }
         let rate = SampleRate::new(rate)?;
         RatePair::new(rate, defaults.stream_base.sample_rate())?;
-        let format = match parameters.get("fmt") {
-            None => SampleFormat::Pcm16,
-            Some(value) => SampleFormat::parse(value)?,
-        };
+        let format = select_decoder(parameters.get("fmt"))?;
         let channels = match parameters.get("channels") {
             None => 1,
             Some(value) => value
@@ -565,13 +566,14 @@ pub(crate) async fn stream(
         );
     }
     let defaults = service.defaults();
-    let query = match StreamQuery::parse(
+    let query = match StreamQuery::parse_with(
         query_text.as_deref(),
         StreamDefaults {
             stream_base: defaults.stream_base,
             dedup_default: defaults.dedup_default,
             backchannel_max_sec: defaults.backchannel_max_sec,
         },
+        |selector| service.audio_decoder(selector),
     ) {
         Ok(query) => query,
         Err(error) => {
