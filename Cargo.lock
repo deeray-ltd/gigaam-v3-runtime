@@ -1043,8 +1043,6 @@ dependencies = [
 [[package]]
 name = "symphonia-codec-vorbis"
 version = "0.6.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "73d90b4fcf796137cc683c538282804ff9629f8ad9dbfd881fcbba331ac4e986"
 dependencies = [
  "log",
  "symphonia-common",
