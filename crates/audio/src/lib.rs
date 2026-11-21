@@ -16,6 +16,7 @@
 mod channel_analysis;
 mod codecs;
 mod contracts;
+mod decoded_input;
 mod dispatch;
 mod fft;
 mod frontend;
@@ -30,6 +31,7 @@ pub use contracts::{
     ChannelAudio, ChannelAudioView, ChannelCount, DecodedAudio, EncodedAudio, FeatureMatrix,
     FeatureMatrixView, FrontendMode, SampleFormat, SampleRate,
 };
+pub use decoded_input::{AudioMetadata, DecodedChunk, FileDecoder, RawDecoder};
 pub use dispatch::{load, load_bytes, read_wav};
 pub use frontend::{FrontendProcessor, FrontendScratch};
 pub use interleaved::{InterleavedFrameDecoder, decode_samples};

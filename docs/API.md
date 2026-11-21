@@ -97,12 +97,17 @@ minimum frontend window geometry still applies to very short groups. One native 
 reused sequentially across its selected channels; no shared VAD worker or session pool is
 introduced.
 
-The body must be nonempty. Decoded source audio must have a rate in 4000 through 192000 Hz
+The body must be nonempty. IEEE-float WAV samples must be finite; values outside
+`[-1, 1]` are preserved. Decoded source audio must have a rate in 4000 through 192000 Hz
 and at least one channel. Within that range, a rate is accepted only when its ratio to the
 model rate, reduced to lowest terms, stays within 1000 on both sides; other rates refuse
 with an explicit message. The service resamples accepted input to the model rate. The
 channel policy is selected from the output request: ordinary text is a single-output
 workflow; split channels or requested turns selects the separate-channel workflow.
+
+Decoded input positions count emitted sample frames from zero after format-defined
+trimming. A skipped undecodable packet contributes no frames; container presentation
+timestamps and gaps do not extend this decoded sample clock.
 
 Every usable request gets an x-request-id response header. A supplied value must be
 nonempty visible ASCII text; otherwise the service returns 400. If absent, the service
@@ -115,7 +120,7 @@ Every successful response contains:
 | Field | Meaning |
 | --- | --- |
 | duration_sec | Input duration, projected to two decimal places. |
-| sample_rate_in | Decoded input sample rate in Hz. |
+| sample_rate_in | Decoded source sample rate in Hz, before conversion to the model rate. Opus uses its 48 kHz reference clock. |
 | channels | Number of source channels. |
 | dual_mono | Whether duplicate-channel classification collapsed a dual-mono source. |
 | model | ctc or rnnt. |

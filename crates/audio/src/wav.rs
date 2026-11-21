@@ -10,11 +10,13 @@
 //! Strict RIFF/WAV container traversal and decoding.
 
 use crate::contracts::{ChannelAudio, ChannelCount, DecodedAudio, SampleRate};
-use crate::g711;
+use crate::{AudioMetadata, g711};
 use gigaam_primitives::{i32_to_f32, u32_to_usize};
 
 const RIFF_HEADER_LENGTH: usize = 12;
-const CHUNK_HEADER_LENGTH: usize = 8;
+use std::io::{Cursor, Read, Seek, SeekFrom};
+
+const CHUNK_HEADER_LENGTH: u64 = 8;
 const PCM_TAG: u16 = 1;
 const IEEE_FLOAT_TAG: u16 = 3;
 const ALAW_TAG: u16 = 6;
@@ -204,78 +206,122 @@ fn decode_wav_sample(format: WavFormat, sample: &[u8]) -> Result<f32, String> {
     }
 }
 
-/// Parses exactly one unambiguous complete RIFF/WAV payload.
-pub fn parse_wav(bytes: &[u8]) -> Result<DecodedAudio, String> {
-    if !is_riff_wave(bytes) {
-        return Err("input is not RIFF/WAVE".into());
-    }
-    let declared_size = u32_to_usize(u32_at(bytes, 4, "RIFF size")?)
-        .map_err(|error| format!("RIFF size: {error}"))?;
-    let actual_size = bytes
-        .len()
-        .checked_sub(8)
-        .ok_or_else(|| "RIFF input is shorter than its header".to_owned())?;
-    if declared_size != actual_size {
-        return Err(format!(
-            "RIFF size {declared_size} does not match payload size {actual_size}"
-        ));
+pub(crate) struct WavReader<R> {
+    reader: R,
+    format: WavFormat,
+    remaining_bytes: usize,
+}
+
+impl<R: Read + Seek> WavReader<R> {
+    pub(crate) fn open(mut reader: R) -> Result<Self, String> {
+        let length = reader.seek(SeekFrom::End(0)).map_err(wav_io)?;
+        reader.rewind().map_err(wav_io)?;
+        let mut header = [0; RIFF_HEADER_LENGTH];
+        if length < 12 {
+            return Err("input is not RIFF/WAVE".into());
+        }
+        reader.read_exact(&mut header).map_err(wav_io)?;
+        if !is_riff_wave(&header) {
+            return Err("input is not RIFF/WAVE".into());
+        }
+        let declared_size = u64::from(u32_at(&header, 4, "RIFF size")?);
+        let actual_size = length - 8;
+        if declared_size != actual_size {
+            return Err(format!(
+                "RIFF size {declared_size} does not match payload size {actual_size}"
+            ));
+        }
+
+        let (mut position, mut format, mut data) = (12_u64, None, None);
+        while position < length {
+            if length - position < CHUNK_HEADER_LENGTH {
+                return Err("RIFF chunk header: truncated input".into());
+            }
+            reader.seek(SeekFrom::Start(position)).map_err(wav_io)?;
+            let mut chunk_header = [0; 8];
+            reader.read_exact(&mut chunk_header).map_err(wav_io)?;
+            let body_size = u32_at(&chunk_header, 4, "RIFF chunk size")?;
+            let body_start = position + CHUNK_HEADER_LENGTH;
+            let body_end = body_start + u64::from(body_size);
+            if body_end > length {
+                return Err("RIFF chunk body: truncated input".into());
+            }
+            position = body_end + u64::from(body_size % 2);
+            if position > length {
+                return Err("RIFF chunk padding is truncated".into());
+            }
+            match &chunk_header[..4] {
+                b"fmt " => {
+                    if format.is_some() {
+                        return Err("RIFF/WAV contains duplicate fmt chunks".into());
+                    }
+                    let mut body = [0; 40];
+                    let fields = u32_to_usize(body_size.min(40))
+                        .map_err(|error| format!("WAV fmt size: {error}"))?;
+                    reader.read_exact(&mut body[..fields]).map_err(wav_io)?;
+                    format = Some(parse_format(&body[..fields])?);
+                }
+                b"data" => {
+                    if data.is_some() {
+                        return Err("RIFF/WAV contains duplicate data chunks".into());
+                    }
+                    data = Some((body_start, body_size));
+                }
+                _ => {}
+            }
+        }
+        let format = format.ok_or_else(|| "RIFF/WAV fmt chunk is missing".to_owned())?;
+        let (data_start, data_size) =
+            data.ok_or_else(|| "RIFF/WAV data chunk is missing".to_owned())?;
+        let remaining_bytes =
+            u32_to_usize(data_size).map_err(|error| format!("RIFF data size: {error}"))?;
+        if remaining_bytes == 0 {
+            return Err("RIFF/WAV data chunk must not be empty".into());
+        }
+        if !remaining_bytes.is_multiple_of(format.block_align) {
+            return Err("RIFF/WAV data ends with an incomplete terminal frame".into());
+        }
+        reader.seek(SeekFrom::Start(data_start)).map_err(wav_io)?;
+        Ok(Self {
+            reader,
+            format,
+            remaining_bytes,
+        })
     }
 
-    let (mut position, mut format, mut data) = (RIFF_HEADER_LENGTH, None, None);
-    while position < bytes.len() {
-        let header = range(bytes, position, CHUNK_HEADER_LENGTH, "RIFF chunk header")?;
-        let identifier = header
-            .get(0..4)
-            .ok_or_else(|| "RIFF chunk identifier is truncated".to_owned())?;
-        let body_size = u32_to_usize(u32::from_le_bytes(
-            header
-                .get(4..8)
-                .ok_or_else(|| "RIFF chunk size is truncated".to_owned())?
-                .try_into()
-                .map_err(|_| "RIFF chunk size has invalid width".to_owned())?,
-        ))
-        .map_err(|error| format!("RIFF chunk size: {error}"))?;
-        let body_start = position
-            .checked_add(CHUNK_HEADER_LENGTH)
-            .ok_or_else(|| "RIFF chunk body offset overflows usize".to_owned())?;
-        let body = range(bytes, body_start, body_size, "RIFF chunk body")?;
-        let padding = body_size % 2;
-        let next_position = body_start
-            .checked_add(body_size)
-            .and_then(|value| value.checked_add(padding))
-            .ok_or_else(|| "RIFF chunk end overflows usize".to_owned())?;
-        if next_position > bytes.len() {
-            return Err("RIFF chunk padding is truncated".into());
+    pub(crate) fn metadata(&self) -> AudioMetadata {
+        AudioMetadata::new(self.format.sample_rate, self.format.channels)
+    }
+
+    pub(crate) fn next_audio(&mut self, max_frames: usize) -> Result<Option<DecodedAudio>, String> {
+        if self.remaining_bytes == 0 {
+            return Ok(None);
         }
-        match identifier {
-            b"fmt " => {
-                if format.is_some() {
-                    return Err("RIFF/WAV contains duplicate fmt chunks".into());
-                }
-                format = Some(parse_format(body)?);
-            }
-            b"data" => {
-                if data.is_some() {
-                    return Err("RIFF/WAV contains duplicate data chunks".into());
-                }
-                data = Some(body);
-            }
-            _ => {}
-        }
-        position = next_position;
+        // Limit bytes in the read buffer even for unusual validated channel counts.
+        let buffer_frames = (64 * 1024 / self.format.block_align).max(1);
+        let frames = (self.remaining_bytes / self.format.block_align)
+            .min(max_frames)
+            .min(buffer_frames);
+        let bytes = frames * self.format.block_align;
+        let mut data = vec![0; bytes];
+        self.reader.read_exact(&mut data).map_err(wav_io)?;
+        self.remaining_bytes -= bytes;
+        decode_frames(self.format, &data, frames).map(Some)
     }
-    let format = format.ok_or_else(|| "RIFF/WAV fmt chunk is missing".to_owned())?;
-    let data = data.ok_or_else(|| "RIFF/WAV data chunk is missing".to_owned())?;
-    if data.is_empty() {
-        return Err("RIFF/WAV data chunk must not be empty".into());
-    }
-    if !data.len().is_multiple_of(format.block_align) {
-        return Err("RIFF/WAV data ends with an incomplete terminal frame".into());
-    }
-    let frames = data.len() / format.block_align;
-    if frames == 0 {
-        return Err("RIFF/WAV data contains no complete frames".into());
-    }
+}
+
+fn wav_io(error: std::io::Error) -> String {
+    format!("RIFF/WAV I/O: {error}")
+}
+
+/// Parses exactly one unambiguous complete RIFF/WAV payload.
+pub fn parse_wav(bytes: &[u8]) -> Result<DecodedAudio, String> {
+    let mut reader = WavReader::open(Cursor::new(bytes))?;
+    let metadata = reader.metadata();
+    crate::decoded_input::collect_audio(metadata, || reader.next_audio(usize::MAX))
+}
+
+fn decode_frames(format: WavFormat, data: &[u8], frames: usize) -> Result<DecodedAudio, String> {
     let bytes_per_sample = format.block_align / format.channels.get();
     let mut samples = Vec::new();
     samples
