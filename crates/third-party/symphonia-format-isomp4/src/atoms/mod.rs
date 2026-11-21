@@ -621,6 +621,11 @@ impl<R: ReadAtom> AtomIterator<R> {
         self.defer_sample_sizes = self.len.is_some();
     }
 
+    /// Seekable batch mode does not expose user metadata to the transcription caller.
+    pub(crate) fn omit_user_metadata(&self) -> bool {
+        self.defer_sample_sizes
+    }
+
     pub(crate) fn fixed_table_position(&self, bytes: u64) -> Result<Option<u64>> {
         if !self.defer_sample_sizes {
             return Ok(None);

@@ -17,6 +17,7 @@ members = [
 exclude = [
     "crates/third-party/symphonia-format-isomp4",
     "crates/third-party/symphonia-format-mkv",
+    "crates/third-party/symphonia-format-ogg",
 ]
 resolver = "3"
 
@@ -35,3 +36,4 @@ lto = "thin"
 [patch.crates-io]
 symphonia-format-isomp4 = { path = "crates/third-party/symphonia-format-isomp4" }
 symphonia-format-mkv = { path = "crates/third-party/symphonia-format-mkv" }
+symphonia-format-ogg = { path = "crates/third-party/symphonia-format-ogg" }

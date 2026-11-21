@@ -4,6 +4,7 @@
 
 mod batch_probe;
 mod codecs;
+mod flac_audio;
 mod id3v2;
 pub use codecs::decode_bytes;
 use gigaam_audio::{AudioFile, FileDecoder, FileDecoderProvider, FileFormatMatch};
