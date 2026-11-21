@@ -101,6 +101,7 @@ COPY crates/third-party/symphonia-format-mkv/LICENSE crates/third-party/symphoni
 COPY crates/third-party/symphonia-format-isomp4/LICENSE crates/third-party/symphonia-format-isomp4/SOURCE.md /usr/share/licenses/gigaam-v3-runtime/symphonia-format-isomp4/
 COPY crates/third-party/symphonia-codec-vorbis/LICENSE crates/third-party/symphonia-codec-vorbis/SOURCE.md /usr/share/licenses/gigaam-v3-runtime/symphonia-codec-vorbis/
 COPY crates/third-party/symphonia-format-riff/LICENSE crates/third-party/symphonia-format-riff/SOURCE.md /usr/share/licenses/gigaam-v3-runtime/symphonia-format-riff/
+COPY crates/third-party/symphonia-common/LICENSE crates/third-party/symphonia-common/SOURCE.md /usr/share/licenses/gigaam-v3-runtime/symphonia-common/
 COPY crates/model-package/licenses/sentencepiece/ /usr/share/licenses/gigaam-v3-runtime/sentencepiece/
 
 ENV ASR_ENCODER_EP=tensorrt \

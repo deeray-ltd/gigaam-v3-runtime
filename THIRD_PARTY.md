@@ -95,6 +95,9 @@ identifies the MPL-2.0 source used by the build.
 The [symphonia-format-riff source record](crates/third-party/symphonia-format-riff/SOURCE.md)
 identifies the MPL-2.0 source used by the build.
 
+The [symphonia-common source record](crates/third-party/symphonia-common/SOURCE.md)
+identifies the MPL-2.0 source used by the build.
+
 ## Attribution
 
 The GPLv3 and LGPLv3 texts in [COPYING](COPYING) and
