@@ -21,8 +21,8 @@ use crate::dialog::{BackchannelPolicy, DialogMerger};
 use crate::stream::{StreamSession, StreamSetup};
 use crate::turns::TurnGap;
 use gigaam_audio::{
-    ChannelAudio, ChannelAudioView, ChannelCount, InterleavedFrameDecoder, RatePair, Resampler,
-    ResamplerConfig, SampleFormat, SampleRate, StreamResampler,
+    ChannelAudio, ChannelAudioView, ChannelCount, RatePair, RawDecoder, Resampler, ResamplerConfig,
+    SampleFormat, SampleRate, StreamResampler,
 };
 use gigaam_recognition::{SpeechProbabilityDetector, WindowDecoder};
 use std::cmp::Ordering;
@@ -683,7 +683,7 @@ fn dialogue_order(left: &DialogTurn, right: &DialogTurn) -> Ordering {
 
 /// Owns the complete online multi-channel transcription lifecycle from raw frames to dialogue.
 pub struct MultiChannelSession<D: WindowDecoder, V: SpeechProbabilityDetector> {
-    decoder: Option<InterleavedFrameDecoder>,
+    decoder: Option<RawDecoder>,
     source_channels: SourceChannelCount,
     candidates: Vec<OnlineCandidate<D, V>>,
     lifecycle: OnlineLifecycle,
@@ -744,8 +744,9 @@ impl<D: WindowDecoder, V: SpeechProbabilityDetector> MultiChannelSession<D, V> {
     where
         F: StreamChannelFactory<Decoder = D, Detector = V>,
     {
-        let decoder = InterleavedFrameDecoder::new(
+        let decoder = RawDecoder::new(
             setup.sample_format,
+            setup.rate_pair.input(),
             ChannelCount::new(setup.source_channels.get())?,
         )?;
         let lifecycle = match setup.options.channel_policy() {
@@ -804,12 +805,13 @@ impl<D: WindowDecoder, V: SpeechProbabilityDetector> MultiChannelSession<D, V> {
                 ));
             }
         };
-        let Some(channels) = decoded else {
+        let Some(chunk) = decoded else {
             return Ok(MultiChannelStep {
                 emission_groups: Vec::new(),
                 observations,
             });
         };
+        let (_, channels) = chunk.into_audio().into_parts();
         let result = match self.buffering_parameters() {
             Some((threshold, analysis_window)) => {
                 self.push_buffered(channels, threshold, analysis_window, &mut observations)

@@ -47,7 +47,7 @@ mod native_http;
 mod openai_http;
 
 use gigaam_audio::{
-    ChannelAudio, ChannelAudioView, DecodedAudio, EncodedAudio, load_bytes, resample_audio,
+    ChannelAudio, ChannelAudioView, DecodedAudio, EncodedAudio, FileDecoder, resample_audio,
 };
 use gigaam_recognition::{ExecutionControl, ExecutionState, SpeechProbabilityDetector};
 use gigaam_transcription::{
@@ -619,7 +619,10 @@ fn run_batch<D: SpeechProbabilityDetector>(
     }
     let loaded = progress.stage(BatchStage::AudioDecode, || {
         let encoded = EncodedAudio::new(audio, extension).map_err(TranscribeError::BadRequest)?;
-        load_bytes(encoded).map_err(|error| TranscribeError::BadRequest(error.to_string()))
+        let mut decoder = FileDecoder::open(encoded).map_err(TranscribeError::BadRequest)?;
+        decoder
+            .collect_remaining()
+            .map_err(TranscribeError::BadRequest)
     })?;
     let source_rate = loaded.sample_rate().hertz();
     if !(4000..=192000).contains(&source_rate) {
