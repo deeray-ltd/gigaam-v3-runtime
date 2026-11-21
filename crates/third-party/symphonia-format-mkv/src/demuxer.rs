@@ -9,6 +9,7 @@ use std::collections::{HashMap, VecDeque};
 use std::convert::TryFrom;
 use std::num::NonZero;
 
+use symphonia_core::codecs::audio::well_known::CODEC_ID_VORBIS;
 use symphonia_core::errors::{Error, Result, SeekErrorKind, seek_error, unsupported_error};
 use symphonia_core::formats::prelude::*;
 use symphonia_core::formats::probe::{ProbeFormatData, ProbeableFormat, Score, Scoreable};
@@ -66,6 +67,7 @@ pub struct MkvReader<'s> {
     defer_blocks: bool,
     selected_track: Option<u32>,
     batch_pcm: Option<BatchPcm>,
+    batch_vorbis_prefix_len: Option<u64>,
     pending_pcm: Option<PendingPcm>,
 }
 
@@ -107,7 +109,8 @@ impl<'s> MkvReader<'s> {
             _ => (),
         }
 
-        let mut it = EbmlIterator::new(mss, MkvSchema, total_len);
+        let defer_blocks = is_seekable && !retain_cues && total_len.is_some();
+        let mut it = EbmlIterator::new(mss, MkvSchema, total_len, defer_blocks);
 
         // Read the EBML header.
         let ebml = it.next_element::<EbmlHeaderElement>()?;
@@ -349,7 +352,7 @@ impl<'s> MkvReader<'s> {
 
             tr.with_flags(track.flags);
 
-            if let Some(codec_params) = make_track_codec_params(track)? {
+            if let Some(codec_params) = make_track_codec_params(track, &mut it)? {
                 tr.with_codec_params(codec_params);
             }
 
@@ -379,9 +382,10 @@ impl<'s> MkvReader<'s> {
             current_cluster,
             frames: VecDeque::new(),
             frame_ranges: VecDeque::new(),
-            defer_blocks: is_seekable && !retain_cues && total_len.is_some(),
+            defer_blocks,
             selected_track: None,
             batch_pcm: None,
+            batch_vorbis_prefix_len: None,
             pending_pcm: None,
         })
     }
@@ -397,6 +401,13 @@ impl<'s> MkvReader<'s> {
         if selected.id != track_id {
             return Err(Error::DecodeError("mkv: requested batch track is not selected"));
         }
+        self.batch_vorbis_prefix_len = selected
+            .codec_params
+            .as_ref()
+            .and_then(|params| params.audio())
+            .filter(|params| params.codec == CODEC_ID_VORBIS)
+            .and_then(|params| params.extra_data.as_deref())
+            .and_then(crate::vorbis::audio_packet_prefix_len);
         self.selected_track = Some(track_id);
         Ok(())
     }
@@ -808,7 +819,9 @@ impl FormatReader for MkvReader<'_> {
                         return self.next_pcm_packet().map(Some);
                     }
                 }
-                let size = usize::try_from(frame.len).map_err(|_| Error::DecodeError("mkv: frame too large"))?;
+                let prefix_len = frame.len.min(self.batch_vorbis_prefix_len.unwrap_or(frame.len));
+                let size = usize::try_from(prefix_len)
+                    .map_err(|_| Error::DecodeError("mkv: frame too large"))?;
                 let data = self.iter.with_binary_range(frame.start, frame.len, |mut reader| {
                     use symphonia_core::io::ReadBytes;
                     Ok(reader.read_boxed_slice_exact(size)?)

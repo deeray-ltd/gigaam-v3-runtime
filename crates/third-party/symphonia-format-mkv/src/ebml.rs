@@ -5,7 +5,8 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-use std::io::SeekFrom;
+use std::io::{Seek, SeekFrom};
+use std::ops::Range;
 
 use symphonia_core::io::{MediaSource, ReadBytes, SeekBuffered};
 use symphonia_core::util::bits::sign_extend_leq64_to_i64;
@@ -60,9 +61,8 @@ impl From<std::io::Error> for EbmlError {
 
 pub type Result<T> = std::result::Result<T, EbmlError>;
 
-/// A super-trait of `ReadBytes` and `SeekBuffered` that all readers of `EbmlIterator` must
-/// implement.
-pub(crate) trait ReadEbml: ReadBytes + SeekBuffered {}
+/// The I/O traits that all readers of `EbmlIterator` must implement.
+pub(crate) trait ReadEbml: ReadBytes + SeekBuffered + Seek {}
 
 /// EBML data types.
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
@@ -274,6 +274,12 @@ pub(crate) struct EbmlIteratorState<S: EbmlSchema> {
     pos: u64,
 }
 
+#[derive(Debug)]
+pub(crate) enum BinaryData {
+    Inline(Box<[u8]>),
+    Source(Range<u64>),
+}
+
 /// An EBML document iterator supporting hierarchical traversal.
 pub(crate) struct EbmlIterator<R: ReadEbml, S: EbmlSchema> {
     /// The inner reader.
@@ -286,13 +292,15 @@ pub(crate) struct EbmlIterator<R: ReadEbml, S: EbmlSchema> {
     current: Option<EbmlElementHeader<S>>,
     /// The length of the container, if known.
     len: Option<u64>,
+    /// Whether opt-in binary reads may retain a range in the seekable source.
+    defer_binary: bool,
 }
 
 impl<R: ReadEbml, S: EbmlSchema> EbmlIterator<R, S> {
-    pub(crate) fn new(reader: R, schema: S, len: Option<u64>) -> Self {
+    pub(crate) fn new(reader: R, schema: S, len: Option<u64>, defer_binary: bool) -> Self {
         // Pre-allocate the iteration stack.
         let stack = Vec::with_capacity(S::MAX_DEPTH);
-        Self { reader, schema, stack, current: None, len }
+        Self { reader, schema, stack, current: None, len, defer_binary }
     }
 
     /// Get a reference to the schema being used by the EBML reader.
@@ -833,26 +841,59 @@ impl<R: ReadEbml, S: EbmlSchema> EbmlIterator<R, S> {
         Ok(self.read_string()?.unwrap_or_default())
     }
 
+    fn seek_exact(&mut self, pos: u64) -> Result<()> {
+        if self.reader.seek_buffered(pos) != pos && self.reader.seek(SeekFrom::Start(pos))? != pos {
+            return Err(EbmlError::SeekOutOfRange);
+        }
+        Ok(())
+    }
+
     pub(crate) fn with_binary_range<T>(
-        &mut self, start: u64, len: u64,
+        &mut self,
+        start: u64,
+        len: u64,
         f: impl FnOnce(symphonia_core::io::ScopedStream<&mut R>) -> symphonia_core::errors::Result<T>,
-    ) -> symphonia_core::errors::Result<T>
-    where R: MediaSource {
+    ) -> symphonia_core::errors::Result<T> {
         let end = start.checked_add(len).ok_or(EbmlError::SeekOutOfRange)?;
         if self.len.is_none_or(|length| end > length) {
             return Err(EbmlError::SeekOutOfRange.into());
         }
         let saved = self.reader.pos();
-        if self.reader.seek_buffered(start) != start {
-            self.reader.seek(SeekFrom::Start(start))?;
-        }
+        self.seek_exact(start)?;
         let value = f(symphonia_core::io::ScopedStream::new(&mut self.reader, len));
-        let restored = if self.reader.seek_buffered(saved) != saved {
-            self.reader.seek(SeekFrom::Start(saved)).map(|_| ())
-        } else { Ok(()) };
+        let restored = self.seek_exact(saved);
         let value = value?;
         restored?;
         Ok(value)
+    }
+
+    /// Retain the current binary element as a source range when deferred reads are enabled.
+    pub(crate) fn read_binary_or_range(&mut self) -> Result<BinaryData> {
+        if !self.defer_binary {
+            return self.read_binary().map(BinaryData::Inline);
+        }
+
+        let header = self.current_or_err()?;
+        if header.element_info.ok_or(EbmlError::UnknownElement)?.data_type() != EbmlDataType::Binary {
+            return Err(EbmlError::UnexpectedElementDataType);
+        }
+        let start = self.reader.pos();
+        let size = header.data_size.ok_or(EbmlError::UnknownElementDataSize)?;
+        let end = start.checked_add(size).ok_or(EbmlError::SeekOutOfRange)?;
+        if self.len.is_none_or(|length| end > length) {
+            return Err(EbmlError::SeekOutOfRange);
+        }
+        let parent_range =
+            self.parent().and_then(|parent| parent.size().map(|size| (parent.pos(), size)));
+        if let Some((pos, size)) = parent_range {
+            let parent_end = pos.checked_add(size).ok_or(EbmlError::SeekOutOfRange)?;
+            if end > parent_end {
+                return Err(EbmlError::Overrun);
+            }
+        }
+        self.seek_exact(end)?;
+        self.discard_current();
+        Ok(BinaryData::Source(start..end))
     }
 
     /// Read a boxed slice of the binary data carried by a binary element.
