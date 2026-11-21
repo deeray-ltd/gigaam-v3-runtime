@@ -72,6 +72,8 @@ COPY --from=ort /opt/ort/LICENSE /usr/share/licenses/gigaam-v3-runtime/onnxrunti
 COPY --from=ort /opt/ort/ThirdPartyNotices.txt /usr/share/licenses/gigaam-v3-runtime/onnxruntime/ThirdPartyNotices.txt
 COPY COPYING COPYING.LESSER THIRD_PARTY.md /usr/share/licenses/gigaam-v3-runtime/
 COPY crates/service/licenses/rust/ /usr/share/licenses/gigaam-v3-runtime/rust/
+COPY crates/third-party/symphonia-format-mkv/LICENSE crates/third-party/symphonia-format-mkv/SOURCE.md /usr/share/licenses/gigaam-v3-runtime/symphonia-format-mkv/
+COPY crates/third-party/symphonia-format-isomp4/LICENSE crates/third-party/symphonia-format-isomp4/SOURCE.md /usr/share/licenses/gigaam-v3-runtime/symphonia-format-isomp4/
 COPY crates/model-package/licenses/sentencepiece/ /usr/share/licenses/gigaam-v3-runtime/sentencepiece/
 
 ENV ASR_ENCODER_EP=cuda \

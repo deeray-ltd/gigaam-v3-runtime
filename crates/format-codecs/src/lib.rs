@@ -2,7 +2,9 @@
 // Copyright (C) 2026 Yuriy Krasilnikov
 // Copyright (C) 2026 Deeray Ltd.
 
+mod batch_probe;
 mod codecs;
+mod id3v2;
 pub use codecs::decode_bytes;
 use gigaam_audio::{AudioFile, FileDecoder, FileDecoderProvider, FileFormatMatch};
 

@@ -14,9 +14,9 @@ locked Cargo metadata and checksum-verified local registry crate archives.
 - Selection: normal non-dev dependency edges only. Packages whose only library target
   is a procedural macro are excluded because their code is executed during compilation,
   not statically linked into `asr-serve`.
-- Registry packages: 104; the three selected closures are identical.
-- Cargo.lock SHA-256: `8f332a5bb9730f1f0926859ee401a4c99ecfa9876a662e0333cf0d057945ddc8`.
-- Closure SHA-256: `5f4b03f99ebe49d57a2a226986bf31e2d1e1669cd522d783b35faffece19b739`.
+- Registry packages: 102; the three selected closures are identical.
+- Cargo.lock SHA-256: `36f08d568f3bb5fcede8bccb808c1eb140200ed9cfab092604858fdeb75f28c8`.
+- Closure SHA-256: `561d01a1787a8e99da8e04979eb1e9ae9ad7f24d7942ad734d758246fe790986`.
 - Project workspace code is covered by the parent `COPYING` and `COPYING.LESSER` files.
 
 ## Package records
@@ -31,16 +31,6 @@ locked Cargo metadata and checksum-verified local registry crate archives.
   - `LICENSE-0BSD`: `texts/861399f8c21c042b110517e76dc6b63a2b334276c8cf17412fc3c8908ca8dc17.txt` (SHA-256 `861399f8c21c042b110517e76dc6b63a2b334276c8cf17412fc3c8908ca8dc17`).
   - `LICENSE-APACHE`: `texts/8ada45cd9f843acf64e4722ae262c622a2b3b3007c7310ef36ac1061a30f6adb.txt` (SHA-256 `8ada45cd9f843acf64e4722ae262c622a2b3b3007c7310ef36ac1061a30f6adb`).
   - `LICENSE-MIT`: `texts/23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3.txt` (SHA-256 `23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3`).
-
-### `arrayvec` 0.7.8
-- License expression: `MIT OR Apache-2.0`.
-- Locked crate archive SHA-256: `d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56`.
-- Source archive: `https://static.crates.io/crates/arrayvec/arrayvec-0.7.8.crate`.
-- Repository declared by package metadata: `https://github.com/bluss/arrayvec`.
-- Authors declared by package metadata: `bluss`.
-- Packaged license, permission, and copyright notices:
-  - `LICENSE-APACHE`: `texts/a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2.txt` (SHA-256 `a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2`).
-  - `LICENSE-MIT`: `texts/4da95ec4ecb65b738d470b7d762894ad9c97da93e6cbfb18b570fc2c96f4b871.txt` (SHA-256 `4da95ec4ecb65b738d470b7d762894ad9c97da93e6cbfb18b570fc2c96f4b871`).
 
 ### `atomic-waker` 1.1.2
 - License expression: `Apache-2.0 OR MIT`.
@@ -79,10 +69,10 @@ locked Cargo metadata and checksum-verified local registry crate archives.
   - `LICENSE-APACHE`: `texts/a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2.txt` (SHA-256 `a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2`).
   - `LICENSE-MIT`: `texts/0dd882e53de11566d50f8e8e2d5a651bcf3fabee4987d70f306233cf39094ba7.txt` (SHA-256 `0dd882e53de11566d50f8e8e2d5a651bcf3fabee4987d70f306233cf39094ba7`).
 
-### `bitflags` 1.3.2
-- License expression: `MIT/Apache-2.0`.
-- Locked crate archive SHA-256: `bef38d45163c2f1dde094a7dfd33ccf595c92905c8f8f4fdc18d06fb1037718a`.
-- Source archive: `https://static.crates.io/crates/bitflags/bitflags-1.3.2.crate`.
+### `bitflags` 2.13.2
+- License expression: `MIT OR Apache-2.0`.
+- Locked crate archive SHA-256: `3ded4057c258ba199e2d26386d3af3780957ecaee6c4ef4041c6b4b8b97c0b06`.
+- Source archive: `https://static.crates.io/crates/bitflags/bitflags-2.13.2.crate`.
 - Repository declared by package metadata: `https://github.com/bitflags/bitflags`.
 - Authors declared by package metadata: `The Rust Project Developers`.
 - Packaged license, permission, and copyright notices:
@@ -695,6 +685,16 @@ locked Cargo metadata and checksum-verified local registry crate archives.
   - `LICENSE-APACHE`: `texts/a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2.txt` (SHA-256 `a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2`).
   - `LICENSE-MIT`: `texts/7576269ea71f767b99297934c0b2367532690f8c4badc695edf8e04ab6a1e545.txt` (SHA-256 `7576269ea71f767b99297934c0b2367532690f8c4badc695edf8e04ab6a1e545`).
 
+### `regex-lite` 0.1.9
+- License expression: `MIT OR Apache-2.0`.
+- Locked crate archive SHA-256: `cab834c73d247e67f4fae452806d17d3c7501756d98c8808d7c9c7aa7d18f973`.
+- Source archive: `https://static.crates.io/crates/regex-lite/regex-lite-0.1.9.crate`.
+- Repository declared by package metadata: `https://github.com/rust-lang/regex`.
+- Authors declared by package metadata: `The Rust Project Developers`; `Andrew Gallant <jamslam@gmail.com>`.
+- Packaged license, permission, and copyright notices:
+  - `LICENSE-APACHE`: `texts/a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2.txt` (SHA-256 `a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2`).
+  - `LICENSE-MIT`: `texts/6485b8ed310d3f0340bf1ad1f47645069ce4069dcc6bb46c7d5c6faf41de1fdb.txt` (SHA-256 `6485b8ed310d3f0340bf1ad1f47645069ce4069dcc6bb46c7d5c6faf41de1fdb`).
+
 ### `scopeguard` 1.2.0
 - License expression: `MIT OR Apache-2.0`.
 - Locked crate archive SHA-256: `94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49`.
@@ -793,122 +793,115 @@ locked Cargo metadata and checksum-verified local registry crate archives.
   - `LICENSE-APACHE`: `texts/a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2.txt` (SHA-256 `a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2`).
   - `LICENSE-MIT`: `texts/378f5840b258e2779c39418f3f2d7b2ba96f1c7917dd6be0713f88305dbda397.txt` (SHA-256 `378f5840b258e2779c39418f3f2d7b2ba96f1c7917dd6be0713f88305dbda397`).
 
-### `symphonia` 0.5.5
+### `symphonia` 0.6.1
 - License expression: `MPL-2.0`.
-- Locked crate archive SHA-256: `5773a4c030a19d9bfaa090f49746ff35c75dfddfa700df7a5939d5e076a57039`.
-- Source archive: `https://static.crates.io/crates/symphonia/symphonia-0.5.5.crate`.
+- Locked crate archive SHA-256: `a7edef6a96b696d4e0cab5ee9ebb7ca155ed95f30a6b45bbb8b97d2727f02424`.
+- Source archive: `https://static.crates.io/crates/symphonia/symphonia-0.6.1.crate`.
 - Repository declared by package metadata: `https://github.com/pdeljanov/Symphonia`.
 - Authors declared by package metadata: `Philip Deljanov <philip.deljanov@gmail.com>`.
 - MPL-2.0 terms: `https://www.mozilla.org/MPL/2.0/`; obtain the checksum-bound source archive above.
-- The locked crate archive contains no standalone license or notice file; its metadata and source archive above are retained without inventing text.
+- Packaged license, permission, and copyright notices:
+  - `LICENSE`: `texts/c76f740d1521b9bed9ca7a04ad526c310493c62621b1341d623b431736533b30.txt` (SHA-256 `c76f740d1521b9bed9ca7a04ad526c310493c62621b1341d623b431736533b30`).
 
-### `symphonia-bundle-flac` 0.5.5
+### `symphonia-bundle-flac` 0.6.1
 - License expression: `MPL-2.0`.
-- Locked crate archive SHA-256: `c91565e180aea25d9b80a910c546802526ffd0072d0b8974e3ebe59b686c9976`.
-- Source archive: `https://static.crates.io/crates/symphonia-bundle-flac/symphonia-bundle-flac-0.5.5.crate`.
+- Locked crate archive SHA-256: `6405d5c34ff6f8f7ca08a4101efe66d21e180f7322ef9359900a0e55698a7892`.
+- Source archive: `https://static.crates.io/crates/symphonia-bundle-flac/symphonia-bundle-flac-0.6.1.crate`.
 - Repository declared by package metadata: `https://github.com/pdeljanov/Symphonia`.
 - Authors declared by package metadata: `Philip Deljanov <philip.deljanov@gmail.com>`.
 - MPL-2.0 terms: `https://www.mozilla.org/MPL/2.0/`; obtain the checksum-bound source archive above.
-- The locked crate archive contains no standalone license or notice file; its metadata and source archive above are retained without inventing text.
+- Packaged license, permission, and copyright notices:
+  - `LICENSE`: `texts/c76f740d1521b9bed9ca7a04ad526c310493c62621b1341d623b431736533b30.txt` (SHA-256 `c76f740d1521b9bed9ca7a04ad526c310493c62621b1341d623b431736533b30`).
 
-### `symphonia-bundle-mp3` 0.5.5
+### `symphonia-bundle-mp3` 0.6.1
 - License expression: `MPL-2.0`.
-- Locked crate archive SHA-256: `4872dd6bb56bf5eac799e3e957aa1981086c3e613b27e0ac23b176054f7c57ed`.
-- Source archive: `https://static.crates.io/crates/symphonia-bundle-mp3/symphonia-bundle-mp3-0.5.5.crate`.
+- Locked crate archive SHA-256: `98ea5ffc8716bff677dfb3b01b420c7b758de901a72b8c330bf2040ab74b4add`.
+- Source archive: `https://static.crates.io/crates/symphonia-bundle-mp3/symphonia-bundle-mp3-0.6.1.crate`.
 - Repository declared by package metadata: `https://github.com/pdeljanov/Symphonia`.
 - Authors declared by package metadata: `Philip Deljanov <philip.deljanov@gmail.com>`.
 - MPL-2.0 terms: `https://www.mozilla.org/MPL/2.0/`; obtain the checksum-bound source archive above.
-- The locked crate archive contains no standalone license or notice file; its metadata and source archive above are retained without inventing text.
+- Packaged license, permission, and copyright notices:
+  - `LICENSE`: `texts/c76f740d1521b9bed9ca7a04ad526c310493c62621b1341d623b431736533b30.txt` (SHA-256 `c76f740d1521b9bed9ca7a04ad526c310493c62621b1341d623b431736533b30`).
 
-### `symphonia-codec-aac` 0.5.5
+### `symphonia-codec-aac` 0.6.1
 - License expression: `MPL-2.0`.
-- Locked crate archive SHA-256: `4c263845aa86881416849c1729a54c7f55164f8b96111dba59de46849e73a790`.
-- Source archive: `https://static.crates.io/crates/symphonia-codec-aac/symphonia-codec-aac-0.5.5.crate`.
+- Locked crate archive SHA-256: `f5bf8e39552d34a3c4c98333370e62f48c92456d2e814f273b5c3ad7c4a5f45c`.
+- Source archive: `https://static.crates.io/crates/symphonia-codec-aac/symphonia-codec-aac-0.6.1.crate`.
 - Repository declared by package metadata: `https://github.com/pdeljanov/Symphonia`.
 - Authors declared by package metadata: `Philip Deljanov <philip.deljanov@gmail.com>`; `Kostya Shishkov <kostya.shiskov@gmail.com>`.
 - MPL-2.0 terms: `https://www.mozilla.org/MPL/2.0/`; obtain the checksum-bound source archive above.
-- The locked crate archive contains no standalone license or notice file; its metadata and source archive above are retained without inventing text.
+- Packaged license, permission, and copyright notices:
+  - `LICENSE`: `texts/c76f740d1521b9bed9ca7a04ad526c310493c62621b1341d623b431736533b30.txt` (SHA-256 `c76f740d1521b9bed9ca7a04ad526c310493c62621b1341d623b431736533b30`).
 
-### `symphonia-codec-pcm` 0.5.5
+### `symphonia-codec-pcm` 0.6.1
 - License expression: `MPL-2.0`.
-- Locked crate archive SHA-256: `4e89d716c01541ad3ebe7c91ce4c8d38a7cf266a3f7b2f090b108fb0cb031d95`.
-- Source archive: `https://static.crates.io/crates/symphonia-codec-pcm/symphonia-codec-pcm-0.5.5.crate`.
+- Locked crate archive SHA-256: `e04ba75686acbe43542fdd374571195f0530c0b7785ca25cc6840e9c6c4b6eea`.
+- Source archive: `https://static.crates.io/crates/symphonia-codec-pcm/symphonia-codec-pcm-0.6.1.crate`.
 - Repository declared by package metadata: `https://github.com/pdeljanov/Symphonia`.
 - Authors declared by package metadata: `Philip Deljanov <philip.deljanov@gmail.com>`.
 - MPL-2.0 terms: `https://www.mozilla.org/MPL/2.0/`; obtain the checksum-bound source archive above.
-- The locked crate archive contains no standalone license or notice file; its metadata and source archive above are retained without inventing text.
+- Packaged license, permission, and copyright notices:
+  - `LICENSE`: `texts/c76f740d1521b9bed9ca7a04ad526c310493c62621b1341d623b431736533b30.txt` (SHA-256 `c76f740d1521b9bed9ca7a04ad526c310493c62621b1341d623b431736533b30`).
 
-### `symphonia-codec-vorbis` 0.5.5
+### `symphonia-codec-vorbis` 0.6.1
 - License expression: `MPL-2.0`.
-- Locked crate archive SHA-256: `f025837c309cd69ffef572750b4a2257b59552c5399a5e49707cc5b1b85d1c73`.
-- Source archive: `https://static.crates.io/crates/symphonia-codec-vorbis/symphonia-codec-vorbis-0.5.5.crate`.
+- Locked crate archive SHA-256: `73d90b4fcf796137cc683c538282804ff9629f8ad9dbfd881fcbba331ac4e986`.
+- Source archive: `https://static.crates.io/crates/symphonia-codec-vorbis/symphonia-codec-vorbis-0.6.1.crate`.
 - Repository declared by package metadata: `https://github.com/pdeljanov/Symphonia`.
 - Authors declared by package metadata: `Philip Deljanov <philip.deljanov@gmail.com>`.
 - MPL-2.0 terms: `https://www.mozilla.org/MPL/2.0/`; obtain the checksum-bound source archive above.
-- The locked crate archive contains no standalone license or notice file; its metadata and source archive above are retained without inventing text.
+- Packaged license, permission, and copyright notices:
+  - `LICENSE`: `texts/c76f740d1521b9bed9ca7a04ad526c310493c62621b1341d623b431736533b30.txt` (SHA-256 `c76f740d1521b9bed9ca7a04ad526c310493c62621b1341d623b431736533b30`).
 
-### `symphonia-core` 0.5.5
+### `symphonia-common` 0.6.1
 - License expression: `MPL-2.0`.
-- Locked crate archive SHA-256: `ea00cc4f79b7f6bb7ff87eddc065a1066f3a43fe1875979056672c9ef948c2af`.
-- Source archive: `https://static.crates.io/crates/symphonia-core/symphonia-core-0.5.5.crate`.
+- Locked crate archive SHA-256: `2acc3fcc18ec9b8cdd48614e259c4cf0d27b71d41e5d9b120b42c5adab12d7c4`.
+- Source archive: `https://static.crates.io/crates/symphonia-common/symphonia-common-0.6.1.crate`.
 - Repository declared by package metadata: `https://github.com/pdeljanov/Symphonia`.
 - Authors declared by package metadata: `Philip Deljanov <philip.deljanov@gmail.com>`.
 - MPL-2.0 terms: `https://www.mozilla.org/MPL/2.0/`; obtain the checksum-bound source archive above.
-- The locked crate archive contains no standalone license or notice file; its metadata and source archive above are retained without inventing text.
+- Packaged license, permission, and copyright notices:
+  - `LICENSE`: `texts/c76f740d1521b9bed9ca7a04ad526c310493c62621b1341d623b431736533b30.txt` (SHA-256 `c76f740d1521b9bed9ca7a04ad526c310493c62621b1341d623b431736533b30`).
 
-### `symphonia-format-isomp4` 0.5.5
+### `symphonia-core` 0.6.1
 - License expression: `MPL-2.0`.
-- Locked crate archive SHA-256: `243739585d11f81daf8dac8d9f3d18cc7898f6c09a259675fc364b382c30e0a5`.
-- Source archive: `https://static.crates.io/crates/symphonia-format-isomp4/symphonia-format-isomp4-0.5.5.crate`.
+- Locked crate archive SHA-256: `01c412864d599d4750d0c3d684d7e093ec05e5309681ef5252cc1096a437f6e0`.
+- Source archive: `https://static.crates.io/crates/symphonia-core/symphonia-core-0.6.1.crate`.
 - Repository declared by package metadata: `https://github.com/pdeljanov/Symphonia`.
 - Authors declared by package metadata: `Philip Deljanov <philip.deljanov@gmail.com>`.
 - MPL-2.0 terms: `https://www.mozilla.org/MPL/2.0/`; obtain the checksum-bound source archive above.
-- The locked crate archive contains no standalone license or notice file; its metadata and source archive above are retained without inventing text.
+- Packaged license, permission, and copyright notices:
+  - `LICENSE`: `texts/c76f740d1521b9bed9ca7a04ad526c310493c62621b1341d623b431736533b30.txt` (SHA-256 `c76f740d1521b9bed9ca7a04ad526c310493c62621b1341d623b431736533b30`).
 
-### `symphonia-format-mkv` 0.5.5
+### `symphonia-format-ogg` 0.6.1
 - License expression: `MPL-2.0`.
-- Locked crate archive SHA-256: `122d786d2c43a49beb6f397551b4a050d8229eaa54c7ddf9ee4b98899b8742d0`.
-- Source archive: `https://static.crates.io/crates/symphonia-format-mkv/symphonia-format-mkv-0.5.5.crate`.
-- Repository declared by package metadata: `https://github.com/pdeljanov/Symphonia`.
-- Authors declared by package metadata: `Dariusz Niedoba <dariusz.niedoba@gmail.com>`.
-- MPL-2.0 terms: `https://www.mozilla.org/MPL/2.0/`; obtain the checksum-bound source archive above.
-- The locked crate archive contains no standalone license or notice file; its metadata and source archive above are retained without inventing text.
-
-### `symphonia-format-ogg` 0.5.5
-- License expression: `MPL-2.0`.
-- Locked crate archive SHA-256: `2b4955c67c1ed3aa8ae8428d04ca8397fbef6a19b2b051e73b5da8b1435639cb`.
-- Source archive: `https://static.crates.io/crates/symphonia-format-ogg/symphonia-format-ogg-0.5.5.crate`.
+- Locked crate archive SHA-256: `0b5495e7f7e3c7035328d82b6d6e377eef289bb0c4105bdeb557fc93a833f994`.
+- Source archive: `https://static.crates.io/crates/symphonia-format-ogg/symphonia-format-ogg-0.6.1.crate`.
 - Repository declared by package metadata: `https://github.com/pdeljanov/Symphonia`.
 - Authors declared by package metadata: `Philip Deljanov <philip.deljanov@gmail.com>`.
 - MPL-2.0 terms: `https://www.mozilla.org/MPL/2.0/`; obtain the checksum-bound source archive above.
-- The locked crate archive contains no standalone license or notice file; its metadata and source archive above are retained without inventing text.
+- Packaged license, permission, and copyright notices:
+  - `LICENSE`: `texts/c76f740d1521b9bed9ca7a04ad526c310493c62621b1341d623b431736533b30.txt` (SHA-256 `c76f740d1521b9bed9ca7a04ad526c310493c62621b1341d623b431736533b30`).
 
-### `symphonia-format-riff` 0.5.5
+### `symphonia-format-riff` 0.6.1
 - License expression: `MPL-2.0`.
-- Locked crate archive SHA-256: `c2d7c3df0e7d94efb68401d81906eae73c02b40d5ec1a141962c592d0f11a96f`.
-- Source archive: `https://static.crates.io/crates/symphonia-format-riff/symphonia-format-riff-0.5.5.crate`.
+- Locked crate archive SHA-256: `1ff70929083a8c1a5f6cd7c904b6071c7914ad04739b510c2f7239dfc9b7dabe`.
+- Source archive: `https://static.crates.io/crates/symphonia-format-riff/symphonia-format-riff-0.6.1.crate`.
 - Repository declared by package metadata: `https://github.com/pdeljanov/Symphonia`.
 - Authors declared by package metadata: `Philip Deljanov <philip.deljanov@gmail.com>`; `dedobbin <dedobbindedobbin@gmail.com>`.
 - MPL-2.0 terms: `https://www.mozilla.org/MPL/2.0/`; obtain the checksum-bound source archive above.
-- The locked crate archive contains no standalone license or notice file; its metadata and source archive above are retained without inventing text.
+- Packaged license, permission, and copyright notices:
+  - `LICENSE`: `texts/c76f740d1521b9bed9ca7a04ad526c310493c62621b1341d623b431736533b30.txt` (SHA-256 `c76f740d1521b9bed9ca7a04ad526c310493c62621b1341d623b431736533b30`).
 
-### `symphonia-metadata` 0.5.5
+### `symphonia-metadata` 0.6.1
 - License expression: `MPL-2.0`.
-- Locked crate archive SHA-256: `36306ff42b9ffe6e5afc99d49e121e0bd62fe79b9db7b9681d48e29fa19e6b16`.
-- Source archive: `https://static.crates.io/crates/symphonia-metadata/symphonia-metadata-0.5.5.crate`.
+- Locked crate archive SHA-256: `83713a97705d77bdef7cdbc0768fd6e5a54e4cd7e48d60a806ae85639e2c87c6`.
+- Source archive: `https://static.crates.io/crates/symphonia-metadata/symphonia-metadata-0.6.1.crate`.
 - Repository declared by package metadata: `https://github.com/pdeljanov/Symphonia`.
 - Authors declared by package metadata: `Philip Deljanov <philip.deljanov@gmail.com>`.
 - MPL-2.0 terms: `https://www.mozilla.org/MPL/2.0/`; obtain the checksum-bound source archive above.
-- The locked crate archive contains no standalone license or notice file; its metadata and source archive above are retained without inventing text.
-
-### `symphonia-utils-xiph` 0.5.5
-- License expression: `MPL-2.0`.
-- Locked crate archive SHA-256: `ee27c85ab799a338446b68eec77abf42e1a6f1bb490656e121c6e27bfbab9f16`.
-- Source archive: `https://static.crates.io/crates/symphonia-utils-xiph/symphonia-utils-xiph-0.5.5.crate`.
-- Repository declared by package metadata: `https://github.com/pdeljanov/Symphonia`.
-- Authors declared by package metadata: `Philip Deljanov <philip.deljanov@gmail.com>`.
-- MPL-2.0 terms: `https://www.mozilla.org/MPL/2.0/`; obtain the checksum-bound source archive above.
-- The locked crate archive contains no standalone license or notice file; its metadata and source archive above are retained without inventing text.
+- Packaged license, permission, and copyright notices:
+  - `LICENSE`: `texts/c76f740d1521b9bed9ca7a04ad526c310493c62621b1341d623b431736533b30.txt` (SHA-256 `c76f740d1521b9bed9ca7a04ad526c310493c62621b1341d623b431736533b30`).
 
 ### `sync_wrapper` 1.0.2
 - License expression: `Apache-2.0`.

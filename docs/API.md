@@ -355,6 +355,10 @@ including the last partial frame. Providers offering only complete-waveform exec
 available to callers using that interface. A bounded batch request using such a provider
 receives an explicit refusal.
 
+For container inputs with leading ID3v2 tags, the decoder checks each tag extent and skips
+its metadata payload before opening the audio stream. Embedded cover art is ignored by
+transcription. The decoded audio clock still starts at the first emitted source sample.
+
 ## Offline CLI
 
 The asr executable has exactly five commands. Each command places its required input file

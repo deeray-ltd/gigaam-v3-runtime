@@ -14,13 +14,14 @@ use gigaam_audio::{DecodedAudio, EncodedAudio, FileDecoder};
 use gigaam_audio::{AudioMetadata, ChannelAudio, ChannelCount, SampleRate, resample_audio};
 use std::io::{self, Cursor, Read, Seek, SeekFrom};
 use symphonia::core::{
-    audio::SampleBuffer,
-    codecs::{CODEC_TYPE_NULL, CODEC_TYPE_OPUS, Decoder, DecoderOptions},
+    codecs::audio::{
+        AudioDecoder, AudioDecoderOptions, CODEC_ID_NULL_AUDIO, well_known::CODEC_ID_OPUS,
+    },
     errors::Error as SymphoniaError,
+    formats::probe::Hint,
     formats::{FormatOptions, FormatReader},
     io::{MediaSource, MediaSourceStream},
     meta::MetadataOptions,
-    probe::Hint,
 };
 
 /// Opus decoded PCM and pre-skip use this fixed RFC reference clock.
@@ -86,13 +87,13 @@ struct OpusPackets {
 }
 
 enum PacketDecoder {
-    Standard(Box<dyn Decoder>),
+    Standard(Box<dyn AudioDecoder>),
     Opus(Box<OpusPackets>),
 }
 
 /// The codec adapter retains one decoded packet at a time plus the linked demuxer's state.
 struct CodecReader {
-    format: Box<dyn FormatReader>,
+    format: Box<dyn FormatReader + 'static>,
     track_id: u32,
     decoder: PacketDecoder,
     metadata: Option<AudioMetadata>,
@@ -106,38 +107,42 @@ impl CodecReader {
         format_hint: Option<&str>,
     ) -> Result<Self, String> {
         let length = input.seek(SeekFrom::End(0)).map_err(audio_io)?;
+        let audio_offset = crate::id3v2::audio_offset(&mut input, length)?;
         input.rewind().map_err(audio_io)?;
-        let source = MediaSourceStream::new(
+        let mut source = MediaSourceStream::new(
             Box::new(SeekableSource { input, length }),
             Default::default(),
         );
+        source
+            .seek(SeekFrom::Start(audio_offset))
+            .map_err(audio_io)?;
         let mut hint = Hint::new();
         if let Some(extension) = format_hint {
             hint.with_extension(extension);
         }
-        let probed = symphonia::default::get_probe()
-            .format(
+        let format = crate::batch_probe::BATCH_PROBE
+            .probe(
                 &hint,
                 source,
-                &FormatOptions::default(),
-                &MetadataOptions::default(),
+                FormatOptions::default(),
+                MetadataOptions::default(),
             )
             .map_err(|error| format!("audio format is not recognized: {error}"))?;
-        let track = probed
-            .format
+        let (track, parameters) = format
             .tracks()
             .iter()
-            .find(|track| track.codec_params.codec != CODEC_TYPE_NULL)
+            .filter_map(|track| Some((track, track.codec_params.as_ref()?.audio()?)))
+            .find(|(_, parameters)| parameters.codec != CODEC_ID_NULL_AUDIO)
             .ok_or_else(|| "audio input has no decodable track".to_owned())?;
         let track_id = track.id;
-        let parameters = &track.codec_params;
-        let (metadata, decoder) = if parameters.codec == CODEC_TYPE_OPUS {
+        let (metadata, decoder) = if parameters.codec == CODEC_ID_OPUS {
             let channels = parameters
                 .channels
+                .as_ref()
                 .map(|channels| ChannelCount::new(channels.count()))
                 .transpose()?
                 .ok_or_else(|| "Opus track channel layout is unknown".to_owned())?;
-            let pre_skip_frames = parameters
+            let pre_skip_frames = track
                 .delay
                 .ok_or_else(|| "Opus track does not declare its required pre-skip".to_owned())
                 .and_then(|delay| {
@@ -160,12 +165,12 @@ impl CodecReader {
             )
         } else {
             let decoder = symphonia::default::get_codecs()
-                .make(parameters, &DecoderOptions::default())
+                .make_audio_decoder(parameters, &AudioDecoderOptions::default())
                 .map_err(|error| format!("audio codec: {error}"))?;
             (None, PacketDecoder::Standard(decoder))
         };
         let mut reader = Self {
-            format: probed.format,
+            format,
             track_id,
             decoder,
             metadata,
@@ -204,12 +209,10 @@ impl CodecReader {
         self.samples.clear();
         self.offset = 0;
         loop {
-            let packet = match self.format.next_packet() {
-                Ok(packet) if packet.track_id() == self.track_id => packet,
-                Ok(_) => continue,
-                Err(SymphoniaError::IoError(error))
-                    if error.kind() == io::ErrorKind::UnexpectedEof =>
-                {
+            let mut packet = match self.format.next_packet() {
+                Ok(Some(packet)) if packet.track_id == self.track_id => packet,
+                Ok(Some(_)) => continue,
+                Ok(None) => {
                     if let PacketDecoder::Opus(opus) = &self.decoder
                         && opus.pending_skip != 0
                     {
@@ -244,26 +247,31 @@ impl CodecReader {
                     self.samples.extend_from_slice(decoded);
                 }
                 PacketDecoder::Standard(decoder) => {
+                    // The previous decoder disabled gapless trimming. Retain
+                    // its output sample clock for these container comparisons.
+                    packet.dur = packet
+                        .dur
+                        .checked_add(packet.trim_start)
+                        .and_then(|duration| duration.checked_add(packet.trim_end))
+                        .ok_or_else(|| "decoded packet duration overflows".to_owned())?;
+                    packet.trim_start = symphonia::core::units::Duration::ZERO;
+                    packet.trim_end = symphonia::core::units::Duration::ZERO;
                     let audio = match decoder.decode(&packet) {
                         Ok(audio) => audio,
                         Err(SymphoniaError::DecodeError(_)) => continue,
                         Err(SymphoniaError::ResetRequired) => return Err(configuration_change()),
                         Err(error) => return Err(format!("audio decode: {error}")),
                     };
-                    let spec = *audio.spec();
+                    let spec = audio.spec();
                     let metadata = AudioMetadata::new(
-                        SampleRate::new(spec.rate)?,
-                        ChannelCount::new(spec.channels.count())?,
+                        SampleRate::new(spec.rate())?,
+                        ChannelCount::new(spec.channels().count())?,
                     );
                     if self.metadata.is_some_and(|known| known != metadata) {
                         return Err(configuration_change());
                     }
                     self.metadata = Some(metadata);
-                    let capacity = u64::try_from(audio.capacity())
-                        .map_err(|_| "decoded packet capacity does not fit u64".to_owned())?;
-                    let mut buffer = SampleBuffer::<f32>::new(capacity, spec);
-                    buffer.copy_interleaved_ref(audio);
-                    self.samples.extend_from_slice(buffer.samples());
+                    audio.copy_to_vec_interleaved(&mut self.samples);
                 }
             }
             if !self.samples.is_empty() {
