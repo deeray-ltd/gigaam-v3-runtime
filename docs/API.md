@@ -359,6 +359,10 @@ For container inputs with leading ID3v2 tags, the decoder checks each tag extent
 its metadata payload before opening the audio stream. Embedded cover art is ignored by
 transcription. The decoded audio clock still starts at the first emitted source sample.
 
+The container Wave reader used for batch input skips LIST/INFO values after
+checking their chunk boundaries. This also applies to Wave files reached after
+an ID3v2 prefix.
+
 Batch FLAC input retains STREAMINFO and the encoded audio frames. The reader skips
 other metadata blocks in native FLAC. For seekable Matroska it reads STREAMINFO
 from the validated codec data range. For Ogg-FLAC, it preserves decoder setup
