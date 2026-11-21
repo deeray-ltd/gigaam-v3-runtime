@@ -1090,6 +1090,7 @@ version = "0.6.1"
 dependencies = [
  "lazy_static",
  "log",
+ "symphonia-codec-vorbis",
  "symphonia-common",
  "symphonia-core",
 ]

@@ -60,8 +60,8 @@ pub struct Residue {
 }
 
 impl Residue {
-    pub fn try_read(
-        bs: &mut BitReaderRtl<'_>,
+    pub fn try_read<B: ReadBitsRtl>(
+        bs: &mut B,
         residue_type: u16,
         max_codebook: u8,
     ) -> Result<Self> {
@@ -70,8 +70,8 @@ impl Residue {
         Ok(Residue { setup, part_classes: Default::default(), type2_buf: Default::default() })
     }
 
-    fn read_setup(
-        bs: &mut BitReaderRtl<'_>,
+    fn read_setup<B: ReadBitsRtl>(
+        bs: &mut B,
         residue_type: u16,
         max_codebook: u8,
     ) -> Result<ResidueSetup> {

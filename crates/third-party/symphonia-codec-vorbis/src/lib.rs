@@ -26,7 +26,9 @@ use symphonia_core::codecs::audio::{AudioDecoder, FinalizeResult};
 use symphonia_core::codecs::registry::{RegisterableAudioDecoder, SupportedAudioCodec};
 use symphonia_core::dsp::mdct::Imdct;
 use symphonia_core::errors::{Result, decode_error, unsupported_error};
-use symphonia_core::io::{BitReaderRtl, BufReader, FiniteBitStream, ReadBitsRtl, ReadBytes};
+use symphonia_core::io::{
+    BitReaderRtl, BitStreamRtl, BufReader, FiniteBitStream, ReadBitsRtl, ReadBytes,
+};
 use symphonia_core::packet::PacketRef;
 use symphonia_core::support_audio_codec;
 
@@ -85,6 +87,23 @@ fn read_extradata(buf: &[u8]) -> Result<(IdentHeader, Setup)> {
         let ident = read_ident_header(&mut reader)?;
         let setup = read_setup(&mut reader, &ident)?;
         Ok((ident, setup))
+    }
+}
+
+/// Read the significant bytes of a Vorbis setup packet through its framing bit.
+///
+/// The caller supplies the identification packet and a reader positioned at the setup
+/// packet's first byte. Bound the reader to the declared packet extent. This parses the
+/// setup syntax without retaining trailing bytes or building the decoder's codebooks.
+/// The returned length includes the byte containing the framing bit.
+pub fn vorbis_setup_prefix_len<R: ReadBytes>(identification: &[u8], setup: &mut R) -> Result<u64> {
+    let ident = read_ident_header(&mut BufReader::new(identification))?;
+    let start = setup.pos();
+    read_setup_header(setup)?;
+    read_setup_body::<_, false>(&mut BitStreamRtl::new(setup), &ident)?;
+    match setup.pos().checked_sub(start) {
+        Some(len) => Ok(len),
+        None => decode_error("vorbis: setup packet reader moved backwards"),
     }
 }
 
@@ -488,6 +507,20 @@ struct Setup {
 }
 
 fn read_setup(reader: &mut BufReader<'_>, ident: &IdentHeader) -> Result<Setup> {
+    read_setup_header(reader)?;
+    let mut bs = BitReaderRtl::new(reader.read_buf_bytes_available_ref());
+    let setup = read_setup_body::<_, true>(&mut bs, ident)?;
+
+    // Extra bits less than a byte (< 8 bits) are expected padding to align to
+    // a byte boundary. Only log if there are leftover full bytes.
+    if bs.bits_left() >= 8 {
+        debug!("vorbis: leftover bits in setup head extra data");
+    }
+
+    Ok(setup)
+}
+
+fn read_setup_header<R: ReadBytes>(reader: &mut R) -> Result<()> {
     // The packet type must be an setup header.
     let packet_type = reader.read_u8()?;
 
@@ -503,48 +536,49 @@ fn read_setup(reader: &mut BufReader<'_>, ident: &IdentHeader) -> Result<Setup> 
         return decode_error("vorbis: invalid setup header signature");
     }
 
-    // The remaining portion of the setup header packet is read bitwise.
-    let mut bs = BitReaderRtl::new(reader.read_buf_bytes_available_ref());
+    Ok(())
+}
 
+fn read_setup_body<B: ReadBitsRtl, const BUILD_TABLES: bool>(
+    bs: &mut B,
+    ident: &IdentHeader,
+) -> Result<Setup> {
     // Read codebooks.
-    let codebooks = read_codebooks(&mut bs)?;
+    let codebook_count = bs.read_bits_leq32(8)? + 1;
+    let mut codebooks = Vec::new();
+    for _ in 0..codebook_count {
+        if let Some(codebook) = VorbisCodebook::read::<_, BUILD_TABLES>(bs)? {
+            codebooks.push(codebook);
+        }
+    }
+    // A count of 256 has no representable nonzero upper bound in the existing setup
+    // readers. Those readers reject references in that case.
+    let max_codebook = u8::try_from(codebook_count).unwrap_or(0);
 
     // Read time-domain transforms (placeholders in Vorbis 1).
-    read_time_domain_transforms(&mut bs)?;
+    read_time_domain_transforms(bs)?;
 
     // Read floors.
-    let floors = read_floors(&mut bs, ident.bs0_exp, ident.bs1_exp, codebooks.len() as u8)?;
+    let floors = read_floors(bs, ident.bs0_exp, ident.bs1_exp, max_codebook, BUILD_TABLES)?;
 
     // Read residues.
-    let residues = read_residues(&mut bs, codebooks.len() as u8)?;
+    let residues = read_residues(bs, max_codebook)?;
 
     // Read channel mappings.
-    let mappings =
-        read_mappings(&mut bs, ident.n_channels, floors.len() as u8, residues.len() as u8)?;
+    let mappings = read_mappings(bs, ident.n_channels, floors.len() as u8, residues.len() as u8)?;
 
     // Read modes.
-    let modes = read_modes(&mut bs, mappings.len() as u8)?;
+    let modes = read_modes(bs, mappings.len() as u8)?;
 
     // Framing flag must be set.
     if !bs.read_bool()? {
         return decode_error("vorbis: setup header framing flag unset");
     }
 
-    // Extra bits less than a byte (< 8 bits) are expected padding to align to
-    // a byte boundary. Only log if there are leftover full bytes.
-    if bs.bits_left() >= 8 {
-        debug!("vorbis: leftover bits in setup head extra data");
-    }
-
     Ok(Setup { codebooks, floors, residues, mappings, modes })
 }
 
-fn read_codebooks(bs: &mut BitReaderRtl<'_>) -> Result<Vec<VorbisCodebook>> {
-    let count = bs.read_bits_leq32(8)? + 1;
-    (0..count).map(|_| VorbisCodebook::read(bs)).collect()
-}
-
-fn read_time_domain_transforms(bs: &mut BitReaderRtl<'_>) -> Result<()> {
+fn read_time_domain_transforms<B: ReadBitsRtl>(bs: &mut B) -> Result<()> {
     let count = bs.read_bits_leq32(6)? + 1;
 
     for _ in 0..count {
@@ -557,37 +591,39 @@ fn read_time_domain_transforms(bs: &mut BitReaderRtl<'_>) -> Result<()> {
     Ok(())
 }
 
-fn read_floors(
-    bs: &mut BitReaderRtl<'_>,
+fn read_floors<B: ReadBitsRtl>(
+    bs: &mut B,
     bs0_exp: u8,
     bs1_exp: u8,
     max_codebook: u8,
+    build_tables: bool,
 ) -> Result<Vec<Box<dyn Floor>>> {
     let count = bs.read_bits_leq32(6)? + 1;
-    (0..count).map(|_| read_floor(bs, bs0_exp, bs1_exp, max_codebook)).collect()
+    (0..count).map(|_| read_floor(bs, bs0_exp, bs1_exp, max_codebook, build_tables)).collect()
 }
 
-fn read_floor(
-    bs: &mut BitReaderRtl<'_>,
+fn read_floor<B: ReadBitsRtl>(
+    bs: &mut B,
     bs0_exp: u8,
     bs1_exp: u8,
     max_codebook: u8,
+    build_tables: bool,
 ) -> Result<Box<dyn Floor>> {
     let floor_type = bs.read_bits_leq32(16)?;
 
     match floor_type {
-        0 => Floor0::try_read(bs, bs0_exp, bs1_exp, max_codebook),
+        0 => Floor0::try_read(bs, bs0_exp, bs1_exp, max_codebook, build_tables),
         1 => Floor1::try_read(bs, max_codebook),
         _ => decode_error("vorbis: invalid floor type"),
     }
 }
 
-fn read_residues(bs: &mut BitReaderRtl<'_>, max_codebook: u8) -> Result<Vec<Residue>> {
+fn read_residues<B: ReadBitsRtl>(bs: &mut B, max_codebook: u8) -> Result<Vec<Residue>> {
     let count = bs.read_bits_leq32(6)? + 1;
     (0..count).map(|_| read_residue(bs, max_codebook)).collect()
 }
 
-fn read_residue(bs: &mut BitReaderRtl<'_>, max_codebook: u8) -> Result<Residue> {
+fn read_residue<B: ReadBitsRtl>(bs: &mut B, max_codebook: u8) -> Result<Residue> {
     let residue_type = bs.read_bits_leq32(16)? as u16;
 
     match residue_type {
@@ -596,8 +632,8 @@ fn read_residue(bs: &mut BitReaderRtl<'_>, max_codebook: u8) -> Result<Residue> 
     }
 }
 
-fn read_mappings(
-    bs: &mut BitReaderRtl<'_>,
+fn read_mappings<B: ReadBitsRtl>(
+    bs: &mut B,
     audio_channels: u8,
     max_floor: u8,
     max_residue: u8,
@@ -606,8 +642,8 @@ fn read_mappings(
     (0..count).map(|_| read_mapping(bs, audio_channels, max_floor, max_residue)).collect()
 }
 
-fn read_mapping(
-    bs: &mut BitReaderRtl<'_>,
+fn read_mapping<B: ReadBitsRtl>(
+    bs: &mut B,
     audio_channels: u8,
     max_floor: u8,
     max_residue: u8,
@@ -620,7 +656,7 @@ fn read_mapping(
     }
 }
 
-fn read_modes(bs: &mut BitReaderRtl<'_>, max_mapping: u8) -> Result<Vec<Mode>> {
+fn read_modes<B: ReadBitsRtl>(bs: &mut B, max_mapping: u8) -> Result<Vec<Mode>> {
     let count = bs.read_bits_leq32(6)? + 1;
     (0..count).map(|_| read_mode(bs, max_mapping)).collect()
 }
@@ -644,8 +680,8 @@ struct Mapping {
     submaps: Vec<SubMap>,
 }
 
-fn read_mapping_type0(
-    bs: &mut BitReaderRtl<'_>,
+fn read_mapping_type0<B: ReadBitsRtl>(
+    bs: &mut B,
     audio_channels: u8,
     max_floor: u8,
     max_residue: u8,
@@ -740,7 +776,7 @@ struct Mode {
     mapping: u8,
 }
 
-fn read_mode(bs: &mut BitReaderRtl<'_>, max_mapping: u8) -> Result<Mode> {
+fn read_mode<B: ReadBitsRtl>(bs: &mut B, max_mapping: u8) -> Result<Mode> {
     let block_flag = bs.read_bool()?;
     let window_type = bs.read_bits_leq32(16)? as u16;
     let transform_type = bs.read_bits_leq32(16)? as u16;
@@ -764,6 +800,105 @@ fn read_mode(bs: &mut BitReaderRtl<'_>, max_mapping: u8) -> Result<Mode> {
     let mode = Mode { block_flag, mapping };
 
     Ok(mode)
+}
+
+#[cfg(test)]
+mod setup_prefix_tests {
+    use super::*;
+
+    fn identification() -> Vec<u8> {
+        let mut bytes = b"\x01vorbis\0\0\0\0\x01".to_vec();
+        bytes.extend(48_000_u32.to_le_bytes());
+        bytes.extend([0; 12]); // Bitrate hints.
+        bytes.extend([0x66, 1]); // Equal 64-sample blocks and the framing bit.
+        bytes
+    }
+
+    fn setup() -> Vec<u8> {
+        let mut bytes = b"\x05vorbis".to_vec();
+        let mut position = bytes.len() * 8;
+        let mut write = |value: u32, width: usize| {
+            for bit in 0..width {
+                if position % 8 == 0 {
+                    bytes.push(0);
+                }
+                if value & (1 << bit) != 0 {
+                    bytes[position / 8] |= 1 << (position % 8);
+                }
+                position += 1;
+            }
+        };
+        write(0, 8); // One codebook.
+        write(0x564342, 24);
+        write(1, 16); // Vector dimension.
+        write(256, 24);
+        write(1, 1); // Ordered lengths.
+        write(7, 5); // Length 8.
+        write(256, 9); // 256 codewords of length 8.
+        write(2, 4); // Vector lookup type 2.
+        write(0, 32);
+        write(0, 32);
+        write(15, 4); // 16-bit multiplicands.
+        write(0, 1);
+        for value in 0..256 {
+            write(value, 16);
+        }
+        write(0, 6); // One time-domain transform.
+        write(0, 16);
+        write(0, 6); // One floor.
+        write(1, 16); // Floor 1.
+        write(0, 5); // No partitions.
+        write(0, 2);
+        write(6, 4);
+        write(0, 6); // One residue.
+        write(0, 16);
+        for _ in 0..3 {
+            write(0, 24);
+        }
+        write(0, 6);
+        write(0, 8);
+        write(0, 4); // No residue vectors.
+        write(0, 6); // One mapping.
+        write(0, 16);
+        write(0, 4); // Default submap, no coupling and reserved bits.
+        write(0, 24); // Time transform, floor and residue indices.
+        write(0, 6); // One mode.
+        write(0, 1);
+        write(0, 16);
+        write(0, 16);
+        write(0, 8);
+        write(1, 1); // Framing bit.
+        bytes
+    }
+
+    #[test]
+    fn read_only_the_setup_prefix_used_by_the_decoder() -> Result<()> {
+        let ident = identification();
+        let valid = setup();
+        let mut padded = valid.clone();
+        padded.resize(valid.len() + 4096, 0xa5);
+        for bytes in [&valid, &padded] {
+            let mut reader = BufReader::new(bytes);
+            let prefix = vorbis_setup_prefix_len(&ident, &mut reader)?;
+            assert_eq!(usize::try_from(prefix).ok(), Some(valid.len()));
+            assert_eq!(reader.pos(), prefix);
+
+            let (_, decoded_setup) = read_extradata(&[ident.as_slice(), bytes].concat())?;
+            assert_eq!(decoded_setup.codebooks.len(), 1);
+            assert_eq!(decoded_setup.modes.len(), 1);
+        }
+
+        let truncated = &valid[..valid.len() - 1];
+        assert!(vorbis_setup_prefix_len(&ident, &mut BufReader::new(truncated)).is_err());
+        assert!(read_extradata(&[ident.as_slice(), truncated].concat()).is_err());
+
+        padded[8] = 0; // Invalid first codebook synchronization word.
+        let mut invalid = BufReader::new(&padded);
+        assert!(vorbis_setup_prefix_len(&ident, &mut invalid).is_err());
+        assert_eq!(invalid.pos(), 11);
+        assert!(read_extradata(&[ident.as_slice(), &padded].concat()).is_err());
+        Ok(())
+    }
 }
 
 /// Map a Vorbis channel index to an audio buffer channel index given the channel map implied by the

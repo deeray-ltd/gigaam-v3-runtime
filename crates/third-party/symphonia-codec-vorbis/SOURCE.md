@@ -9,3 +9,6 @@ used by GigaAM v3 Runtime.
 
 The normalized Cargo manifest uses the published 0.6.1 packaging layout.
 The library source comes from the pinned upstream revision.
+
+The local change exposes the significant length of a Vorbis setup through
+its framing bit. It uses the same setup syntax as decoder initialization.

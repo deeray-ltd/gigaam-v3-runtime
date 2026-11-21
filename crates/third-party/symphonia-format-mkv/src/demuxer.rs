@@ -9,7 +9,7 @@ use std::collections::{HashMap, VecDeque};
 use std::convert::TryFrom;
 use std::num::NonZero;
 
-use symphonia_core::codecs::audio::well_known::CODEC_ID_VORBIS;
+use symphonia_core::codecs::audio::{CODEC_ID_NULL_AUDIO, well_known::CODEC_ID_VORBIS};
 use symphonia_core::errors::{Error, Result, SeekErrorKind, seek_error, unsupported_error};
 use symphonia_core::formats::prelude::*;
 use symphonia_core::formats::probe::{ProbeFormatData, ProbeableFormat, Score, Scoreable};
@@ -320,6 +320,7 @@ impl<'s> MkvReader<'s> {
 
         let mut tracks = Vec::new();
         let mut track_states = HashMap::new();
+        let mut selected_audio = false;
 
         for track in segment_tracks.tracks {
             // The track's timebase is scaled by the track timestamp scale.
@@ -352,7 +353,11 @@ impl<'s> MkvReader<'s> {
 
             tr.with_flags(track.flags);
 
-            if let Some(codec_params) = make_track_codec_params(track, &mut it)? {
+            if let Some(codec_params) =
+                make_track_codec_params(track, &mut it, defer_blocks && !selected_audio)?
+            {
+                // Apply setup validation to the same track as first_track_known_codec.
+                selected_audio |= codec_params.audio().is_some_and(|p| p.codec != CODEC_ID_NULL_AUDIO);
                 tr.with_codec_params(codec_params);
             }
 

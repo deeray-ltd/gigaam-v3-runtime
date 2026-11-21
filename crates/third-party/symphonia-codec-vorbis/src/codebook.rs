@@ -218,7 +218,7 @@ pub struct VorbisCodebook {
 }
 
 impl VorbisCodebook {
-    pub fn read<B: ReadBitsRtl>(bs: &mut B) -> Result<Self> {
+    pub fn read<B: ReadBitsRtl, const BUILD_TABLES: bool>(bs: &mut B) -> Result<Option<Self>> {
         // Verify codebook synchronization word.
         let sync = bs.read_bits_leq32(24)?;
 
@@ -249,7 +249,10 @@ impl VorbisCodebook {
         let is_length_ordered = bs.read_bool()?;
 
         let mut code_lens = Vec::<u8>::with_capacity(codebook_entries as usize);
-        let mut code_values = Vec::<u32>::with_capacity(codebook_entries as usize);
+        let mut code_values = Vec::<u32>::new();
+        if BUILD_TABLES {
+            code_values.reserve(codebook_entries as usize);
+        }
 
         if !is_length_ordered {
             // Codeword list is not length ordered.
@@ -265,7 +268,9 @@ impl VorbisCodebook {
                         let code_len = bs.read_bits_leq32(5)? as u8 + 1;
 
                         code_lens.push(code_len);
-                        code_values.push(entry);
+                        if BUILD_TABLES {
+                            code_values.push(entry);
+                        }
                     }
                 }
             }
@@ -277,7 +282,9 @@ impl VorbisCodebook {
                 }
 
                 // The codeword list is not sparse. Populate all values.
-                code_values.extend(0..codebook_entries);
+                if BUILD_TABLES {
+                    code_values.extend(0..codebook_entries);
+                }
             }
         }
         else {
@@ -314,7 +321,9 @@ impl VorbisCodebook {
             }
 
             // The codeword list is not sparse. Populate all values.
-            code_values.extend(0..cur_entry);
+            if BUILD_TABLES {
+                code_values.extend(0..cur_entry);
+            }
         }
 
         // Single-entry codebooks are technically invalid because the minimum possible codeword
@@ -326,7 +335,9 @@ impl VorbisCodebook {
         // specified. Do not support single-entry codebooks for codeword lengths > 1.
         if code_lens.len() == 1 && code_lens[0] == 1 {
             code_lens.push(code_lens[0]);
-            code_values.push(code_values[0]);
+            if BUILD_TABLES {
+                code_values.push(code_values[0]);
+            }
         }
 
         // Read and unpack vector quantization (VQ) lookup table.
@@ -346,6 +357,14 @@ impl VorbisCodebook {
                     2 => codebook_entries * u32::from(codebook_dimensions),
                     _ => unreachable!(),
                 };
+
+                if !BUILD_TABLES {
+                    // The setup boundary depends on the number and width of the multiplicands.
+                    // Their values are used only when constructing the decoder's lookup table.
+                    bs.ignore_bits(lookup_values * value_bits)?;
+                    synthesize_codewords(&code_lens)?;
+                    return Ok(None);
+                }
 
                 let mut multiplicands = Vec::<u16>::new();
 
@@ -381,6 +400,9 @@ impl VorbisCodebook {
 
         // Generate a canonical list of codewords given the set of codeword lengths.
         let code_words = synthesize_codewords(&code_lens)?;
+        if !BUILD_TABLES {
+            return Ok(None);
+        }
 
         // Finally, generate the codebook with a reverse (LSb) bit order.
         let mut builder = CodebookBuilder::new(BitOrder::Reverse);
@@ -390,7 +412,7 @@ impl VorbisCodebook {
 
         let codebook = builder.make::<Entry32x32>(&code_words, &code_lens, &code_values)?;
 
-        Ok(VorbisCodebook { codebook, dimensions: codebook_dimensions, vq_vec })
+        Ok(Some(VorbisCodebook { codebook, dimensions: codebook_dimensions, vq_vec }))
     }
 
     #[inline(always)]

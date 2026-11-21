@@ -146,22 +146,24 @@ pub struct Floor0 {
 }
 
 impl Floor0 {
-    pub fn try_read(
-        bs: &mut BitReaderRtl<'_>,
+    pub fn try_read<B: ReadBitsRtl>(
+        bs: &mut B,
         bs0_exp: u8,
         bs1_exp: u8,
         max_codebook: u8,
+        build_tables: bool,
     ) -> Result<Box<dyn Floor>> {
-        let setup = Self::read_setup(bs, bs0_exp, bs1_exp, max_codebook)?;
+        let setup = Self::read_setup(bs, bs0_exp, bs1_exp, max_codebook, build_tables)?;
 
         Ok(Box::new(Floor0 { setup, is_unused: false, amplitude: 0, coeffs: [0.0; 256] }))
     }
 
-    fn read_setup(
-        bs: &mut BitReaderRtl<'_>,
+    fn read_setup<B: ReadBitsRtl>(
+        bs: &mut B,
         bs0_exp: u8,
         bs1_exp: u8,
         max_codebook: u8,
+        build_tables: bool,
     ) -> Result<Floor0Setup> {
         let floor0_order = bs.read_bits_leq32(8)? as u8;
         let floor0_rate = bs.read_bits_leq32(16)? as u16;
@@ -181,9 +183,16 @@ impl Floor0 {
             }
         }
 
-        // Pre-compute the Bark-scale maps.
-        let floor0_map_short = bark_map(1 << (bs0_exp - 1), floor0_rate, floor0_bark_map_size);
-        let floor0_map_long = bark_map(1 << (bs1_exp - 1), floor0_rate, floor0_bark_map_size);
+        // Only the decoder needs the Bark-scale maps.
+        let (floor0_map_short, floor0_map_long) = if build_tables {
+            (
+                bark_map(1 << (bs0_exp - 1), floor0_rate, floor0_bark_map_size),
+                bark_map(1 << (bs1_exp - 1), floor0_rate, floor0_bark_map_size),
+            )
+        }
+        else {
+            (Vec::new(), Vec::new())
+        };
 
         let floor_type0 = Floor0Setup {
             floor0_order,
@@ -438,7 +447,7 @@ pub struct Floor1 {
 }
 
 impl Floor1 {
-    pub fn try_read(bs: &mut BitReaderRtl<'_>, max_codebook: u8) -> Result<Box<dyn Floor>> {
+    pub fn try_read<B: ReadBitsRtl>(bs: &mut B, max_codebook: u8) -> Result<Box<dyn Floor>> {
         let setup = Self::read_setup(bs, max_codebook)?;
 
         let x_list_len = setup.floor1_x_list.len();
@@ -452,7 +461,7 @@ impl Floor1 {
         }))
     }
 
-    fn read_setup(bs: &mut BitReaderRtl<'_>, max_codebook: u8) -> Result<Floor1Setup> {
+    fn read_setup<B: ReadBitsRtl>(bs: &mut B, max_codebook: u8) -> Result<Floor1Setup> {
         // The number of partitions. 5-bit value, 0..31 range.
         let floor1_partitions = bs.read_bits_leq32(5)? as usize;
 

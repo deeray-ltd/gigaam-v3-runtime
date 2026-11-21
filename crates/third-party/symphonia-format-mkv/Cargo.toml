@@ -57,6 +57,9 @@ version = "0.4"
 [dependencies.symphonia-common]
 version = "0.6.1"
 
+[dependencies.symphonia-codec-vorbis]
+version = "0.6.1"
+
 [dependencies.symphonia-core]
 version = "0.6.1"
 
