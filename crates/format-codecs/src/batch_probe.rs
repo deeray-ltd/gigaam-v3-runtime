@@ -82,8 +82,7 @@ impl<'input> ProbeableFormat<'input> for Sequential<IsoMp4Reader<'_>> {
             .flatten();
         reader.select_for_batch(id)?;
         if let Some(geometry) = geometry {
-            // A false result preserves the original packet path for unproven layouts.
-            let _enabled = reader.enable_batch_pcm(
+            reader.enable_batch_pcm(
                 id,
                 geometry.frame_bytes,
                 std::num::NonZeroUsize::new(BATCH_PCM_MAX_FRAMES)
