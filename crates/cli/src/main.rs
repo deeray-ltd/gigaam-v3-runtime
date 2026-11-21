@@ -4,6 +4,7 @@
 
 //! Binary-only offline command-line entrypoint for GigaAM v3 Runtime.
 
+mod audio_io;
 mod commands;
 mod composition;
 mod configuration;

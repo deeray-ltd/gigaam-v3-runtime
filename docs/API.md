@@ -97,8 +97,7 @@ minimum frontend window geometry still applies to very short groups. One native 
 reused sequentially across its selected channels; no shared VAD worker or session pool is
 introduced.
 
-The body must be nonempty. IEEE-float WAV samples must be finite; values outside
-`[-1, 1]` are preserved. Decoded source audio must have a rate in 4000 through 192000 Hz
+The body must be nonempty. Decoded source audio must have a rate in 4000 through 192000 Hz
 and at least one channel. Within that range, a rate is accepted only when its ratio to the
 model rate, reduced to lowest terms, stays within 1000 on both sides; other rates refuse
 with an explicit message. The service resamples accepted input to the model rate. The

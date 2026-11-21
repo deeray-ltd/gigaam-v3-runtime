@@ -9,13 +9,10 @@
 
 //! Feature-gated container codecs, including exact Opus reference-clock trimming.
 
-use crate::{DecodedAudio, EncodedAudio};
+use gigaam_audio::{DecodedAudio, EncodedAudio, FileDecoder};
 
-#[cfg(feature = "decoders")]
-use crate::{AudioMetadata, ChannelAudio, ChannelCount, SampleRate, resample_audio};
-#[cfg(feature = "decoders")]
+use gigaam_audio::{AudioMetadata, ChannelAudio, ChannelCount, SampleRate, resample_audio};
 use std::io::{self, Cursor, Read, Seek, SeekFrom};
-#[cfg(feature = "decoders")]
 use symphonia::core::{
     audio::SampleBuffer,
     codecs::{CODEC_TYPE_NULL, CODEC_TYPE_OPUS, Decoder, DecoderOptions},
@@ -27,16 +24,12 @@ use symphonia::core::{
 };
 
 /// Opus decoded PCM and pre-skip use this fixed RFC reference clock.
-#[cfg(feature = "decoders")]
 const OPUS_REFERENCE_SAMPLE_RATE_HZ: u32 = 48_000;
 /// GigaAM v3 Runtime's established decoded Opus delivery rate.
-#[cfg(feature = "decoders")]
 const OPUS_DELIVERY_SAMPLE_RATE_HZ: u32 = 16_000;
 /// RFC 6716's maximum 120 ms packet duration expressed at the 48 kHz reference clock.
-#[cfg(feature = "decoders")]
 const OPUS_MAX_SAMPLES_PER_CHANNEL_PER_PACKET: usize = 5_760;
 
-#[cfg(feature = "decoders")]
 fn deinterleave(samples: &[f32], metadata: AudioMetadata) -> Result<DecodedAudio, String> {
     let channels = metadata.channel_count().get();
     let frames = samples.len() / channels;
@@ -59,27 +52,23 @@ fn deinterleave(samples: &[f32], metadata: AudioMetadata) -> Result<DecodedAudio
     DecodedAudio::new(metadata.sample_rate(), output)
 }
 
-#[cfg(feature = "decoders")]
 struct SeekableSource<R> {
     input: R,
     length: u64,
 }
 
-#[cfg(feature = "decoders")]
 impl<R: Read> Read for SeekableSource<R> {
     fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
         self.input.read(bytes)
     }
 }
 
-#[cfg(feature = "decoders")]
 impl<R: Seek> Seek for SeekableSource<R> {
     fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
         self.input.seek(position)
     }
 }
 
-#[cfg(feature = "decoders")]
 impl<R: Read + Seek + Send + Sync> MediaSource for SeekableSource<R> {
     fn is_seekable(&self) -> bool {
         true
@@ -90,21 +79,18 @@ impl<R: Read + Seek + Send + Sync> MediaSource for SeekableSource<R> {
     }
 }
 
-#[cfg(feature = "decoders")]
 struct OpusPackets {
     decoder: opus_decoder::OpusDecoder,
     pending_skip: usize,
     scratch: Vec<f32>,
 }
 
-#[cfg(feature = "decoders")]
 enum PacketDecoder {
     Standard(Box<dyn Decoder>),
     Opus(Box<OpusPackets>),
 }
 
 /// The codec adapter retains one decoded packet at a time plus the linked demuxer's state.
-#[cfg(feature = "decoders")]
 struct CodecReader {
     format: Box<dyn FormatReader>,
     track_id: u32,
@@ -114,7 +100,6 @@ struct CodecReader {
     offset: usize,
 }
 
-#[cfg(feature = "decoders")]
 impl CodecReader {
     fn open(
         mut input: impl Read + Seek + Send + Sync + 'static,
@@ -289,12 +274,10 @@ impl CodecReader {
 }
 
 /// Container file delivery on the decoded source sample clock.
-#[cfg(feature = "decoders")]
 pub(crate) struct CodecFileReader {
     inner: CodecReader,
 }
 
-#[cfg(feature = "decoders")]
 impl CodecFileReader {
     pub(crate) fn open(
         input: impl Read + Seek + Send + Sync + 'static,
@@ -314,49 +297,31 @@ impl CodecFileReader {
     }
 }
 
-#[cfg(feature = "decoders")]
 fn audio_io(error: io::Error) -> String {
     format!("audio source: {error}")
 }
 
-#[cfg(feature = "decoders")]
 fn configuration_change() -> String {
     "unsupported midstream track/configuration change".into()
 }
 
-#[cfg(feature = "decoders")]
 pub fn decode_bytes(encoded: EncodedAudio) -> Result<DecodedAudio, String> {
     let (bytes, format_hint) = encoded.into_parts();
-    let mut reader = CodecReader::open(Cursor::new(bytes), format_hint.as_deref())?;
-    let audio =
-        crate::decoded_input::collect_audio(reader.metadata(), || reader.next_audio(usize::MAX))?;
-    if reader.uses_opus() {
+    let reader = CodecReader::open(Cursor::new(bytes), format_hint.as_deref())?;
+    let is_opus = reader.uses_opus();
+    let mut decoder = FileDecoder::from_reader(Box::new(CodecFileReader { inner: reader }));
+    let audio = decoder.collect_remaining()?;
+    if is_opus {
         resample_audio(audio, SampleRate::new(OPUS_DELIVERY_SAMPLE_RATE_HZ)?)
     } else {
         Ok(audio)
     }
 }
 
-#[cfg(not(feature = "decoders"))]
-pub fn decode_bytes(encoded: EncodedAudio) -> Result<DecodedAudio, String> {
-    Err(unsupported_format(encoded.format_hint()))
-}
-
-#[cfg(not(feature = "decoders"))]
-pub(crate) fn unsupported_format(format_hint: Option<&str>) -> String {
-    {
-        match format_hint {
-            Some(extension) => format!(
-                "audio extension {extension:?} is unsupported because this build has no `decoders` feature"
-            ),
-            None => "audio format has no extension hint and is unsupported because this build has no `decoders` feature".into(),
-        }
-    }
-}
-#[cfg(all(feature = "decoders", test))]
+#[cfg(test)]
 mod tests {
     use super::*;
-    use crate::FileDecoder;
+    use gigaam_audio::FileDecoder;
     use std::num::NonZeroUsize;
 
     fn append_ogg_page(
@@ -431,7 +396,10 @@ mod tests {
 
         for bound in [1, 137, 5700] {
             let limit = NonZeroUsize::new(bound).ok_or("nonzero test bound")?;
-            let mut stream = FileDecoder::open(EncodedAudio::new(file.clone(), None)?)?;
+            let mut stream = FileDecoder::from_reader(Box::new(CodecFileReader::open(
+                Cursor::new(file.clone()),
+                None,
+            )?));
             assert_eq!(stream.metadata().sample_rate(), SampleRate::new(48_000)?);
             let mut actual = Vec::new();
             while let Some(chunk) = stream.next_chunk(limit)? {
@@ -452,5 +420,17 @@ mod tests {
         }
 
         Ok(())
+    }
+}
+
+impl gigaam_audio::FileChunkReader for CodecFileReader {
+    fn metadata(&self) -> AudioMetadata {
+        CodecFileReader::metadata(self)
+    }
+    fn next_audio(
+        &mut self,
+        max_frames: std::num::NonZeroUsize,
+    ) -> Result<Option<DecodedAudio>, String> {
+        CodecFileReader::next_audio(self, max_frames.get())
     }
 }

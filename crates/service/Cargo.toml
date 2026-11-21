@@ -20,6 +20,10 @@ name = "gigaam_service"
 path = "src/lib.rs"
 
 [dependencies]
+gigaam-audio = { path = "../audio" }
+gigaam-format-wav = { path = "../format-wav" }
+gigaam-format-raw = { path = "../format-raw" }
+gigaam-format-codecs = { path = "../format-codecs" }
 gigaam-service-host = { path = "../service-host", default-features = false }
 gigaam-api-native = { path = "../api-native" }
 gigaam-api-openai = { path = "../api-openai" }
@@ -27,7 +31,7 @@ gigaam-recognition = { path = "../recognition", default-features = false }
 axum = { version = "0.8.9", default-features = false, features = ["http1", "matched-path", "original-uri", "tokio", "tower-log", "tracing"] }
 
 [dev-dependencies]
-gigaam-audio = { path = "../audio", features = ["decoders"] }
+gigaam-audio = { path = "../audio" }
 gigaam-model-package = { path = "../model-package" }
 gigaam-transcription = { path = "../transcription" }
 axum = { version = "0.8.9", default-features = false, features = ["http1", "matched-path", "original-uri", "tokio", "tower-log", "tracing", "ws"] }

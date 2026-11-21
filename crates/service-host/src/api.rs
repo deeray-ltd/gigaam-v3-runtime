@@ -25,6 +25,28 @@ pub trait ApiAdapter: Send + Sync {
     fn routes(&self, operations: ApiOperations) -> Router;
 }
 
+struct AudioRoutes<A> {
+    adapter: A,
+    file_decoders: gigaam_audio::FileDecoders,
+    live_decoders: Option<gigaam_audio::LiveDecoders>,
+}
+
+impl<A: ApiAdapter> ApiAdapter for AudioRoutes<A> {
+    fn name(&self) -> &'static str {
+        self.adapter.name()
+    }
+
+    fn routes(&self, mut operations: ApiOperations) -> Router {
+        operations.batch = operations
+            .batch
+            .with_file_decoders(self.file_decoders.clone());
+        if let Some(decoders) = &self.live_decoders {
+            operations.live = operations.live.with_audio_decoders(decoders.clone());
+        }
+        self.adapter.routes(operations)
+    }
+}
+
 /// API families included by the process composition.
 #[derive(Default)]
 pub struct ApiRegistry {
@@ -43,6 +65,33 @@ impl ApiRegistry {
                 Ok(())
             }
         }
+    }
+
+    /// Registers a family with the exact file formats its route may use.
+    pub fn register_file_formats(
+        &mut self,
+        adapter: impl ApiAdapter + 'static,
+        decoders: gigaam_audio::FileDecoders,
+    ) -> Result<(), String> {
+        self.register(AudioRoutes {
+            adapter,
+            file_decoders: decoders,
+            live_decoders: None,
+        })
+    }
+
+    /// Registers a family with explicit decoder choices for its file and live routes.
+    pub fn register_audio_formats(
+        &mut self,
+        adapter: impl ApiAdapter + 'static,
+        file_decoders: gigaam_audio::FileDecoders,
+        live_decoders: gigaam_audio::LiveDecoders,
+    ) -> Result<(), String> {
+        self.register(AudioRoutes {
+            adapter,
+            file_decoders,
+            live_decoders: Some(live_decoders),
+        })
     }
 
     pub(crate) fn select(&self, name: &str) -> Result<&dyn ApiAdapter, String> {

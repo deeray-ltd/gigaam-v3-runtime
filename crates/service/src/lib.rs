@@ -30,8 +30,17 @@ impl ServiceApplication {
 
 fn stock_apis() -> Result<ApiRegistry, String> {
     let mut apis = ApiRegistry::default();
-    apis.register(NativeApi)?;
-    apis.register(OpenAiApi)?;
+    use std::sync::Arc;
+    let files = gigaam_audio::FileDecoders::new(vec![
+        Arc::new(gigaam_format_wav::Wave),
+        Arc::new(gigaam_format_codecs::Containers),
+    ])?;
+    apis.register_audio_formats(
+        NativeApi,
+        files.clone(),
+        gigaam_audio::LiveDecoders::new(gigaam_format_raw::providers(), Some("pcm16"))?,
+    )?;
+    apis.register_file_formats(OpenAiApi, files)?;
     Ok(apis)
 }
 

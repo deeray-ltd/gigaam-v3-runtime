@@ -4,6 +4,7 @@
 
 //! Offline batch-transcription command adapter.
 
+use crate::audio_io::load;
 use crate::composition;
 use crate::composition::Package;
 use crate::configuration;
@@ -15,7 +16,6 @@ use crate::projection::{
     self, EvidenceAudioHeader, EvidenceModelHeader, EvidenceWriter, TranscribeSummary,
     evidence_token,
 };
-use gigaam_audio::load;
 use gigaam_primitives::f64_to_f32;
 use gigaam_recognition::{ExecutionControl, FrameRate, RequiredEncoderRoles, vad::VAD_SR};
 use gigaam_transcription::{

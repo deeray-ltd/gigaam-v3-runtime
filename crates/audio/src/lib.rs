@@ -14,29 +14,30 @@
 //! depend on recognition, transcription, service, CLI, provider, or ONNX Runtime types.
 
 mod channel_analysis;
-mod codecs;
 mod contracts;
 mod decoded_input;
-mod dispatch;
 mod fft;
+mod formats;
 mod frontend;
 mod g711;
-mod interleaved;
+mod live_input;
 mod resampling;
-mod wav;
 
 pub use channel_analysis::channel_correlation;
-pub use codecs::decode_bytes;
 pub use contracts::{
     ChannelAudio, ChannelAudioView, ChannelCount, DecodedAudio, EncodedAudio, FeatureMatrix,
     FeatureMatrixView, FrontendMode, SampleFormat, SampleRate,
 };
-pub use decoded_input::{AudioMetadata, DecodedChunk, FileDecoder, RawDecoder};
-pub use dispatch::{load, load_bytes, read_wav};
+pub use decoded_input::{
+    AudioFile, AudioMetadata, DecodedChunk, FileChunkReader, FileDecoder, collect_audio,
+};
+pub use formats::{FileDecoderProvider, FileDecoders, FileFormatMatch};
 pub use frontend::{FrontendProcessor, FrontendScratch};
-pub use interleaved::{InterleavedFrameDecoder, decode_samples};
+pub use g711::{alaw_to_i16, ulaw_to_i16};
+pub use live_input::{
+    LiveChunkReader, LiveDecoder, LiveDecoderProvider, LiveDecoders, SelectedLiveDecoder,
+};
 pub use resampling::{RatePair, Resampler, ResamplerConfig, StreamResampler, resample_audio};
-pub use wav::parse_wav;
 
 #[cfg(test)]
 mod tests;

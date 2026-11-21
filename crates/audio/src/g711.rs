@@ -22,7 +22,7 @@ fn pcm_i16(value: i32) -> i16 {
     }
 }
 
-pub(crate) fn ulaw_to_i16(value: u8) -> i16 {
+pub fn ulaw_to_i16(value: u8) -> i16 {
     let value = !value;
     let mut magnitude = i32::from(value & QUANT_MASK) << 3;
     magnitude += BIAS;
@@ -34,7 +34,7 @@ pub(crate) fn ulaw_to_i16(value: u8) -> i16 {
     })
 }
 
-pub(crate) fn alaw_to_i16(value: u8) -> i16 {
+pub fn alaw_to_i16(value: u8) -> i16 {
     let value = value ^ 0x55;
     let mut magnitude = i32::from(value & QUANT_MASK) << 4;
     let segment = i32::from((value & SEG_MASK) >> SEG_SHIFT);

@@ -5,6 +5,14 @@
 // Exercise the production wire loop with directly controlled host fixtures.
 include!("../../api-native/src/ws.rs");
 
+impl StreamQuery<SampleFormat> {
+    fn parse(raw: Option<&str>, defaults: StreamDefaults) -> Result<Self, String> {
+        Self::parse_with(raw, defaults, |format| {
+            format.map_or(Ok(SampleFormat::Pcm16), SampleFormat::parse)
+        })
+    }
+}
+
 use std::sync::Arc;
 
 use crate::admission::{AdmissionPhase, AdmissionRefusal, AdmissionState};
@@ -1603,6 +1611,145 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn upgraded_socket_decodes_selected_plugin_before_end()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use gigaam_audio::{
+            AudioMetadata, ChannelAudio, DecodedAudio, DecodedChunk, LiveChunkReader,
+            LiveDecoderProvider, LiveDecoders,
+        };
+
+        struct DuplexListener(Option<tokio::io::DuplexStream>);
+        impl axum::serve::Listener for DuplexListener {
+            type Io = tokio::io::DuplexStream;
+            type Addr = ();
+
+            async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+                match self.0.take() {
+                    Some(stream) => (stream, ()),
+                    None => std::future::pending().await,
+                }
+            }
+            fn local_addr(&self) -> std::io::Result<Self::Addr> {
+                Ok(())
+            }
+        }
+
+        struct FixtureProvider(Arc<tokio::sync::Notify>);
+        impl LiveDecoderProvider for FixtureProvider {
+            fn id(&self) -> &'static str {
+                "fixture"
+            }
+            fn open(&self, metadata: AudioMetadata) -> Result<Box<dyn LiveChunkReader>, String> {
+                assert_eq!(metadata.sample_rate().hertz(), 16_000);
+                assert_eq!(metadata.channel_count().get(), 1);
+                Ok(Box::new(FixtureReader {
+                    metadata,
+                    pushed: Arc::clone(&self.0),
+                    next_frame: 0,
+                }))
+            }
+        }
+
+        struct FixtureReader {
+            metadata: AudioMetadata,
+            pushed: Arc<tokio::sync::Notify>,
+            next_frame: u64,
+        }
+        impl FixtureReader {
+            fn sample(&self) -> Result<DecodedChunk, String> {
+                DecodedChunk::new(
+                    self.next_frame,
+                    DecodedAudio::new(
+                        self.metadata.sample_rate(),
+                        vec![ChannelAudio::new(vec![0.25])?],
+                    )?,
+                )
+            }
+        }
+        impl LiveChunkReader for FixtureReader {
+            fn metadata(&self) -> AudioMetadata {
+                self.metadata
+            }
+            fn push(&mut self, bytes: &[u8]) -> Result<Option<DecodedChunk>, String> {
+                if bytes != b"x" {
+                    return Err("unexpected fixture payload".into());
+                }
+                let chunk = self.sample()?;
+                self.next_frame = chunk.end_frame();
+                self.pushed.notify_one();
+                Ok(Some(chunk))
+            }
+            fn finish(self: Box<Self>) -> Result<Option<DecodedChunk>, String> {
+                if self.next_frame != 1 {
+                    return Err("the fixture requires one sample before EOF".into());
+                }
+                self.sample().map(Some)
+            }
+        }
+
+        let fixture = crate::tests::assembly_fixture()?;
+        let admission = Arc::new(AdmissionState::new(&ServiceAdmission::new(
+            1,
+            1,
+            Duration::from_secs(5),
+        )?)?);
+        let telemetry = test_support::prepare(1, 1)?;
+        let state = active_session_state(
+            &fixture,
+            Arc::clone(&admission),
+            telemetry.metrics_arc(),
+            telemetry.producer(),
+        )?;
+        let pushed = Arc::new(tokio::sync::Notify::new());
+        let fixture_decoder: Arc<dyn LiveDecoderProvider> =
+            Arc::new(FixtureProvider(Arc::clone(&pushed)));
+        assert!(state.live.audio_decoder(Some("fixture")).is_err());
+        let state = WsState::new(
+            state
+                .live
+                .with_audio_decoders(LiveDecoders::new(vec![fixture_decoder], None)?),
+        );
+        let router = Router::new()
+            .route("/v1/stream", get(stream))
+            .with_state(state);
+        let (mut client, socket) = tokio::io::duplex(4096);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            axum::serve(DuplexListener(Some(socket)), router)
+                .with_graceful_shutdown(async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            client.write_all(
+                b"GET /v1/stream?rate=16000&fmt=fixture&endpoint=blank&silence_skip=false HTTP/1.1\r\nHost: fixture\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n"
+            ).await?;
+            let mut response = Vec::new();
+            while !response.ends_with(b"\r\n\r\n") {
+                response.push(client.read_u8().await?);
+            }
+            assert!(response.starts_with(b"HTTP/1.1 101"), "{}", String::from_utf8_lossy(&response));
+            // A zero mask leaves the one-byte fixture payload unchanged.
+            client.write_all(b"\x82\x81\0\0\0\0x").await?;
+            pushed.notified().await;
+            client.write_all(b"\x81\x8e\0\0\0\0{\"type\":\"end\"}").await?;
+            let mut trailing = Vec::new();
+            client.read_to_end(&mut trailing).await?;
+            let response = String::from_utf8_lossy(&trailing);
+            assert!(response.contains("{\"type\":\"end\"}"), "{response}");
+            assert!(!response.contains("{\"type\":\"error"), "{response}");
+            Ok::<_, std::io::Error>(())
+        }).await??;
+        shutdown_tx
+            .send(())
+            .map_err(|_| "fixture server stopped early")?;
+        server.await??;
+        assert_eq!(admission.available_ws(), 1);
+        Ok(())
+    }
+
     #[test]
     fn refused_pre_upgrade_requests_never_register_a_callback_or_start_factory_work() {
         let settings = ServiceAdmission::new(1, 2, Duration::from_secs(1))
@@ -2690,9 +2837,9 @@ mod tests {
         source_channels: SourceChannelCount,
         sample_rate: gigaam_audio::SampleRate,
         emission_mode: StreamEmissionMode,
-    ) -> Result<MultiChannelStreamSetup, String> {
+    ) -> Result<MultiChannelStreamSetup<gigaam_audio::SelectedLiveDecoder>, String> {
         MultiChannelStreamSetup::new(MultiChannelStreamSetupInput {
-            sample_format: SampleFormat::Pcm16,
+            sample_format: gigaam_format_raw::select(SampleFormat::Pcm16)?,
             source_sample_rate: sample_rate,
             source_channels,
             stream_config: serializer_stream_config(sample_rate)?,
@@ -2737,7 +2884,7 @@ mod tests {
     > {
         let mut factory = SerializerFactory::new()?;
         let sample_rate = factory.sample_rate;
-        let session = MultiChannelSession::new(
+        let session = MultiChannelSession::new_with_decoder(
             serializer_setup(source_channels, sample_rate, emission_mode)?,
             &mut factory,
         )?;
@@ -2838,8 +2985,12 @@ impl WsState {
         metrics: Arc<Metrics>,
         telemetry: TelemetryProducer,
     ) -> Self {
-        Self::new(gigaam_service_host::live::LiveService::new(
-            context, admission, metrics, telemetry,
-        ))
+        Self::new(
+            gigaam_service_host::live::LiveService::new(context, admission, metrics, telemetry)
+                .with_audio_decoders(
+                    gigaam_audio::LiveDecoders::new(gigaam_format_raw::providers(), Some("pcm16"))
+                        .expect("stock test providers are unique"),
+                ),
+        )
     }
 }

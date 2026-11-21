@@ -355,8 +355,6 @@ version = "0.1.1"
 dependencies = [
  "gigaam-model-package",
  "gigaam-primitives",
- "opus-decoder",
- "symphonia",
 ]
 
 [[package]]
@@ -364,10 +362,37 @@ name = "gigaam-cli"
 version = "0.1.1"
 dependencies = [
  "gigaam-audio",
+ "gigaam-format-codecs",
+ "gigaam-format-wav",
  "gigaam-model-package",
  "gigaam-primitives",
  "gigaam-recognition",
  "gigaam-transcription",
+]
+
+[[package]]
+name = "gigaam-format-codecs"
+version = "0.1.1"
+dependencies = [
+ "gigaam-audio",
+ "opus-decoder",
+ "symphonia",
+]
+
+[[package]]
+name = "gigaam-format-raw"
+version = "0.1.1"
+dependencies = [
+ "gigaam-audio",
+]
+
+[[package]]
+name = "gigaam-format-wav"
+version = "0.1.1"
+dependencies = [
+ "gigaam-audio",
+ "gigaam-format-raw",
+ "gigaam-primitives",
 ]
 
 [[package]]
@@ -403,6 +428,9 @@ dependencies = [
  "gigaam-api-native",
  "gigaam-api-openai",
  "gigaam-audio",
+ "gigaam-format-codecs",
+ "gigaam-format-raw",
+ "gigaam-format-wav",
  "gigaam-model-package",
  "gigaam-recognition",
  "gigaam-service-host",
@@ -417,6 +445,8 @@ dependencies = [
  "axum",
  "flate2",
  "gigaam-audio",
+ "gigaam-format-raw",
+ "gigaam-format-wav",
  "gigaam-model-package",
  "gigaam-primitives",
  "gigaam-recognition",
@@ -431,6 +461,9 @@ name = "gigaam-transcription"
 version = "0.1.1"
 dependencies = [
  "gigaam-audio",
+ "gigaam-format-codecs",
+ "gigaam-format-raw",
+ "gigaam-format-wav",
  "gigaam-model-package",
  "gigaam-primitives",
  "gigaam-recognition",

@@ -4,13 +4,14 @@
 
 //! Streaming-simulator command adapter with direct local Recognition composition.
 
+use crate::audio_io::load;
 use crate::composition;
 use crate::configuration;
 use crate::grammar::StreamInvocation;
 use crate::numeric::{count_to_f32, stream_chunk};
 use crate::projection;
 use crate::projection::stream::{StreamProjection, StreamSummary};
-use gigaam_audio::{ChannelAudio, load};
+use gigaam_audio::ChannelAudio;
 use gigaam_recognition::{ExecutionControl, RequiredEncoderRoles};
 use gigaam_transcription::{
     BatchConfig, BatchSetup, BatchTranscriber, EndpointDetector, PadPolicy, StreamSession,

@@ -11,7 +11,7 @@
 
 mod common;
 
-use gigaam_audio::read_wav;
+use gigaam_format_wav::read_wav;
 
 #[test]
 fn wav_decoding_matches_the_golden_waveform() {
