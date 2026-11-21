@@ -43,8 +43,8 @@ the locked package versions, license expressions and redistributed texts.
 | ort | gigaam-recognition | Dynamic ONNX Runtime binding with the API-24 graph-assignment surface; its transitive ort-sys binding follows the same expression. | MIT OR Apache-2.0 |
 | sha2 | gigaam-recognition | Canonical CUDA graph-assignment SHA-256 binding. | MIT OR Apache-2.0 |
 | prost | gigaam-model-package | Decodes the existing SentencePiece model protobuf format. | Apache-2.0 |
-| opus-decoder | gigaam-audio | Optional Opus decoding. | MIT OR Apache-2.0 |
-| symphonia | gigaam-audio | Optional MP3, FLAC, Vorbis, AAC, ISO-BMFF, Ogg, WAV, PCM, and Matroska decoding. | MPL-2.0 |
+| opus-decoder | gigaam-format-codecs | Optional Opus decoding. | MIT OR Apache-2.0 |
+| symphonia | gigaam-format-codecs | Optional MP3, FLAC, Vorbis, AAC, ISO-BMFF, Ogg, WAV, PCM, and Matroska decoding. | MPL-2.0 |
 | axum | gigaam-service | HTTP and WebSocket routing. | MIT |
 | tokio | gigaam-service | Async runtime, networking, signals, synchronization, and timers. | MIT |
 | tungstenite | gigaam-service | WebSocket close-frame and capacity-error types shared with axum's WebSocket support. | MIT OR Apache-2.0 |
@@ -68,13 +68,23 @@ present, checksum-bound crates.io source archive, and every top-level packaged
 into content-addressed files beneath `texts/`; the manifest maps each package notice to its
 SHA-256 text.
 
-The Symphonia MPL-2.0 crates and `opus-decoder` 0.1.1 contain no standalone license or notice
-file in their locked crate archives. Their generated records retain the metadata expression and
-the exact checksum-bound crates.io source archive. Every MPL-2.0 record also links the canonical
+Where a locked registry crate has no standalone license or notice, its generated record
+retains the metadata expression and exact checksum-bound crates.io source archive. Every MPL-2.0 record also links the canonical
 [Mozilla Public License 2.0 terms](https://www.mozilla.org/MPL/2.0/) and identifies the archive
 as its source-acquisition location.
 CI compares the checked-in payload with those inputs. The Dockerfiles copy the payload to each
 final image. Inspect the built images to verify the shipped files.
+
+## Modified Symphonia demuxers
+
+The ISO-BMFF and Matroska format crates use local copies of version 0.6.1 with a
+sequential batch read path. Their MPL-2.0 license and modified source accompany
+the corresponding GigaAM v3 Runtime checkout. See the exact upstream revision and
+archive in the [ISO-BMFF source record](crates/third-party/symphonia-format-isomp4/SOURCE.md)
+and [Matroska source record](crates/third-party/symphonia-format-mkv/SOURCE.md).
+Each service image includes the license and source record for both demuxers under
+`/usr/share/licenses/gigaam-v3-runtime`. The modified source is available under
+`crates/third-party` in the repository revision used to build the image.
 
 ## Attribution
 
