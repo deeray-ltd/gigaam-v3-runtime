@@ -303,18 +303,33 @@ fn search<F>(input: &CtcBeamInput<'_>, checkpoint: &mut F) -> Result<Vec<Prefix>
 where
     F: FnMut() -> Result<(), String>,
 {
-    search_observed(input, checkpoint, &mut |_, _, _, _| {})
+    search_observed(
+        input,
+        checkpoint,
+        #[cfg(test)]
+        &mut |_, _, _| {},
+    )
 }
 
-// The observer permits tests to count live entries at the two peak-storage phases.
-fn search_observed<F, O>(
+#[cfg(test)]
+#[derive(Default)]
+struct SearchObservation<'a> {
+    candidates: &'a [Candidate],
+    candidate_capacity: usize,
+    rank_capacity: usize,
+    slot_capacity: usize,
+    ancestor_comparisons: usize,
+    slot_lookups: usize,
+}
+
+// Observe lookup work and storage as the live buffers change between search phases.
+fn search_observed<F>(
     input: &CtcBeamInput<'_>,
     checkpoint: &mut F,
-    observe: &mut O,
+    #[cfg(test)] observe: &mut impl FnMut(SearchObservation<'_>, &[Prefix], &[Prefix]),
 ) -> Result<Vec<Prefix>, String>
 where
     F: FnMut() -> Result<(), String>,
-    O: FnMut(usize, (usize, usize), &[Prefix], &[Prefix]),
 {
     checkpoint()?;
     let empty = State {
@@ -333,11 +348,11 @@ where
         },
         nonblank: empty,
     });
-    let candidate_limit = input
-        .width
-        .checked_mul(input.vocabulary)
-        .and_then(|n| n.checked_add(input.width))
-        .ok_or("CTC candidate count overflow")?;
+    const NO_CANDIDATE: usize = usize::MAX;
+    let stride = input
+        .vocabulary
+        .checked_add(1)
+        .ok_or("CTC slot count overflow")?;
     for frame in 0..input.frames {
         checkpoint()?;
         let row = &input.scores[frame * input.vocabulary..(frame + 1) * input.vocabulary];
@@ -348,9 +363,38 @@ where
             return Err("invalid CTC normalization".into());
         }
         let mut candidates: Vec<Candidate> = Vec::new();
-        reserve(&mut candidates, candidate_limit)?;
+        let slot_count = current
+            .len()
+            .checked_mul(stride)
+            .ok_or("CTC slot count overflow")?;
+        // Each retained prefix has at most one unchanged and one destination per label.
+        reserve(&mut candidates, slot_count)?;
+        let mut slots = Vec::new();
+        reserve(&mut slots, slot_count)?;
+        slots.resize(slot_count, NO_CANDIDATE);
+        #[cfg(test)]
+        let mut comparisons = 0_usize;
+        #[cfg(test)]
+        let mut lookups = 0_usize;
         let mut work = 0_usize;
         for (parent, prefix) in current.iter().enumerate() {
+            checkpoint()?;
+            let own_slot = parent * stride + input.vocabulary;
+            // An unchanged prefix aliases its unique extension only if the immediate
+            // predecessor survived pruning. Retained prefixes are lexicographically sorted.
+            let unchanged_slot = match prefix.ids.split_last() {
+                Some((&last, ancestor)) => match current.binary_search_by(|p| {
+                    #[cfg(test)]
+                    {
+                        comparisons += 1;
+                    }
+                    p.ids.as_slice().cmp(ancestor)
+                }) {
+                    Ok(index) => index * stride + last,
+                    Err(_) => own_slot,
+                },
+                None => own_slot,
+            };
             for (label, &value) in row.iter().enumerate() {
                 if work.is_multiple_of(256) {
                     checkpoint()?;
@@ -369,26 +413,28 @@ where
                         continue;
                     }
                     let extension = if unchanged_repeat { None } else { appended };
-                    let probe = Candidate {
-                        parent,
-                        appended: extension,
-                        blank: DestinationState::default(),
-                        nonblank: DestinationState::default(),
-                    };
-                    let index = match candidates
-                        .iter()
-                        .position(|c| key(c, &current).eq(key(&probe, &current)))
+                    #[cfg(test)]
                     {
-                        Some(index) => index,
-                        None => {
-                            candidates.push(probe);
-                            candidates.len() - 1
-                        }
+                        lookups += 1;
+                    }
+                    let slot = match extension {
+                        Some(label) => parent * stride + label,
+                        None => unchanged_slot,
                     };
+                    let index = &mut slots[slot];
+                    if *index == NO_CANDIDATE {
+                        *index = candidates.len();
+                        candidates.push(Candidate {
+                            parent,
+                            appended: extension,
+                            blank: DestinationState::default(),
+                            nonblank: DestinationState::default(),
+                        });
+                    }
                     let dest = if label == input.blank {
-                        &mut candidates[index].blank
+                        &mut candidates[*index].blank
                     } else {
-                        &mut candidates[index].nonblank
+                        &mut candidates[*index].nonblank
                     };
                     if !unchanged_repeat {
                         contribute(dest, &prefix.blank, parent, true, label, q, &current)?;
@@ -399,12 +445,31 @@ where
                 }
             }
         }
+        #[cfg(test)]
+        observe(
+            SearchObservation {
+                candidates: &candidates,
+                candidate_capacity: candidates.capacity(),
+                slot_capacity: slots.capacity(),
+                ancestor_comparisons: comparisons,
+                slot_lookups: lookups,
+                ..SearchObservation::default()
+            },
+            &current,
+            &[],
+        );
+        drop(slots);
         // Remove unreachable destinations, then order by mass and lexicographic identity.
         let mut ranked = Vec::new();
         reserve(&mut ranked, candidates.len())?;
+        #[cfg(test)]
         observe(
-            candidates.len(),
-            (candidates.capacity(), ranked.capacity()),
+            SearchObservation {
+                candidates: &candidates,
+                candidate_capacity: candidates.capacity(),
+                rank_capacity: ranked.capacity(),
+                ..SearchObservation::default()
+            },
             &current,
             &[],
         );
@@ -428,7 +493,8 @@ where
             });
         }
         next.sort_unstable_by(|a, b| a.ids.cmp(&b.ids));
-        observe(0, (0, 0), &current, &next);
+        #[cfg(test)]
+        observe(SearchObservation::default(), &current, &next);
         current = next;
     }
     Ok(current)
@@ -636,34 +702,124 @@ mod tests {
                 let mut observations = 0;
                 let mut largest_scratch = 0;
                 let mut largest_history = 0;
-                search_observed(
-                    &input,
-                    &mut || Ok(()),
-                    &mut |scratch, scratch_capacity, old, new| {
-                        observations += 1;
-                        largest_scratch = largest_scratch.max(scratch);
-                        assert!(scratch <= width * (vocabulary + 1));
-                        assert!(scratch_capacity.0 <= width * (vocabulary + 1));
-                        assert!(scratch_capacity.1 <= width * (vocabulary + 1));
-                        assert!(old.len() <= width && new.len() <= width);
-                        let history: usize = old
-                            .iter()
-                            .chain(new)
-                            .map(|prefix| {
-                                prefix.ids.len()
-                                    + prefix.blank.path.len()
-                                    + prefix.nonblank.path.len()
-                            })
-                            .sum();
-                        largest_history = largest_history.max(history);
-                        assert!(history <= 6 * width * frames);
-                    },
-                )?;
-                assert_eq!(observations, 2 * frames);
+                search_observed(&input, &mut || Ok(()), &mut |storage, old, new| {
+                    observations += 1;
+                    let parent_capacity = old.len() * (vocabulary + 1);
+                    assert!(storage.slot_capacity <= parent_capacity);
+                    assert!(storage.candidate_capacity <= parent_capacity);
+                    assert!(storage.rank_capacity <= parent_capacity);
+                    let live_scratch = storage.slot_capacity * size_of::<usize>()
+                        + storage.candidate_capacity * size_of::<Candidate>()
+                        + storage.rank_capacity * size_of::<(Candidate, f64)>();
+                    let scratch_budget =
+                        parent_capacity * (size_of::<Candidate>() + size_of::<(Candidate, f64)>());
+                    assert!(live_scratch <= scratch_budget);
+                    assert!(storage.slot_capacity == 0 || storage.rank_capacity == 0);
+                    largest_scratch = largest_scratch.max(storage.candidates.len());
+                    assert!(old.len() <= width && new.len() <= width);
+                    let history: usize = old
+                        .iter()
+                        .chain(new)
+                        .map(|prefix| {
+                            prefix.ids.len() + prefix.blank.path.len() + prefix.nonblank.path.len()
+                        })
+                        .sum();
+                    largest_history = largest_history.max(history);
+                    assert!(history <= 6 * width * frames);
+                })?;
+                assert_eq!(observations, 3 * frames);
                 assert!(largest_scratch >= vocabulary);
                 assert!(largest_history >= frames);
             }
         }
+        Ok(())
+    }
+
+    fn linear_destination_keys(
+        retained: &[Prefix],
+        vocabulary: usize,
+        blank: usize,
+    ) -> (Vec<Vec<usize>>, usize) {
+        let mut identities = Vec::new();
+        let mut comparisons = 0;
+        let mut add = |identity| {
+            if !identities.iter().any(|existing| {
+                comparisons += 1;
+                *existing == identity
+            }) {
+                identities.push(identity);
+            }
+        };
+        for prefix in retained {
+            for label in 0..vocabulary {
+                let mut extension = prefix.ids.clone();
+                if label != blank {
+                    extension.push(label);
+                }
+                add(extension);
+                if prefix.ids.last() == Some(&label) {
+                    add(prefix.ids.clone());
+                }
+            }
+        }
+        (identities, comparisons)
+    }
+
+    #[test]
+    fn indexed_destinations_match_ordered_scan_across_pruning_and_vocabularies()
+    -> Result<(), String> {
+        let mut retained_ancestor = false;
+        let mut pruned_ancestor = false;
+        let mut empty_prefix = false;
+        for (vocabulary, width) in [(3, 2), (3, 8), (16, 4), (64, 8), (256, 32)] {
+            let frames = 5;
+            let blank = vocabulary / 2;
+            let rows: Vec<f32> = (0..frames * vocabulary)
+                .map(|i| {
+                    f32::from(
+                        i16::try_from((i * 17 + i / vocabulary * 11) % 97)
+                            .expect("bounded fixture"),
+                    ) / 13.0
+                })
+                .collect();
+            let input = test_input(&rows, frames, vocabulary, blank, width, ScoreDetail::None)?;
+            let mut observed_full_width = false;
+            search_observed(&input, &mut || Ok(()), &mut |work, old, _| {
+                if work.slot_capacity == 0 {
+                    return;
+                }
+                observed_full_width |= old.len() == width;
+                let (expected, linear_comparisons) =
+                    linear_destination_keys(old, vocabulary, blank);
+                let actual: Vec<Vec<usize>> = work
+                    .candidates
+                    .iter()
+                    .map(|c| key(c, old).collect())
+                    .collect();
+                assert_eq!(actual, expected);
+                let nonempty = old.iter().filter(|p| !p.ids.is_empty()).count();
+                assert_eq!(work.slot_lookups, old.len() * vocabulary + nonempty);
+                let comparison_bound = usize::try_from(old.len().ilog2())
+                    .expect("log of retained count fits usize")
+                    + 2;
+                assert!(work.ancestor_comparisons <= nonempty * comparison_bound);
+                if vocabulary >= 16 {
+                    assert!(work.ancestor_comparisons + work.slot_lookups < linear_comparisons);
+                }
+                for prefix in old {
+                    match prefix.ids.split_last() {
+                        Some((_, predecessor)) => {
+                            let present = old.iter().any(|p| p.ids == predecessor);
+                            retained_ancestor |= present;
+                            pruned_ancestor |= !present;
+                        }
+                        None => empty_prefix = true,
+                    }
+                }
+            })?;
+            assert!(observed_full_width);
+        }
+        assert!(retained_ancestor && pruned_ancestor && empty_prefix);
         Ok(())
     }
 
