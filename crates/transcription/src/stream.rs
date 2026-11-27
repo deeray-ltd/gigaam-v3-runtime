@@ -19,7 +19,8 @@ use crate::padding::pad_noise;
 use crate::stitch::{Window, WindowWords, seam, stitch_aligned};
 use crate::text::normalize_word;
 use gigaam_audio::{
-    ChannelAudio, ChannelAudioView, FeatureMatrixView, FrontendProcessor, FrontendScratch,
+    ChannelAudio, ChannelAudioView, FeatureMatrix, FeatureMatrixView, FrontendProcessor,
+    FrontendScratch,
 };
 use gigaam_primitives::{trunc_f32_to_usize, usize_to_f32};
 use gigaam_recognition::vad::{VAD_FPS, VAD_SR, mask};
@@ -117,6 +118,13 @@ enum StreamProgress {
 
 impl<D: WindowDecoder, V: SpeechProbabilityDetector> StreamSession<D, V> {
     pub fn new(setup: StreamSetup<D, V>) -> Result<Self, String> {
+        Self::new_with_analysis(setup, |frontend, samples| frontend.log_mel(samples))
+    }
+
+    fn new_with_analysis(
+        setup: StreamSetup<D, V>,
+        mut analyze: impl FnMut(&FrontendProcessor, &[f32]) -> Result<FeatureMatrix, String>,
+    ) -> Result<Self, String> {
         let StreamSetup {
             frontend,
             decoder,
@@ -168,14 +176,9 @@ impl<D: WindowDecoder, V: SpeechProbabilityDetector> StreamSession<D, V> {
             }
         }
         let full_samples = config.full_window_samples().get();
-        let full_frames = frontend.log_mel(&vec![0.0_f32; full_samples])?.frames();
         let noise = pad_noise(full_samples, 0x5eed);
-        let noise_features = frontend.log_mel(&noise)?;
-        if noise_features.frames() != full_frames {
-            return Err(
-                "stream frontend frame count differs for equal validated window shapes".into(),
-            );
-        }
+        let noise_features = analyze(&frontend, &noise)?;
+        let full_frames = noise_features.frames();
         let noise_mel = noise_features.into_values();
         let scratch = frontend.scratch()?;
         let mel_bins = frontend.mel_bins();
@@ -852,6 +855,81 @@ mod tests {
     };
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn startup_analyzes_one_noise_window_per_session_and_warms_up_with_it() -> Result<(), String> {
+        use std::sync::Mutex;
+
+        type CapturedFeatures = (usize, usize, Vec<f32>);
+        struct CaptureDecoder(Arc<Mutex<Vec<CapturedFeatures>>>);
+        impl WindowDecoder for CaptureDecoder {
+            fn silence_capability(&self) -> gigaam_recognition::SilenceCapability {
+                gigaam_recognition::SilenceCapability::LegacyBlank
+            }
+            fn frame_rate(&self) -> FrameRate {
+                FrameRate::new(8.0).expect("valid frame rate")
+            }
+            fn decode(&mut self, features: FeatureMatrixView<'_>) -> Result<Decoded, String> {
+                self.0.lock().map_err(|_| "capture lock poisoned")?.push((
+                    features.mel_bins(),
+                    features.frames(),
+                    features.values().to_vec(),
+                ));
+                Decoded::new(
+                    vec![],
+                    vec![false; features.frames()],
+                    features.frames(),
+                    0.0,
+                )
+            }
+        }
+
+        for (rate_hz, window_sec, channels) in [
+            (16_000, 0.128, 1),
+            (16_000, 2.0, 2),
+            (8_000, 1.0, 3),
+            (16, 0.125, 1),
+        ] {
+            let rate = SampleRate::new(rate_hz)?;
+            let config = StreamConfig::timing_changes()
+                .with_window_sec(window_sec)?
+                .with_overlap_sec(0.0)?
+                .with_step_sec(window_sec / 2.0)?
+                .apply(StreamConfig::checked_default(rate)?)?
+                .with_endpoint_source(EndpointSource::Manual)?;
+            let frontend = crate::test_support::frontend_at_sample_rate(rate_hz);
+            let expected = frontend.log_mel(&crate::padding::pad_noise(
+                config.full_window_samples().get(),
+                0x5eed,
+            ))?;
+            let analyses = AtomicUsize::new(0);
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            for _ in 0..channels {
+                let mut session = StreamSession::new_with_analysis(
+                    StreamSetup {
+                        frontend: Arc::clone(&frontend),
+                        decoder: CaptureDecoder(Arc::clone(&calls)),
+                        config: config.clone(),
+                        detector: EndpointDetector::<NonFiniteDetector>::Manual,
+                        control: ExecutionControl::without_deadline(),
+                    },
+                    |processor, samples| {
+                        analyses.fetch_add(1, Ordering::SeqCst);
+                        processor.log_mel(samples)
+                    },
+                )?;
+                session.warmup()?;
+            }
+            assert_eq!(analyses.load(Ordering::SeqCst), channels);
+            let calls = calls.lock().map_err(|_| "capture lock poisoned")?;
+            assert_eq!(calls.len(), channels);
+            for (bins, frames, values) in calls.iter() {
+                assert_eq!((*bins, *frames), (expected.mel_bins(), expected.frames()));
+                assert_eq!(values, expected.values());
+            }
+        }
+        Ok(())
+    }
 
     struct ScriptDecoder {
         lines: std::collections::VecDeque<Vec<Word>>,
