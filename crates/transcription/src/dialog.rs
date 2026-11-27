@@ -232,6 +232,11 @@ fn finish_turn(
     })
 }
 
+#[cfg(test)]
+thread_local! {
+    static PEER_COMPARISONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn mark_backchannels(dialogue: &mut [DialogTurn], policy: BackchannelPolicy) {
     let BackchannelPolicy::MarkShorterThan(maximum_duration) = policy else {
         return;
@@ -242,14 +247,17 @@ fn mark_backchannels(dialogue: &mut [DialogTurn], policy: BackchannelPolicy) {
         .enumerate()
         .map(|(index, turn)| {
             let duration = turn.end() - turn.start();
-            let overlaps_longer_peer = dialogue.iter().enumerate().any(|(peer_index, peer)| {
-                peer_index != index
-                    && peer.channel() != turn.channel()
-                    && peer.start() <= turn.start()
-                    && peer.end() >= turn.end()
-                    && peer.end() - peer.start() > duration
-            });
-            if duration <= maximum_duration.seconds() && overlaps_longer_peer {
+            let overlaps_longer_peer = duration <= maximum_duration.seconds()
+                && dialogue.iter().enumerate().any(|(peer_index, peer)| {
+                    #[cfg(test)]
+                    PEER_COMPARISONS.with(|count| count.set(count.get() + 1));
+                    peer_index != index
+                        && peer.channel() != turn.channel()
+                        && peer.start() <= turn.start()
+                        && peer.end() >= turn.end()
+                        && peer.end() - peer.start() > duration
+                });
+            if overlaps_longer_peer {
                 BackchannelMark::Yes
             } else {
                 BackchannelMark::No
@@ -257,7 +265,7 @@ fn mark_backchannels(dialogue: &mut [DialogTurn], policy: BackchannelPolicy) {
         })
         .collect();
     for (turn, mark) in dialogue.iter_mut().zip(marks) {
-        *turn = turn.clone().with_backchannel(mark);
+        turn.set_backchannel(mark);
     }
 }
 
@@ -656,6 +664,161 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![(0, BackchannelMark::No), (1, BackchannelMark::Yes)]
         );
+    }
+
+    #[test]
+    fn backchannel_boundaries_and_peer_work_preserve_turns() {
+        use super::{PEER_COMPARISONS, mark_backchannels};
+        use crate::contracts::{DialogTurn, DialogTurnData};
+
+        let turn = |channel, index, start, end, text: &str| {
+            DialogTurn::new(DialogTurnData {
+                channel,
+                index,
+                start,
+                end,
+                text: text.into(),
+                stability: WordStability::Revisable,
+                finality: WordFinality::Open,
+                backchannel: BackchannelMark::No,
+            })
+            .expect("valid turn")
+        };
+        let policy = BackchannelPolicy::MarkShorterThan(
+            BackchannelDuration::new(1.0).expect("valid duration"),
+        );
+        let mut long: Vec<_> = (0_u16..128)
+            .map(|i| {
+                turn(
+                    usize::from(i % 2),
+                    usize::from(i),
+                    f32::from(i) * 4.0,
+                    f32::from(i) * 4.0 + 2.0,
+                    "long",
+                )
+            })
+            .collect();
+        PEER_COMPARISONS.with(|count| count.set(0));
+        mark_backchannels(&mut long, policy);
+        assert_eq!(PEER_COMPARISONS.with(|count| count.get()), 0);
+        assert!(
+            long.iter()
+                .all(|turn| turn.backchannel() == BackchannelMark::No)
+        );
+
+        // Equal endpoints count as containment, but equal duration and same-channel
+        // containment do not qualify. Partial overlap does not count either.
+        let mut turns = vec![
+            turn(0, 0, 0.0, 4.0, "container"),
+            turn(1, 0, 0.0, 1.0, "start boundary"),
+            turn(1, 1, 3.0, 4.0, "end boundary"),
+            turn(0, 1, 5.0, 6.0, "equal duration"),
+            turn(1, 2, 5.0, 6.0, "equal peer"),
+            turn(0, 2, 7.0, 10.0, "same channel container"),
+            turn(0, 3, 8.0, 9.0, "same channel short"),
+            turn(1, 3, 9.5, 10.5, "partial overlap"),
+            turn(1, 4, 11.0, 12.25, "over limit"),
+            turn(0, 4, 11.0, 14.0, "long peer"),
+        ];
+        let before = turns.clone();
+        let text_pointers: Vec<_> = turns.iter().map(|turn| turn.text().as_ptr()).collect();
+        PEER_COMPARISONS.with(|count| count.set(0));
+        mark_backchannels(&mut turns, policy);
+        assert_eq!(
+            turns
+                .iter()
+                .map(|turn| turn.backchannel())
+                .collect::<Vec<_>>(),
+            vec![
+                BackchannelMark::No,
+                BackchannelMark::Yes,
+                BackchannelMark::Yes,
+                BackchannelMark::No,
+                BackchannelMark::No,
+                BackchannelMark::No,
+                BackchannelMark::No,
+                BackchannelMark::No,
+                BackchannelMark::No,
+                BackchannelMark::No
+            ]
+        );
+        // Six eligible turns scan no more than the full list; long turns do no work.
+        let comparisons = PEER_COMPARISONS.with(|count| count.get());
+        assert!(comparisons > 0 && comparisons <= 6 * turns.len());
+        for ((after, original), pointer) in turns.iter().zip(&before).zip(text_pointers) {
+            assert_eq!(after.text().as_ptr(), pointer);
+            assert_eq!(
+                (
+                    after.channel(),
+                    after.index(),
+                    after.start(),
+                    after.end(),
+                    after.text(),
+                    after.stability(),
+                    after.finality()
+                ),
+                (
+                    original.channel(),
+                    original.index(),
+                    original.start(),
+                    original.end(),
+                    original.text(),
+                    original.stability(),
+                    original.finality()
+                )
+            );
+        }
+        let marked = turns.clone();
+        mark_backchannels(&mut turns, BackchannelPolicy::Disabled);
+        assert_eq!(turns, marked);
+    }
+
+    #[test]
+    fn backchannel_change_revises_the_affected_patch() {
+        let policy = BackchannelPolicy::MarkShorterThan(
+            BackchannelDuration::new(1.0).expect("valid duration"),
+        );
+        let mut merger = merger().with_backchannel_policy(policy);
+        let input = |end| {
+            [
+                channel(
+                    0,
+                    vec![word(
+                        "peer",
+                        0.0,
+                        end,
+                        WordFinality::Open,
+                        WordStability::Revisable,
+                    )],
+                    0.0,
+                    0.0,
+                ),
+                channel(
+                    1,
+                    vec![word(
+                        "reply",
+                        1.0,
+                        2.0,
+                        WordFinality::Open,
+                        WordStability::Revisable,
+                    )],
+                    0.0,
+                    0.0,
+                ),
+            ]
+        };
+        let first = merger
+            .update(&input(3.0))
+            .expect("valid input")
+            .expect("initial patch");
+        assert_eq!(first.turns()[1].backchannel(), BackchannelMark::Yes);
+        assert!(merger.update(&input(3.0)).expect("valid input").is_none());
+        let revised = merger
+            .update(&input(1.5))
+            .expect("valid input")
+            .expect("revised patch");
+        assert_eq!(revised.revise_from(), 0);
+        assert_eq!(revised.turns()[1].backchannel(), BackchannelMark::No);
     }
 
     #[test]

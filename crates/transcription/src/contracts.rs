@@ -1243,9 +1243,8 @@ impl DialogTurn {
         self.backchannel
     }
 
-    pub(crate) fn with_backchannel(mut self, value: BackchannelMark) -> Self {
+    pub(crate) fn set_backchannel(&mut self, value: BackchannelMark) {
         self.backchannel = value;
-        self
     }
 }
 
