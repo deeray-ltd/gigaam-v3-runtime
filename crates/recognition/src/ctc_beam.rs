@@ -9,7 +9,7 @@
 //! beam prunes paths, and width one is not necessarily equivalent to greedy decoding.
 
 use crate::{ScoreDetail, Token};
-use std::cmp::Ordering;
+use std::num::NonZeroUsize;
 
 /// Search choices for a CTC score matrix.
 #[derive(Clone, Copy, Debug)]
@@ -140,11 +140,28 @@ fn copy_append<T: Copy>(source: &[T], extra: Option<T>) -> Result<Vec<T>, String
     }
     Ok(result)
 }
-#[derive(Clone)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct Rank(usize);
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct NodeId(NonZeroUsize);
+struct Node {
+    parent: Option<NodeId>,
+    label: usize,
+}
+#[derive(Clone, Copy)]
+struct Representative {
+    score: f64,
+    tail: Option<NodeId>,
+    rank: Rank,
+}
+#[derive(Clone, Copy)]
 struct State {
     mass: Mass,
-    score: Mass,
-    path: Vec<usize>,
+    representative: Option<Representative>,
+}
+struct SearchResult {
+    prefixes: Vec<Prefix>,
+    arena: Vec<Node>,
 }
 struct Prefix {
     ids: Vec<usize>,
@@ -152,73 +169,56 @@ struct Prefix {
     nonblank: State,
 }
 #[derive(Clone, Copy)]
-struct RefPath {
-    parent: usize,
-    blank: bool,
+struct RefPath<'a> {
+    parent: &'a Representative,
     label: usize,
     score: f64,
 }
 #[derive(Default)]
-struct DestinationState {
+struct DestinationState<'a> {
     mass: Mass,
-    best: Option<RefPath>,
+    best: Option<RefPath<'a>>,
 }
-struct Candidate {
+struct Candidate<'a> {
     parent: usize,
     appended: Option<usize>,
-    blank: DestinationState,
-    nonblank: DestinationState,
+    blank: DestinationState<'a>,
+    nonblank: DestinationState<'a>,
 }
-fn state(prefix: &Prefix, blank: bool) -> &State {
-    if blank {
-        &prefix.blank
-    } else {
-        &prefix.nonblank
-    }
-}
-fn key<'a>(candidate: &'a Candidate, current: &'a [Prefix]) -> impl Iterator<Item = usize> + 'a {
+fn key<'a>(
+    candidate: &'a Candidate<'_>,
+    current: &'a [Prefix],
+) -> impl Iterator<Item = usize> + 'a {
     current[candidate.parent]
         .ids
         .iter()
         .copied()
         .chain(candidate.appended)
 }
-fn path_cmp(a: RefPath, b: RefPath, current: &[Prefix]) -> Ordering {
-    state(&current[a.parent], a.blank)
-        .path
-        .iter()
-        .copied()
-        .chain(Some(a.label))
-        .cmp(
-            state(&current[b.parent], b.blank)
-                .path
-                .iter()
-                .copied()
-                .chain(Some(b.label)),
-        )
+fn path_key(path: RefPath<'_>) -> (Rank, usize) {
+    (path.parent.rank, path.label)
 }
-fn contribute(
-    target: &mut DestinationState,
-    source: &State,
-    parent: usize,
-    blank: bool,
+fn contribute<'a>(
+    target: &mut DestinationState<'a>,
+    source: &'a State,
     label: usize,
     q: f64,
-    current: &[Prefix],
 ) -> Result<(), String> {
     target.mass = add(target.mass, extend(source.mass, q)?)?;
-    if let Some(score) = extend(source.score, q)? {
+    if let Some(parent) = source.representative.as_ref() {
+        let score = parent.score + q;
+        if !score.is_finite() {
+            return Err("invalid CTC path score".into());
+        }
         let candidate = RefPath {
             parent,
-            blank,
             label,
             score,
         };
         let replace = match target.best {
             None => true,
             Some(old) => {
-                score > old.score
-                    || (score == old.score && path_cmp(candidate, old, current).is_lt())
+                score > old.score || (score == old.score && path_key(candidate) < path_key(old))
             }
         };
         if replace {
@@ -227,22 +227,36 @@ fn contribute(
     }
     Ok(())
 }
-fn materialize(s: &DestinationState, current: &[Prefix]) -> Result<State, String> {
-    match s.best {
-        None => Ok(State {
-            mass: s.mass,
-            score: None,
-            path: Vec::new(),
-        }),
-        Some(best) => Ok(State {
-            mass: s.mass,
-            score: Some(best.score),
-            path: copy_append(
-                &state(&current[best.parent], best.blank).path,
-                Some(best.label),
-            )?,
-        }),
-    }
+fn materialize(
+    s: &DestinationState<'_>,
+    keys: &[(Rank, usize)],
+    arena: &mut Vec<Node>,
+) -> Result<State, String> {
+    let representative = if let Some(best) = s.best {
+        let parent = best.parent;
+        let key = (parent.rank, best.label);
+        let rank = Rank(keys.binary_search(&key).expect("rank key exists"));
+        let index = arena
+            .len()
+            .checked_add(1)
+            .and_then(NonZeroUsize::new)
+            .ok_or("CTC history count overflow")?;
+        arena.push(Node {
+            parent: parent.tail,
+            label: best.label,
+        });
+        Some(Representative {
+            score: best.score,
+            tail: Some(NodeId(index)),
+            rank,
+        })
+    } else {
+        None
+    };
+    Ok(State {
+        mass: s.mass,
+        representative,
+    })
 }
 
 /// Runs prefix search, calling `checkpoint` before work, per frame, and during expansion.
@@ -251,7 +265,10 @@ pub fn decode<F>(input: &CtcBeamInput<'_>, mut checkpoint: F) -> Result<CtcBeamO
 where
     F: FnMut() -> Result<(), String>,
 {
-    let current = search(input, &mut checkpoint)?;
+    let SearchResult {
+        prefixes: current,
+        arena,
+    } = search(input, &mut checkpoint)?;
     let mut winner: Option<(usize, f64)> = None;
     for (i, prefix) in current.iter().enumerate() {
         if let Some(mass) = add(prefix.blank.mass, prefix.nonblank.mass)?
@@ -263,23 +280,44 @@ where
     }
     let (index, _) = winner.ok_or("CTC search produced no path")?;
     let prefix = &current[index];
-    let best = match (prefix.blank.score, prefix.nonblank.score) {
+    let best = match (prefix.blank.representative, prefix.nonblank.representative) {
         (Some(a), Some(b)) => {
-            if a > b || (a == b && prefix.blank.path <= prefix.nonblank.path) {
-                &prefix.blank
+            if a.score > b.score || (a.score == b.score && a.rank <= b.rank) {
+                a
             } else {
-                &prefix.nonblank
+                b
             }
         }
-        (Some(_), None) => &prefix.blank,
-        (None, Some(_)) => &prefix.nonblank,
+        (Some(a), None) | (None, Some(a)) => a,
         (None, None) => return Err("CTC winning prefix has no path".into()),
     };
-    let labels = copy_append(&best.path, None)?;
+    let token_capacity = prefix.ids.len();
+    drop(current);
+    let mut labels = Vec::new();
+    reserve(&mut labels, input.frames)?;
+    let mut tail = best.tail;
+    for position in 0..input.frames {
+        if position.is_multiple_of(256) {
+            checkpoint()?;
+        }
+        let id = tail.ok_or("CTC history ended early")?;
+        let node = arena.get(id.0.get() - 1).ok_or("invalid CTC history")?;
+        labels.push(node.label);
+        tail = node.parent;
+    }
+    if tail.is_some() {
+        return Err("CTC history exceeds frame count".into());
+    }
+    labels.reverse();
+    drop(arena);
+    checkpoint()?;
     let mut tokens = Vec::new();
-    reserve(&mut tokens, prefix.ids.len())?;
+    reserve(&mut tokens, token_capacity)?;
     let mut previous = None;
     for (frame, &label) in labels.iter().enumerate() {
+        if frame.is_multiple_of(256) {
+            checkpoint()?;
+        }
         if label != input.blank && previous != Some(label) {
             let token = match input.detail {
                 ScoreDetail::None => Token::new(label, frame),
@@ -296,10 +334,11 @@ where
         }
         previous = Some(label);
     }
+    checkpoint()?;
     Ok(CtcBeamOutput { labels, tokens })
 }
 
-fn search<F>(input: &CtcBeamInput<'_>, checkpoint: &mut F) -> Result<Vec<Prefix>, String>
+fn search<F>(input: &CtcBeamInput<'_>, checkpoint: &mut F) -> Result<SearchResult, String>
 where
     F: FnMut() -> Result<(), String>,
 {
@@ -314,10 +353,15 @@ where
 #[cfg(test)]
 #[derive(Default)]
 struct SearchObservation<'a> {
-    candidates: &'a [Candidate],
+    candidates: &'a [Candidate<'a>],
     candidate_capacity: usize,
     rank_capacity: usize,
     slot_capacity: usize,
+    arena_len: usize,
+    arena_capacity: usize,
+    key_capacity: usize,
+    current_capacity: usize,
+    next_capacity: usize,
     ancestor_comparisons: usize,
     slot_lookups: usize,
 }
@@ -327,15 +371,14 @@ fn search_observed<F>(
     input: &CtcBeamInput<'_>,
     checkpoint: &mut F,
     #[cfg(test)] observe: &mut impl FnMut(SearchObservation<'_>, &[Prefix], &[Prefix]),
-) -> Result<Vec<Prefix>, String>
+) -> Result<SearchResult, String>
 where
     F: FnMut() -> Result<(), String>,
 {
     checkpoint()?;
     let empty = State {
         mass: None,
-        score: None,
-        path: Vec::new(),
+        representative: None,
     };
     let mut current = Vec::new();
     reserve(&mut current, 1)?;
@@ -343,11 +386,15 @@ where
         ids: Vec::new(),
         blank: State {
             mass: Some(0.0),
-            score: Some(0.0),
-            path: Vec::new(),
+            representative: Some(Representative {
+                score: 0.0,
+                tail: None,
+                rank: Rank(0),
+            }),
         },
         nonblank: empty,
     });
+    let mut arena = Vec::new();
     const NO_CANDIDATE: usize = usize::MAX;
     let stride = input
         .vocabulary
@@ -362,7 +409,7 @@ where
         if !normalizer.is_finite() {
             return Err("invalid CTC normalization".into());
         }
-        let mut candidates: Vec<Candidate> = Vec::new();
+        let mut candidates: Vec<Candidate<'_>> = Vec::new();
         let slot_count = current
             .len()
             .checked_mul(stride)
@@ -437,10 +484,10 @@ where
                         &mut candidates[*index].nonblank
                     };
                     if !unchanged_repeat {
-                        contribute(dest, &prefix.blank, parent, true, label, q, &current)?;
+                        contribute(dest, &prefix.blank, label, q)?;
                     }
                     if label == input.blank || (!repeat && !unchanged_repeat) || unchanged_repeat {
-                        contribute(dest, &prefix.nonblank, parent, false, label, q, &current)?;
+                        contribute(dest, &prefix.nonblank, label, q)?;
                     }
                 }
             }
@@ -448,9 +495,12 @@ where
         #[cfg(test)]
         observe(
             SearchObservation {
+                current_capacity: current.capacity(),
                 candidates: &candidates,
                 candidate_capacity: candidates.capacity(),
                 slot_capacity: slots.capacity(),
+                arena_len: arena.len(),
+                arena_capacity: arena.capacity(),
                 ancestor_comparisons: comparisons,
                 slot_lookups: lookups,
                 ..SearchObservation::default()
@@ -465,9 +515,12 @@ where
         #[cfg(test)]
         observe(
             SearchObservation {
+                current_capacity: current.capacity(),
                 candidates: &candidates,
                 candidate_capacity: candidates.capacity(),
                 rank_capacity: ranked.capacity(),
+                arena_len: arena.len(),
+                arena_capacity: arena.capacity(),
                 ..SearchObservation::default()
             },
             &current,
@@ -478,26 +531,85 @@ where
                 ranked.push((candidate, mass));
             }
         }
+        checkpoint()?;
         ranked.sort_unstable_by(|(a, am), (b, bm)| {
             bm.total_cmp(am)
                 .then_with(|| key(a, &current).cmp(key(b, &current)))
         });
+        checkpoint()?;
         ranked.truncate(input.width);
+        checkpoint()?;
+        let mut keys = Vec::new();
+        let needed = ranked
+            .len()
+            .checked_mul(2)
+            .ok_or("CTC rank count overflow")?;
+        reserve(&mut keys, needed)?;
+        for (candidate, _) in &ranked {
+            for best in [candidate.blank.best, candidate.nonblank.best]
+                .into_iter()
+                .flatten()
+            {
+                keys.push(path_key(best));
+            }
+        }
+        arena
+            .len()
+            .checked_add(keys.len())
+            .ok_or("CTC history count overflow")?;
+        arena
+            .try_reserve(keys.len())
+            .map_err(|_| "CTC allocation failed".to_owned())?;
+        checkpoint()?;
+        keys.sort_unstable();
+        keys.dedup();
+        checkpoint()?;
         let mut next = Vec::new();
         reserve(&mut next, ranked.len())?;
+        #[cfg(test)]
+        let ranked_capacity = ranked.capacity();
         for (candidate, _) in ranked {
+            checkpoint()?;
             next.push(Prefix {
                 ids: copy_append(&current[candidate.parent].ids, candidate.appended)?,
-                blank: materialize(&candidate.blank, &current)?,
-                nonblank: materialize(&candidate.nonblank, &current)?,
+                blank: materialize(&candidate.blank, &keys, &mut arena)?,
+                nonblank: materialize(&candidate.nonblank, &keys, &mut arena)?,
             });
+            #[cfg(test)]
+            observe(
+                SearchObservation {
+                    current_capacity: current.capacity(),
+                    rank_capacity: ranked_capacity,
+                    arena_len: arena.len(),
+                    arena_capacity: arena.capacity(),
+                    key_capacity: keys.capacity(),
+                    next_capacity: next.capacity(),
+                    ..SearchObservation::default()
+                },
+                &current,
+                &next,
+            );
         }
         next.sort_unstable_by(|a, b| a.ids.cmp(&b.ids));
         #[cfg(test)]
-        observe(SearchObservation::default(), &current, &next);
+        observe(
+            SearchObservation {
+                current_capacity: current.capacity(),
+                arena_len: arena.len(),
+                arena_capacity: arena.capacity(),
+                key_capacity: keys.capacity(),
+                next_capacity: next.capacity(),
+                ..SearchObservation::default()
+            },
+            &current,
+            &next,
+        );
         current = next;
     }
-    Ok(current)
+    Ok(SearchResult {
+        prefixes: current,
+        arena,
+    })
 }
 
 #[cfg(test)]
@@ -672,7 +784,7 @@ mod tests {
                     *expected.entry(collapse(&path, 0)).or_insert(0.0) += probability;
                 }
                 let input = test_input(&rows, frames, vocabulary, 0, 128, ScoreDetail::None)?;
-                let actual = search(&input, &mut || Ok(()))?;
+                let actual = search(&input, &mut || Ok(()))?.prefixes;
                 assert_eq!(actual.len(), expected.len());
                 for prefix in actual {
                     let actual_mass = add(prefix.blank.mass, prefix.nonblank.mass)?
@@ -699,15 +811,23 @@ mod tests {
                     })
                     .collect();
                 let input = test_input(&rows, frames, vocabulary, 0, width, ScoreDetail::None)?;
-                let mut observations = 0;
+                let mut saw_expansion = false;
+                let mut saw_ranking = false;
+                let mut saw_materialization = false;
                 let mut largest_scratch = 0;
                 let mut largest_history = 0;
                 search_observed(&input, &mut || Ok(()), &mut |storage, old, new| {
-                    observations += 1;
+                    saw_expansion |= storage.slot_capacity > 0;
+                    saw_ranking |= storage.rank_capacity > 0 && storage.candidate_capacity > 0;
+                    saw_materialization |= storage.rank_capacity > 0 && storage.next_capacity > 0;
                     let parent_capacity = old.len() * (vocabulary + 1);
                     assert!(storage.slot_capacity <= parent_capacity);
                     assert!(storage.candidate_capacity <= parent_capacity);
                     assert!(storage.rank_capacity <= parent_capacity);
+                    assert!(storage.arena_len <= 2 * width * frames);
+                    assert!(storage.arena_capacity >= storage.arena_len);
+                    assert!(storage.key_capacity <= 2 * width);
+                    assert!(storage.next_capacity <= width);
                     let live_scratch = storage.slot_capacity * size_of::<usize>()
                         + storage.candidate_capacity * size_of::<Candidate>()
                         + storage.rank_capacity * size_of::<(Candidate, f64)>();
@@ -717,20 +837,177 @@ mod tests {
                     assert!(storage.slot_capacity == 0 || storage.rank_capacity == 0);
                     largest_scratch = largest_scratch.max(storage.candidates.len());
                     assert!(old.len() <= width && new.len() <= width);
-                    let history: usize = old
-                        .iter()
-                        .chain(new)
-                        .map(|prefix| {
-                            prefix.ids.len() + prefix.blank.path.len() + prefix.nonblank.path.len()
-                        })
-                        .sum();
+                    let history: usize = old.iter().chain(new).map(|prefix| prefix.ids.len()).sum();
                     largest_history = largest_history.max(history);
                     assert!(history <= 6 * width * frames);
                 })?;
-                assert_eq!(observations, 3 * frames);
+                assert!(saw_expansion && saw_ranking && saw_materialization);
                 assert!(largest_scratch >= vocabulary);
-                assert!(largest_history >= frames);
+                assert!(largest_history > 0);
             }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn live_capacity_accounts_for_materialization_and_output() -> Result<(), String> {
+        for (frames, width) in [(64, 2), (256, 2), (256, 8), (1024, 8)] {
+            let rows = vec![0.0; frames * 3];
+            let input = test_input(&rows, frames, 3, 0, width, ScoreDetail::None)?;
+            let mut peak = 0;
+            let mut materializations = 0;
+            let result = search_observed(&input, &mut || Ok(()), &mut |storage, old, next| {
+                let ids = old
+                    .iter()
+                    .chain(next)
+                    .map(|p| p.ids.capacity() * size_of::<usize>())
+                    .sum::<usize>();
+                let bytes = storage.arena_capacity * size_of::<Node>()
+                    + storage.slot_capacity * size_of::<usize>()
+                    + storage.candidate_capacity * size_of::<Candidate>()
+                    + storage.rank_capacity * size_of::<(Candidate, f64)>()
+                    + storage.key_capacity * size_of::<(Rank, usize)>()
+                    + (storage.current_capacity + storage.next_capacity) * size_of::<Prefix>()
+                    + ids;
+                peak = peak.max(bytes);
+                if storage.next_capacity > 0 && storage.rank_capacity > 0 {
+                    materializations += 1;
+                    assert!(
+                        storage.key_capacity > 0 && storage.arena_capacity >= storage.arena_len
+                    );
+                }
+            })?;
+            assert!(materializations > 0);
+            assert!(result.arena.len() <= 2 * width * frames);
+            let output = decode(&input, || Ok(()))?;
+            let reconstruction_bytes = result.arena.capacity() * size_of::<Node>()
+                + output.labels.capacity() * size_of::<usize>();
+            let projection_bytes = output.labels.capacity() * size_of::<usize>()
+                + output.tokens.capacity() * size_of::<Token>();
+            eprintln!(
+                "frames={frames} width={width} search_peak={peak} reconstruction={reconstruction_bytes} projection={projection_bytes} nodes={} arena_capacity={}",
+                result.arena.len(),
+                result.arena.capacity()
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn duplicate_rank_keys_share_identity_across_distinct_nodes() -> Result<(), String> {
+        let first = Representative {
+            score: 0.0,
+            tail: Some(NodeId(NonZeroUsize::MIN)),
+            rank: Rank(0),
+        };
+        let second = Representative {
+            score: 0.0,
+            tail: Some(NodeId(NonZeroUsize::new(2).expect("two is nonzero"))),
+            rank: Rank(0),
+        };
+        let a = RefPath {
+            parent: &first,
+            label: 2,
+            score: 0.0,
+        };
+        let b = RefPath {
+            parent: &second,
+            ..a
+        };
+        assert_eq!(path_key(a), path_key(b));
+        let keys = [path_key(a)];
+        let mut arena = vec![
+            Node {
+                parent: None,
+                label: 1,
+            },
+            Node {
+                parent: None,
+                label: 1,
+            },
+        ];
+        let x = materialize(
+            &DestinationState {
+                mass: Some(0.0),
+                best: Some(a),
+            },
+            &keys,
+            &mut arena,
+        )?
+        .representative
+        .expect("reachable destination has a representative");
+        let y = materialize(
+            &DestinationState {
+                mass: Some(0.0),
+                best: Some(b),
+            },
+            &keys,
+            &mut arena,
+        )?
+        .representative
+        .expect("reachable destination has a representative");
+        assert_ne!(x.tail, y.tail);
+        assert_eq!(x.rank, y.rank);
+        Ok(())
+    }
+
+    #[test]
+    fn history_ranks_match_full_paths_and_growth_is_bounded() -> Result<(), String> {
+        for width in [1, 4, 12] {
+            for frames in [16, 64, 256] {
+                let rows = vec![0.0; frames * 3];
+                let input = test_input(&rows, frames, 3, 1, width, ScoreDetail::None)?;
+                let result = search(&input, &mut || Ok(()))?;
+                assert!(result.arena.len() <= 2 * width * frames);
+                let mut paths = Vec::new();
+                for prefix in &result.prefixes {
+                    for rep in [prefix.blank.representative, prefix.nonblank.representative]
+                        .into_iter()
+                        .flatten()
+                    {
+                        let mut path = Vec::new();
+                        let mut tail = rep.tail;
+                        while let Some(id) = tail {
+                            let node = &result.arena[id.0.get() - 1];
+                            path.push(node.label);
+                            tail = node.parent;
+                        }
+                        assert_eq!(path.len(), frames);
+                        path.reverse();
+                        paths.push((rep.rank, path));
+                    }
+                }
+                for (ar, ap) in &paths {
+                    for (br, bp) in &paths {
+                        assert_eq!(ar.cmp(br), ap.cmp(bp));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn cancellation_is_checked_during_reconstruction_and_projection() -> Result<(), String> {
+        let frames = 1024;
+        let rows = vec![0.0; frames * 2];
+        let input = test_input(&rows, frames, 2, 0, 2, ScoreDetail::None)?;
+        let mut search_calls = 0;
+        search(&input, &mut || {
+            search_calls += 1;
+            Ok(())
+        })?;
+        for offset in [1, 4, 6, 9] {
+            let mut calls = 0;
+            let result = decode(&input, || {
+                calls += 1;
+                if calls == search_calls + offset {
+                    Err("cancelled".into())
+                } else {
+                    Ok(())
+                }
+            });
+            assert_eq!(result.unwrap_err(), "cancelled");
         }
         Ok(())
     }
